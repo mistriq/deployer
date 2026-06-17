@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Runners — Deployer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="sidebar-logo">Deployer</div>
+        {{with securityStatus}}
+        <div class="server-status {{.Class}}" title="{{.Title}}">
+            <span class="server-status-dot"></span>
+            <span>{{.Label}}</span>
+        </div>
+        {{end}}
+        <a href="/" class="nav-item">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75V13.5h13.05a.75.75 0 010 1.5H.75a.75.75 0 01-.75-.75V1.75a.75.75 0 011.5 0zm14.28 2.53l-5.25 5.25a.75.75 0 01-1.06 0L7 7.06 4.28 9.78a.75.75 0 01-1.06-1.06l3.25-3.25a.75.75 0 011.06 0L10 8.06l4.72-4.72a.75.75 0 011.06 1.06z"/></svg>
+            Dashboard
+        </a>
+        <a href="/runners" class="nav-item active">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.78 6.03l-4.25 4.5a.75.75 0 01-1.06.02L4.22 8.34a.75.75 0 011.06-1.06l1.7 1.64 3.72-3.92a.75.75 0 111.08 1.04z"/></svg>
+            Runners
+        </a>
+        <div class="nav-divider"></div>
+        <a href="/projects/new" class="nav-item nav-item-add">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M7.75 2a.75.75 0 01.75.75V7h4.25a.75.75 0 010 1.5H8.5v4.25a.75.75 0 01-1.5 0V8.5H2.75a.75.75 0 010-1.5H7V2.75A.75.75 0 017.75 2z"/></svg>
+            New Project
+        </a>
+    </nav>
+
+	    <div class="main-content">
+	        <div id="runner-config" data-public-url="{{.PublicURL}}" hidden></div>
+	        <div class="page-header">
+            <h1>Self-hosted runners</h1>
+            <div class="header-actions">
+	                <button class="btn btn-primary" data-action="show-add-runner">+ New runner</button>
+            </div>
+        </div>
+
+        <!-- Add Runner Modal -->
+        <div id="add-runner-form" class="card" style="display:none;">
+            <h2>Add New Runner</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label>Runner Name *</label>
+                    <input type="text" id="runner-name" placeholder="e.g. production-server" required>
+                </div>
+                <div class="form-group">
+                    <label>Labels (optional)</label>
+                    <input type="text" id="runner-labels" placeholder="e.g. production, linux">
+                </div>
+            </div>
+            <div class="form-actions">
+	                <button class="btn btn-primary" data-action="create-runner">Create Runner</button>
+	                <button class="btn" data-action="hide-add-runner">Cancel</button>
+            </div>
+        </div>
+
+        <!-- Setup Instructions (shown after creation) -->
+        <div id="setup-instructions" class="card" style="display:none;">
+            <h2 id="setup-title">Runner setup</h2>
+            <p style="color: var(--text-muted); margin-bottom: 1rem;">
+                The token is shown only once. Store it in a password manager before closing this panel.
+            </p>
+            <div class="terminal" style="min-height: auto; max-height: none; margin-bottom: 1rem;">
+                <pre id="runner-token"></pre>
+            </div>
+            <div class="form-actions" style="margin-bottom: 1rem;">
+                <button class="btn btn-primary" data-action="copy-runner-token">Copy Token</button>
+            </div>
+            <p style="color: var(--text-muted); margin-bottom: 1rem;">
+                The setup commands prompt for the token instead of embedding it directly.
+            </p>
+
+            <div class="terminal" style="min-height: auto; max-height: none; margin-bottom: 1rem;">
+                <pre id="setup-commands"></pre>
+            </div>
+
+            <div class="form-actions">
+	                <button class="btn btn-primary" data-action="copy-setup-commands">Copy Commands</button>
+	                <button class="btn" data-action="hide-setup">Done</button>
+            </div>
+        </div>
+
+	        {{if not .RunnerRows}}
+        <div class="empty-state" id="empty-state">
+            <h2>No runners yet</h2>
+            <p>Add a runner to deploy to your servers — no SSH setup needed!</p>
+	            <button class="btn btn-primary" data-action="show-add-runner">+ New runner</button>
+        </div>
+        {{else}}
+        <div class="list-toolbar">
+            <input type="search" class="filter-input" data-filter-target="#runner-list" data-filter-empty="#runner-filter-empty" placeholder="Search runners" aria-label="Search runners">
+        </div>
+        <div class="workflow-list" id="runner-list" data-page-size="20" data-page-empty="#runner-filter-empty">
+	            {{range .RunnerRows}}
+            <div class="workflow-run runner-row" data-filter-text="{{.Runner.Name}} {{.Runner.Labels}} {{.Runner.Status}} {{if .Runner.LastSeen}}{{.Runner.LastSeen.Format "Jan 2, 15:04"}}{{end}}">
+                <div class="workflow-icon">
+                    {{if eq .Runner.Status "online"}}<span class="icon-check">✓</span>
+                    {{else}}<span class="icon-pending">○</span>
+                    {{end}}
+                </div>
+                <div class="workflow-info">
+                    <div class="workflow-title">{{.Runner.Name}}</div>
+                    <div class="workflow-meta">
+                        {{if .Runner.Labels}}{{.Runner.Labels}} ·{{end}}
+                        {{if eq .Runner.Status "online"}}<span style="color:var(--success)">Online</span>{{else}}<span style="color:var(--text-muted)">Offline</span>{{end}}
+                        {{if .Runner.LastSeen}}· Last seen {{.Runner.LastSeen.Format "Jan 2, 15:04"}}{{end}}
+                    </div>
+                    {{with .History}}
+                    {{if .Points}}
+                    <div class="runner-history">
+                        <div class="runner-history-meta">{{.Counts.Total}} recent builds · avg {{formatDuration .AverageDurationSeconds}}</div>
+                        <div class="history-chart history-chart-compact" aria-label="Runner build duration history">
+                            {{range .Points}}
+                            <a class="history-bar status-{{.Status}}" href="/builds/{{.BuildID}}" style="height: {{.HeightPercent}}%;" title="{{.ProjectName}} build #{{.BuildID}} {{.Status}} {{formatDuration .DurationSeconds}}"></a>
+                            {{end}}
+                        </div>
+                    </div>
+                    {{else}}
+                    <div class="runner-history-meta">No build history yet</div>
+                    {{end}}
+                    {{end}}
+                </div>
+	                <div class="workflow-actions">
+	                    <button class="btn" data-rotate-runner-id="{{.Runner.ID}}" data-runner-name="{{.Runner.Name}}">Rotate token</button>
+	                    <button class="btn btn-danger" data-delete-runner-id="{{.Runner.ID}}" data-runner-name="{{.Runner.Name}}">Delete</button>
+	                </div>
+            </div>
+            {{end}}
+        </div>
+        <div class="filter-empty" id="runner-filter-empty" hidden>No matching runners.</div>
+        {{end}}
+    </div>
+
+    <script src="/static/app.js"></script>
+	</body>
+	</html>

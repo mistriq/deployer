@@ -1,0 +1,47 @@
+# Binaries and build output
+/deployer
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+coverage.out
+dist/
+build/
+
+# Runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+
+# Artifacts and archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.gz
+
+# Local secrets and machine config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+known_hosts
+
+# Local screenshots and scratch files
+image*.png
+*.bak
+*.tmp
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,2005 @@
+openapi: 3.1.0
+info:
+  title: Deployer API
+  version: v1
+  description: >
+    Machine-readable reference for the Deployer admin API and runner agent API.
+    Admin routes require Basic Auth when DEPLOYER_ADMIN_PASSWORD is configured.
+    Browser write requests also send X-Deployer-CSRF: "1". Agent routes use
+    bearer tokens created through the runner API.
+servers:
+  - url: https://deployer.example.com
+    description: Example production URL
+  - url: http://127.0.0.1:9090
+    description: Default local URL
+
+security:
+  - basicAuth: []
+
+tags:
+  - name: capabilities
+  - name: projects
+  - name: builds
+  - name: runners
+  - name: agent
+  - name: release
+
+paths:
+  /api/capabilities:
+    get:
+      tags: [capabilities]
+      summary: Describe supported API capabilities
+      operationId: getCapabilities
+      responses:
+        "200":
+          description: Supported modes, versions, features, and limits.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Capabilities"
+
+  /api/projects:
+    get:
+      tags: [projects]
+      summary: List projects
+      operationId: listProjects
+      responses:
+        "200":
+          description: Projects with their latest build when available.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Project"
+    post:
+      tags: [projects]
+      summary: Create a project
+      operationId: createProject
+      parameters:
+        - $ref: "#/components/parameters/CSRFHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectInput"
+            examples:
+              filesProject:
+                summary: Files-mode project
+                value:
+                  name: Dashboard
+                  repo_path: /srv/repos/dashboard
+                  deploy_dir: /srv/apps/dashboard
+                  deploy_mode: files
+                  runner_id: 1
+                  preserve: uploads,.env
+                  permissions: '{"owner":"www-data:www-data","dirs":{"storage":"0750"}}'
+              dockerProject:
+                summary: Docker-mode project
+                value:
+                  name: API
+                  repo_path: /srv/repos/api
+                  dockerfile_path: Dockerfile
+                  compose_file: docker-compose.yml
+                  compose_services: app worker
+                  image_name: registry.example.com/api
+                  deploy_dir: /srv/apps/api
+                  deploy_mode: docker
+                  runner_id: 1
+                  health_url: https://api.example.com/health
+      responses:
+        "201":
+          description: Created project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/import:
+    post:
+      tags: [projects]
+      summary: Import a project from a public-safe export envelope
+      operationId: importProject
+      parameters:
+        - $ref: "#/components/parameters/CSRFHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectExport"
+      responses:
+        "201":
+          description: Imported project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/{projectId}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [projects]
+      summary: Get a project
+      operationId: getProject
+      responses:
+        "200":
+          description: Project details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      tags: [projects]
+      summary: Update a project
+      operationId: updateProject
+      parameters:
+        - $ref: "#/components/parameters/CSRFHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectInput"
+      responses:
+        "200":
+          description: Updated project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [projects]
+      summary: Delete a project
+      operationId: deleteProject
+      parameters:
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "204":
+          description: Project deleted.
+
+  /api/projects/{projectId}/summary:
+    get:
+      tags: [projects]
+      summary: Get an AI-focused project summary
+      operationId: getProjectSummary
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Compact project state for agents and API clients.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectSummary"
+              examples:
+                summary:
+                  value:
+                    project:
+                      id: 1
+                      name: Dashboard
+                      repo_path: /srv/repos/dashboard
+                      deploy_dir: /srv/apps/dashboard
+                      deploy_mode: files
+                      runner_id: 1
+                      created_at: "2026-06-16T12:00:00Z"
+                    runner:
+                      id: 1
+                      name: production-vps
+                      labels: linux,docker
+                      status: offline
+                      created_at: "2026-06-16T12:00:00Z"
+                    last_build:
+                      id: 42
+                      project_id: 1
+                      status: failed
+                      started_at: "2026-06-16T12:10:00Z"
+                      finished_at: "2026-06-16T12:11:00Z"
+                      duration_seconds: 60
+                      error_message: health check failed
+                      triggered_by: manual
+                    recent_failures:
+                      - id: 42
+                        project_id: 1
+                        status: failed
+                        started_at: "2026-06-16T12:10:00Z"
+                        finished_at: "2026-06-16T12:11:00Z"
+                        duration_seconds: 60
+                        error_message: health check failed
+                        triggered_by: manual
+                    recommended_actions:
+                      - Runner is offline; check the agent service and runner token before deploying.
+                      - Last build failed; inspect the build log and error message before redeploying.
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/{projectId}/export:
+    get:
+      tags: [projects]
+      summary: Export a project with secrets and runtime bindings omitted
+      operationId: exportProject
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Public-safe project export envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectExport"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/{projectId}/history:
+    get:
+      tags: [projects, builds]
+      summary: Summarize recent build duration and status history for a project
+      operationId: getProjectBuildHistory
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Recent project build history for charts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildHistory"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/{projectId}/clone:
+    post:
+      tags: [projects]
+      summary: Clone a project configuration without copying build history
+      operationId: cloneProject
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectCloneInput"
+            examples:
+              namedClone:
+                value:
+                  name: Dashboard Staging
+      responses:
+        "201":
+          description: Cloned project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/{projectId}/preview:
+    get:
+      tags: [projects]
+      summary: Preview planned deployment actions without starting a build
+      operationId: previewProjectDeploy
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Read-only deploy plan for the current project configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeployPreview"
+              examples:
+                dockerAgentPreview:
+                  value:
+                    project_id: 1
+                    project_name: Dashboard
+                    repo_path: /srv/repos/dashboard
+                    commit_sha: abc1234
+                    deploy_mode: docker
+                    transport: agent
+                    runner:
+                      id: 1
+                      name: production-vps
+                      labels: linux,docker
+                      status: online
+                      last_seen: "2026-06-16T12:00:00Z"
+                      created_at: "2026-06-16T11:00:00Z"
+                    deploy_dir: /srv/apps/dashboard
+                    hooks:
+                      git_pull_before_build: true
+                      post_deploy: echo migrated
+                      post_deploy_enabled: true
+                    health_check:
+                      enabled: true
+                      url: https://dashboard.example.com/health
+                      timeout: 60s
+                    expected_artifact:
+                      type: docker_image_tar
+                      extension: .tar
+                      server_managed: true
+                    planned_steps:
+                      - git_pull
+                      - get_commit_sha
+                      - docker_build
+                      - docker_save
+                      - create_agent_job
+                      - wait_for_agent
+                    warnings: []
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/{projectId}/runbook:
+    get:
+      tags: [projects]
+      summary: Generate an AI-focused operational runbook for a project
+      operationId: getProjectRunbook
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Deterministic deploy and recovery runbook generated from project configuration and recent state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectRunbook"
+              examples:
+                filesRunbook:
+                  value:
+                    project_id: 1
+                    project_name: Dashboard
+                    deploy_mode: files
+                    how_to_deploy:
+                      - Review the deploy preview for the current commit and planned artifact.
+                      - The server packages repository files into a tar.gz archive.
+                      - The assigned runner downloads the archive, extracts it into deploy_dir, restores preserve paths, applies permissions, and runs post_deploy if configured.
+                      - Watch the build log stream or structured build events until the build reaches a terminal status.
+                    important_files:
+                      - /srv/repos/dashboard
+                      - .deployignore or .dockerignore
+                      - /srv/apps/dashboard
+                      - preserve:uploads
+                    runner:
+                      id: 1
+                      name: production-vps
+                      labels: linux
+                      status: offline
+                      created_at: "2026-06-16T11:00:00Z"
+                    rollback:
+                      supported: false
+                      notes:
+                        - Automatic file rollback is not implemented; take a snapshot before risky deploys and restore files manually if needed.
+                    failure_recovery:
+                      - Open the latest failed build and inspect the failure summary plus structured build events.
+                      - The runner is offline; check the agent service, network path, and runner token.
+                    operational_notes:
+                      - "Deploy preview transport: agent"
+                      - "Expected artifact type: files_archive"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/{projectId}/autodetect:
+    get:
+      tags: [projects]
+      summary: Detect repository deploy signals
+      operationId: autodetectProjectRepo
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Detected Docker, Compose, package manager, ignore-file, and likely deploy-mode signals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoAutodetect"
+              examples:
+                dockerRepo:
+                  value:
+                    project_id: 1
+                    repo_path: /srv/repos/dashboard
+                    dockerfiles:
+                      - Dockerfile
+                    compose_files:
+                      - compose.yaml
+                    package_managers:
+                      - npm
+                      - go
+                    ignore_file: .deployignore
+                    likely_deploy_mode: docker
+                    suggested_fields:
+                      deploy_mode: docker
+                      dockerfile_path: Dockerfile
+                      compose_file: compose.yaml
+                    warnings: []
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/{projectId}/deploy:
+    post:
+      tags: [projects, builds]
+      summary: Trigger a deployment
+      operationId: deployProject
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "200":
+          description: Deployment build was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildCreated"
+              examples:
+                deployStarted:
+                  value:
+                    build_id: 42
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /api/projects/{projectId}/snapshot:
+    post:
+      tags: [projects, builds]
+      summary: Request a remote snapshot from a runner
+      operationId: snapshotProject
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "200":
+          description: Snapshot build was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildCreated"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /api/builds/{buildId}:
+    parameters:
+      - $ref: "#/components/parameters/BuildId"
+    get:
+      tags: [builds]
+      summary: Get a build
+      operationId: getBuild
+      responses:
+        "200":
+          description: Build details and persisted log.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/builds/{buildId}/stream:
+    get:
+      tags: [builds]
+      summary: Watch live build logs
+      operationId: streamBuildLogs
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      responses:
+        "200":
+          description: Server-sent events containing build log lines and close events.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                logEvent:
+                  summary: Build log event
+                  value: |
+                    event: log
+                    data: Building image
+
+                    event: close
+                    data: done
+
+  /api/builds/{buildId}/events:
+    get:
+      tags: [builds]
+      summary: Get structured JSON events for a build
+      operationId: getBuildEvents
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      responses:
+        "200":
+          description: Parsed build steps, durations, terminal status, and job metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildEvents"
+              examples:
+                failedStep:
+                  value:
+                    build_id: 42
+                    project_id: 1
+                    status: failed
+                    triggered_by: manual
+                    commit_sha: abc1234
+                    job_id: 9
+                    runner_id: 1
+                    artifact_id: job-9-artifact
+                    artifact_available: true
+                    events:
+                      - sequence: 1
+                        type: step_started
+                        step: Docker Build
+                        status: running
+                      - sequence: 2
+                        type: log
+                        step: Docker Build
+                        message: Building image
+                      - sequence: 3
+                        type: step_finished
+                        step: Docker Build
+                        status: completed
+                        duration_seconds: 12
+                      - sequence: 4
+                        type: step_failed
+                        step: health check
+                        status: failed
+                        error: health check failed
+                      - sequence: 5
+                        type: build_finished
+                        status: failed
+                        error: "health check: health check failed"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/builds/{buildId}/failure-summary:
+    get:
+      tags: [builds]
+      summary: Summarize a failed build
+      operationId: getBuildFailureSummary
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      responses:
+        "200":
+          description: Deterministic failure summary derived from persisted build logs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildFailureSummary"
+              examples:
+                healthFailure:
+                  value:
+                    build_id: 42
+                    project_id: 1
+                    status: failed
+                    has_failure: true
+                    failed_step: health check
+                    likely_cause: health URL not responding
+                    relevant_log_lines:
+                      - Checking https://dashboard.example.com/health
+                      - "curl: failed to connect"
+                      - "FAILED at step 'health check': health URL not responding"
+                    suggested_fix: Check the configured health endpoint or container health status, then review the service logs on the target host.
+                    error_message: "health check: health URL not responding"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/builds/{buildId}/release-notes:
+    get:
+      tags: [builds, release]
+      summary: Generate release notes from Git commits between this and the previous build
+      operationId: getBuildReleaseNotes
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      responses:
+        "200":
+          description: Commit metadata for the selected build range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildReleaseNotes"
+              examples:
+                commitRange:
+                  value:
+                    build_id: 42
+                    project_id: 1
+                    project_name: Dashboard
+                    previous_build_id: 41
+                    previous_commit: abc1234
+                    current_commit: def5678
+                    compare_range: abc1234..def5678
+                    commits:
+                      - hash: def56789abcdef
+                        short_hash: def5678
+                        author_name: Release Bot
+                        author_email: release@example.com
+                        authored_at: "2026-06-16T12:10:00Z"
+                        subject: Update health check endpoint
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/builds/{buildId}/annotations:
+    get:
+      tags: [builds]
+      summary: List build annotations
+      operationId: listBuildAnnotations
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      responses:
+        "200":
+          description: Notes attached to this build.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BuildAnnotation"
+        "404":
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [builds]
+      summary: Create a build annotation
+      operationId: createBuildAnnotation
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BuildAnnotationInput"
+            examples:
+              rollbackCandidate:
+                value:
+                  note: rollback candidate
+      responses:
+        "201":
+          description: Created annotation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildAnnotation"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/builds/{buildId}/annotations/{annotationId}:
+    delete:
+      tags: [builds]
+      summary: Delete a build annotation
+      operationId: deleteBuildAnnotation
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+        - $ref: "#/components/parameters/AnnotationId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "204":
+          description: Annotation deleted.
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/builds/{buildId}/cancel:
+    post:
+      tags: [builds]
+      summary: Cancel a running build
+      operationId: cancelBuild
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "200":
+          description: Build cancellation accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+              examples:
+                cancelled:
+                  value:
+                    status: cancelled
+        "400":
+          $ref: "#/components/responses/Error"
+
+  /api/builds/{buildId}/artifact:
+    get:
+      tags: [builds]
+      summary: Download a completed snapshot artifact
+      operationId: downloadBuildArtifact
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      responses:
+        "200":
+          description: Snapshot tarball.
+          content:
+            application/gzip:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/runners:
+    get:
+      tags: [runners]
+      summary: List runners
+      operationId: listRunners
+      responses:
+        "200":
+          description: Runners without token values.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Runner"
+    post:
+      tags: [runners]
+      summary: Create a runner
+      operationId: createRunner
+      parameters:
+        - $ref: "#/components/parameters/CSRFHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunnerInput"
+            examples:
+              createRunner:
+                value:
+                  name: production-vps
+                  labels: linux,docker
+      responses:
+        "201":
+          description: Created runner. The token is returned only once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Runner"
+              examples:
+                runnerCreated:
+                  value:
+                    id: 1
+                    name: production-vps
+                    token: dep_1234567890_example
+                    labels: linux,docker
+                    status: offline
+                    created_at: "2026-06-16T12:00:00Z"
+        "400":
+          $ref: "#/components/responses/Error"
+
+  /api/runners/{runnerId}:
+    parameters:
+      - $ref: "#/components/parameters/RunnerId"
+    get:
+      tags: [runners]
+      summary: Get a runner
+      operationId: getRunner
+      responses:
+        "200":
+          description: Runner details without token value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Runner"
+        "404":
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [runners]
+      summary: Delete a runner
+      operationId: deleteRunner
+      parameters:
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "204":
+          description: Runner deleted.
+
+  /api/runners/{runnerId}/rotate:
+    post:
+      tags: [runners]
+      summary: Rotate a runner token
+      operationId: rotateRunnerToken
+      parameters:
+        - $ref: "#/components/parameters/RunnerId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "200":
+          description: Runner with newly issued token. The token is returned only once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Runner"
+              examples:
+                tokenRotated:
+                  value:
+                    id: 1
+                    name: production-vps
+                    token: dep_rotated_1234567890_example
+                    labels: linux,docker
+                    status: online
+                    last_seen: "2026-06-16T12:05:00Z"
+                    created_at: "2026-06-16T12:00:00Z"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/runners/{runnerId}/history:
+    get:
+      tags: [runners, builds]
+      summary: Summarize recent build duration and status history for a runner
+      operationId: getRunnerBuildHistory
+      parameters:
+        - $ref: "#/components/parameters/RunnerId"
+      responses:
+        "200":
+          description: Recent runner build history for charts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildHistory"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/agent/poll:
+    get:
+      tags: [agent]
+      summary: Claim the next pending job for a runner
+      operationId: pollAgentJob
+      security:
+        - agentBearerAuth: []
+      responses:
+        "200":
+          description: A job was claimed for this runner.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "204":
+          description: No pending job was available before the long-poll timeout.
+        "401":
+          $ref: "#/components/responses/Error"
+
+  /api/agent/artifact/{buildId}:
+    get:
+      tags: [agent]
+      summary: Download a build artifact assigned to the runner
+      operationId: downloadAgentArtifact
+      security:
+        - agentBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      responses:
+        "200":
+          description: Docker image tar or files archive.
+          content:
+            application/x-tar:
+              schema:
+                type: string
+                format: binary
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/agent/snapshot/{buildId}:
+    post:
+      tags: [agent]
+      summary: Upload a snapshot archive for a build
+      operationId: uploadAgentSnapshot
+      security:
+        - agentBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      requestBody:
+        required: true
+        content:
+          application/gzip:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Snapshot upload accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "403":
+          $ref: "#/components/responses/Error"
+
+  /api/agent/log/{buildId}:
+    post:
+      tags: [agent]
+      summary: Append runner log output to a build
+      operationId: appendAgentLog
+      security:
+        - agentBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+            examples:
+              logLine:
+                value: "Restarting Docker Compose services\n"
+      responses:
+        "200":
+          description: Log accepted.
+        "403":
+          $ref: "#/components/responses/Error"
+
+  /api/agent/complete/{buildId}:
+    post:
+      tags: [agent]
+      summary: Complete a runner job
+      operationId: completeAgentJob
+      security:
+        - agentBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/BuildId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [success, failed]
+                error:
+                  type: string
+            examples:
+              success:
+                value:
+                  status: success
+                  error: ""
+              failure:
+                value:
+                  status: failed
+                  error: health check failed
+      responses:
+        "200":
+          description: Completion accepted or ignored for an already-terminal build.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "403":
+          $ref: "#/components/responses/Error"
+
+  /api/agent/heartbeat:
+    post:
+      tags: [agent]
+      summary: Update runner heartbeat
+      operationId: heartbeatAgent
+      security:
+        - agentBearerAuth: []
+      responses:
+        "200":
+          description: Heartbeat accepted.
+        "401":
+          $ref: "#/components/responses/Error"
+
+  /api/version:
+    get:
+      tags: [release]
+      summary: Get server binary version and checksum
+      operationId: getVersion
+      responses:
+        "200":
+          description: Version metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version]
+                properties:
+                  version:
+                    type: string
+                  checksum_sha256:
+                    type: string
+
+  /download/deployer:
+    get:
+      tags: [release]
+      summary: Download the server binary for agent auto-update
+      operationId: downloadDeployerBinary
+      responses:
+        "200":
+          description: Deployer binary.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+    agentBearerAuth:
+      type: http
+      scheme: bearer
+
+  parameters:
+    CSRFHeader:
+      name: X-Deployer-CSRF
+      in: header
+      required: true
+      schema:
+        type: string
+        enum: ["1"]
+      description: Required for state-changing browser/admin API requests.
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    BuildId:
+      name: buildId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    AnnotationId:
+      name: annotationId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    RunnerId:
+      name: runnerId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+
+  responses:
+    Error:
+      description: JSON error response.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          examples:
+            - validation_error
+            - project_not_found
+            - project_busy
+            - artifact_unavailable
+
+    StatusResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+
+    BuildCreated:
+      type: object
+      required: [build_id]
+      properties:
+        build_id:
+          type: integer
+          format: int64
+
+    Capabilities:
+      type: object
+      required:
+        - service
+        - version
+        - api_version
+        - deploy_modes
+        - build_triggers
+        - build_statuses
+        - job_statuses
+        - error_codes
+        - runtime_error_codes
+        - endpoint_groups
+        - auth
+        - features
+        - limits
+      properties:
+        service:
+          type: string
+          example: deployer
+        version:
+          type: string
+          example: 1.0.0
+        api_version:
+          type: string
+          example: v1
+        deploy_modes:
+          type: array
+          items:
+            type: string
+            enum: [docker, files]
+        build_triggers:
+          type: array
+          items:
+            type: string
+            enum: [manual, snapshot]
+        build_statuses:
+          type: array
+          items:
+            type: string
+            enum: [running, success, failed, cancelled]
+        job_statuses:
+          type: array
+          items:
+            type: string
+            enum: [pending, running, completed, failed, cancelled]
+        error_codes:
+          type: array
+          items:
+            type: string
+          example:
+            - authentication_required
+            - validation_error
+            - method_not_allowed
+            - project_busy
+            - artifact_unavailable
+        runtime_error_codes:
+          type: array
+          items:
+            type: string
+          example:
+            - artifact_failed
+            - cancelled
+            - health_check_failed
+            - runner_offline
+        endpoint_groups:
+          type: array
+          items:
+            type: string
+        auth:
+          type: object
+          properties:
+            admin_auth_configured:
+              type: boolean
+            agent_bearer_auth:
+              type: boolean
+            csrf_header:
+              type: string
+            local_only_without_admin_password:
+              type: boolean
+        features:
+          type: object
+          additionalProperties:
+            type: boolean
+        limits:
+          type: object
+          properties:
+            max_persisted_build_log_bytes:
+              type: integer
+            max_agent_log_send_bytes:
+              type: integer
+            max_snapshot_upload_bytes:
+              type: integer
+            max_agent_artifact_download_bytes:
+              type: integer
+            log_retention_days:
+              type: integer
+            artifact_retention_hours:
+              type: integer
+
+    ProjectInput:
+      type: object
+      required: [name, repo_path, deploy_dir]
+      properties:
+        name:
+          type: string
+        repo_path:
+          type: string
+        dockerfile_path:
+          type: string
+          default: Dockerfile
+        compose_file:
+          type: string
+          default: docker-compose.yml
+        image_name:
+          type: string
+        ssh_host:
+          type: string
+        deploy_dir:
+          type: string
+        health_url:
+          type: string
+        health_container:
+          type: string
+        build_args:
+          type: object
+          additionalProperties:
+            type: string
+        compose_services:
+          type: string
+        git_pull_before_build:
+          type: boolean
+        runner_id:
+          type: integer
+          format: int64
+        deploy_mode:
+          type: string
+          enum: [docker, files]
+          default: docker
+        post_deploy:
+          type: string
+        permissions:
+          type: string
+          description: JSON string containing permissions configuration.
+        preserve:
+          type: string
+
+    ProjectExportConfig:
+      type: object
+      required: [name, repo_path, deploy_dir]
+      properties:
+        name:
+          type: string
+        repo_path:
+          type: string
+        dockerfile_path:
+          type: string
+        compose_file:
+          type: string
+        image_name:
+          type: string
+        ssh_host:
+          type: string
+        deploy_dir:
+          type: string
+        health_url:
+          type: string
+        health_container:
+          type: string
+        build_args:
+          type: object
+          additionalProperties:
+            type: string
+          description: Sensitive build args are omitted from project exports.
+        compose_services:
+          type: string
+        git_pull_before_build:
+          type: boolean
+        deploy_mode:
+          type: string
+          enum: [docker, files]
+        permissions:
+          type: string
+          description: JSON string containing permissions configuration.
+        preserve:
+          type: string
+
+    ProjectExport:
+      type: object
+      required: [kind, version, exported_at, project]
+      properties:
+        kind:
+          type: string
+          const: deployer.project
+        version:
+          type: integer
+          const: 1
+        exported_at:
+          type: string
+          format: date-time
+        project:
+          $ref: "#/components/schemas/ProjectExportConfig"
+        omitted_fields:
+          type: array
+          items:
+            type: string
+          description: Fields intentionally omitted from the export, such as runner_id, post_deploy, or sensitive build args.
+
+    ProjectCloneInput:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Optional name for the clone. Defaults to the source project name plus " Copy".
+
+    Project:
+      allOf:
+        - $ref: "#/components/schemas/ProjectInput"
+        - type: object
+          required: [id, created_at]
+          properties:
+            id:
+              type: integer
+              format: int64
+            created_at:
+              type: string
+              format: date-time
+            last_build:
+              $ref: "#/components/schemas/Build"
+
+    ProjectSummary:
+      type: object
+      required: [project, recent_failures, recommended_actions]
+      properties:
+        project:
+          $ref: "#/components/schemas/Project"
+        runner:
+          $ref: "#/components/schemas/RunnerSummary"
+        last_build:
+          $ref: "#/components/schemas/BuildSummary"
+        recent_failures:
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildSummary"
+        recommended_actions:
+          type: array
+          items:
+            type: string
+
+    ProjectRunbook:
+      type: object
+      required:
+        - project_id
+        - project_name
+        - deploy_mode
+        - how_to_deploy
+        - important_files
+        - rollback
+        - failure_recovery
+        - operational_notes
+      properties:
+        project_id:
+          type: integer
+          format: int64
+        project_name:
+          type: string
+        deploy_mode:
+          type: string
+          enum: [docker, files]
+        how_to_deploy:
+          type: array
+          items:
+            type: string
+        important_files:
+          type: array
+          items:
+            type: string
+        runner:
+          $ref: "#/components/schemas/RunnerSummary"
+        rollback:
+          $ref: "#/components/schemas/RunbookRollback"
+        failure_recovery:
+          type: array
+          items:
+            type: string
+        operational_notes:
+          type: array
+          items:
+            type: string
+
+    RunbookRollback:
+      type: object
+      required: [supported, notes]
+      properties:
+        supported:
+          type: boolean
+        notes:
+          type: array
+          items:
+            type: string
+
+    RepoAutodetect:
+      type: object
+      required:
+        - project_id
+        - repo_path
+        - dockerfiles
+        - compose_files
+        - package_managers
+        - likely_deploy_mode
+        - suggested_fields
+        - warnings
+      properties:
+        project_id:
+          type: integer
+          format: int64
+        repo_path:
+          type: string
+        dockerfiles:
+          type: array
+          items:
+            type: string
+        compose_files:
+          type: array
+          items:
+            type: string
+        package_managers:
+          type: array
+          items:
+            type: string
+        ignore_file:
+          type: string
+        likely_deploy_mode:
+          type: string
+          enum: [docker, files]
+        suggested_fields:
+          type: object
+          additionalProperties:
+            type: string
+        warnings:
+          type: array
+          items:
+            type: string
+
+    RunnerSummary:
+      type: object
+      required: [id, name, status, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        labels:
+          type: string
+        status:
+          type: string
+          enum: [online, offline]
+        last_seen:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    BuildSummary:
+      type: object
+      required:
+        - id
+        - project_id
+        - status
+        - started_at
+        - triggered_by
+      properties:
+        id:
+          type: integer
+          format: int64
+        project_id:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [running, success, failed, cancelled]
+        commit_sha:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        duration_seconds:
+          type: integer
+        error_message:
+          type: string
+        error_code:
+          type: string
+          enum: [artifact_failed, cancelled, command_failed, health_check_failed, panic, runner_offline, server_restarted, validation_failed]
+        triggered_by:
+          type: string
+          enum: [manual, snapshot]
+
+    BuildHistory:
+      type: object
+      required:
+        - scope
+        - scope_id
+        - scope_name
+        - points
+        - counts
+        - max_duration_seconds
+      properties:
+        scope:
+          type: string
+          enum: [project, runner]
+        scope_id:
+          type: integer
+          format: int64
+        scope_name:
+          type: string
+        points:
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildHistoryPoint"
+        counts:
+          $ref: "#/components/schemas/BuildHistoryCounts"
+        average_duration_seconds:
+          type: integer
+        max_duration_seconds:
+          type: integer
+
+    BuildHistoryPoint:
+      type: object
+      required:
+        - build_id
+        - project_id
+        - status
+        - started_at
+        - triggered_by
+        - height_percent
+      properties:
+        build_id:
+          type: integer
+          format: int64
+        project_id:
+          type: integer
+          format: int64
+        project_name:
+          type: string
+        status:
+          type: string
+          enum: [running, success, failed, cancelled]
+        commit_sha:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        duration_seconds:
+          type: integer
+        triggered_by:
+          type: string
+          enum: [manual, snapshot]
+        height_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+
+    BuildHistoryCounts:
+      type: object
+      required: [total, success, failed, cancelled, running]
+      properties:
+        total:
+          type: integer
+        success:
+          type: integer
+        failed:
+          type: integer
+        cancelled:
+          type: integer
+        running:
+          type: integer
+
+    DeployPreview:
+      type: object
+      required:
+        - project_id
+        - project_name
+        - repo_path
+        - deploy_mode
+        - transport
+        - deploy_dir
+        - hooks
+        - health_check
+        - expected_artifact
+        - planned_steps
+        - warnings
+      properties:
+        project_id:
+          type: integer
+          format: int64
+        project_name:
+          type: string
+        repo_path:
+          type: string
+        commit_sha:
+          type: string
+        commit_error:
+          type: string
+          description: Non-fatal Git lookup error when the current commit cannot be read.
+        deploy_mode:
+          type: string
+          enum: [docker, files]
+        transport:
+          type: string
+          enum: [agent, ssh, local]
+        runner:
+          $ref: "#/components/schemas/RunnerSummary"
+        deploy_dir:
+          type: string
+        hooks:
+          $ref: "#/components/schemas/DeployPreviewHooks"
+        health_check:
+          $ref: "#/components/schemas/DeployPreviewHealth"
+        expected_artifact:
+          $ref: "#/components/schemas/DeployPreviewArtifact"
+        planned_steps:
+          type: array
+          items:
+            type: string
+        warnings:
+          type: array
+          items:
+            type: string
+
+    DeployPreviewHooks:
+      type: object
+      required: [git_pull_before_build, post_deploy_enabled]
+      properties:
+        git_pull_before_build:
+          type: boolean
+        post_deploy:
+          type: string
+        post_deploy_enabled:
+          type: boolean
+
+    DeployPreviewHealth:
+      type: object
+      required: [enabled, timeout]
+      properties:
+        enabled:
+          type: boolean
+        url:
+          type: string
+        container:
+          type: string
+        timeout:
+          type: string
+
+    DeployPreviewArtifact:
+      type: object
+      required: [type, server_managed]
+      properties:
+        type:
+          type: string
+          enum: [docker_image_tar, files_archive, none]
+        extension:
+          type: string
+        server_managed:
+          type: boolean
+
+    Build:
+      type: object
+      required:
+        - id
+        - project_id
+        - status
+        - started_at
+        - triggered_by
+      properties:
+        id:
+          type: integer
+          format: int64
+        project_id:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [running, success, failed, cancelled]
+        commit_sha:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        duration_seconds:
+          type: integer
+        log:
+          type: string
+        error_message:
+          type: string
+        error_code:
+          type: string
+          enum: [artifact_failed, cancelled, command_failed, health_check_failed, panic, runner_offline, server_restarted, validation_failed]
+        triggered_by:
+          type: string
+          enum: [manual, snapshot]
+        project_name:
+          type: string
+
+    BuildEvents:
+      type: object
+      required:
+        - build_id
+        - project_id
+        - status
+        - triggered_by
+        - artifact_available
+        - events
+      properties:
+        build_id:
+          type: integer
+          format: int64
+        project_id:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [running, success, failed, cancelled]
+        error_code:
+          type: string
+          enum: [artifact_failed, cancelled, command_failed, health_check_failed, panic, runner_offline, server_restarted, validation_failed]
+        triggered_by:
+          type: string
+          enum: [manual, snapshot]
+        commit_sha:
+          type: string
+        job_id:
+          type: integer
+          format: int64
+        runner_id:
+          type: integer
+          format: int64
+        job_error_code:
+          type: string
+          enum: [artifact_failed, cancelled, command_failed, health_check_failed, panic, runner_offline, server_restarted, validation_failed]
+        artifact_id:
+          type: string
+        artifact_available:
+          type: boolean
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/StructuredBuildEvent"
+
+    StructuredBuildEvent:
+      type: object
+      required: [sequence, type]
+      properties:
+        sequence:
+          type: integer
+        type:
+          type: string
+          enum: [step_started, step_finished, step_failed, log, build_finished]
+        step:
+          type: string
+        status:
+          type: string
+          enum: [running, completed, failed, success, cancelled]
+        duration_seconds:
+          type: integer
+        message:
+          type: string
+        error:
+          type: string
+        error_code:
+          type: string
+          enum: [artifact_failed, cancelled, command_failed, health_check_failed, panic, runner_offline, server_restarted, validation_failed]
+
+    BuildFailureSummary:
+      type: object
+      required:
+        - build_id
+        - project_id
+        - status
+        - has_failure
+        - relevant_log_lines
+      properties:
+        build_id:
+          type: integer
+          format: int64
+        project_id:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [running, success, failed, cancelled]
+        has_failure:
+          type: boolean
+        failed_step:
+          type: string
+        likely_cause:
+          type: string
+        relevant_log_lines:
+          type: array
+          items:
+            type: string
+        suggested_fix:
+          type: string
+        error_message:
+          type: string
+        error_code:
+          type: string
+          enum: [artifact_failed, cancelled, command_failed, health_check_failed, panic, runner_offline, server_restarted, validation_failed]
+
+    BuildReleaseNotes:
+      type: object
+      required:
+        - build_id
+        - project_id
+        - project_name
+        - commits
+      properties:
+        build_id:
+          type: integer
+          format: int64
+        project_id:
+          type: integer
+          format: int64
+        project_name:
+          type: string
+        previous_build_id:
+          type: integer
+          format: int64
+        previous_commit:
+          type: string
+        current_commit:
+          type: string
+        compare_range:
+          type: string
+        commits:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReleaseNoteCommit"
+        warnings:
+          type: array
+          items:
+            type: string
+
+    ReleaseNoteCommit:
+      type: object
+      required: [hash, short_hash, author_name, author_email, authored_at, subject]
+      properties:
+        hash:
+          type: string
+        short_hash:
+          type: string
+        author_name:
+          type: string
+        author_email:
+          type: string
+        authored_at:
+          type: string
+          format: date-time
+        subject:
+          type: string
+
+    BuildAnnotationInput:
+      type: object
+      required: [note]
+      properties:
+        note:
+          type: string
+          maxLength: 4096
+
+    BuildAnnotation:
+      allOf:
+        - $ref: "#/components/schemas/BuildAnnotationInput"
+        - type: object
+          required: [id, build_id, created_at]
+          properties:
+            id:
+              type: integer
+              format: int64
+            build_id:
+              type: integer
+              format: int64
+            created_at:
+              type: string
+              format: date-time
+
+    RunnerInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        labels:
+          type: string
+
+    Runner:
+      allOf:
+        - $ref: "#/components/schemas/RunnerInput"
+        - type: object
+          required: [id, status, created_at]
+          properties:
+            id:
+              type: integer
+              format: int64
+            token:
+              type: string
+              description: Returned only when a runner is created or rotated.
+            status:
+              type: string
+              enum: [online, offline]
+            last_seen:
+              type: string
+              format: date-time
+            created_at:
+              type: string
+              format: date-time
+
+    Job:
+      type: object
+      required:
+        - id
+        - build_id
+        - runner_id
+        - status
+        - deploy_dir
+        - mode
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        build_id:
+          type: integer
+          format: int64
+        runner_id:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [pending, running, completed, failed, cancelled]
+        artifact_path:
+          type: string
+        deploy_dir:
+          type: string
+        compose_file:
+          type: string
+        compose_services:
+          type: string
+        image_name:
+          type: string
+        health_url:
+          type: string
+        health_container:
+          type: string
+        mode:
+          type: string
+          enum: [docker, files, snapshot]
+        post_deploy:
+          type: string
+        permissions:
+          type: string
+        preserve:
+          type: string
+        error_code:
+          type: string
+          enum: [artifact_failed, cancelled, command_failed, health_check_failed, panic, runner_offline, server_restarted, validation_failed]
+        created_at:
+          type: string
+          format: date-time
+        picked_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time

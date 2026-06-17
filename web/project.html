@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{if .IsNew}}New Project{{else}}{{.Project.Name}}{{end}} — Deployer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="sidebar-logo">Deployer</div>
+        {{with securityStatus}}
+        <div class="server-status {{.Class}}" title="{{.Title}}">
+            <span class="server-status-dot"></span>
+            <span>{{.Label}}</span>
+        </div>
+        {{end}}
+        <a href="/" class="nav-item">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75V13.5h13.05a.75.75 0 010 1.5H.75a.75.75 0 01-.75-.75V1.75a.75.75 0 011.5 0zm14.28 2.53l-5.25 5.25a.75.75 0 01-1.06 0L7 7.06 4.28 9.78a.75.75 0 01-1.06-1.06l3.25-3.25a.75.75 0 011.06 0L10 8.06l4.72-4.72a.75.75 0 011.06 1.06z"/></svg>
+            Dashboard
+        </a>
+        <a href="/runners" class="nav-item">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.78 6.03l-4.25 4.5a.75.75 0 01-1.06.02L4.22 8.34a.75.75 0 011.06-1.06l1.7 1.64 3.72-3.92a.75.75 0 111.08 1.04z"/></svg>
+            Runners
+        </a>
+        <div class="nav-divider"></div>
+        <a href="/projects/new" class="nav-item nav-item-add">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M7.75 2a.75.75 0 01.75.75V7h4.25a.75.75 0 010 1.5H8.5v4.25a.75.75 0 01-1.5 0V8.5H2.75a.75.75 0 010-1.5H7V2.75A.75.75 0 017.75 2z"/></svg>
+            New Project
+        </a>
+        {{if and (not .IsNew) .Builds}}
+        <div class="nav-divider"></div>
+        <div class="sidebar-steps">
+            <div class="sidebar-steps-title">Recent Builds</div>
+            {{range .Builds}}
+            <a href="/builds/{{.ID}}" class="step-item" style="text-decoration:none;">
+                <span class="step-icon icon-{{statusIcon .Status}}">{{if eq .Status "success"}}&#10003;{{else if eq .Status "failed"}}&#10005;{{else if eq .Status "running"}}&#8635;{{else}}&#9675;{{end}}</span>
+                <span>#{{.ID}}</span>
+            </a>
+            {{end}}
+        </div>
+        {{end}}
+    </nav>
+
+    <div class="main-content">
+        <div class="page-header">
+            <div>
+                <h1>
+                    <a href="/">Dashboard</a>
+                    <span class="header-sep">/</span>
+                    {{if .IsNew}}New Project{{else}}{{.Project.Name}}{{end}}
+                </h1>
+                {{if not .IsNew}}
+                <div class="page-subtitle">
+                    {{if .Project.ImageName}}<code>{{.Project.ImageName}}</code> · {{end}}<span title="{{.Project.RepoPath}}">{{compactPath .Project.RepoPath}}</span>
+                </div>
+                {{end}}
+            </div>
+            {{if not .IsNew}}
+            <div class="header-actions">
+                {{if gt .Project.RunnerID 0}}
+	                <button class="btn" data-snapshot-project-id="{{.Project.ID}}" data-project-name="{{.Project.Name}}">Fetch Remote State</button>
+	                {{end}}
+	                <button class="btn btn-primary" data-deploy-project-id="{{.Project.ID}}" data-project-name="{{.Project.Name}}">▶ Deploy Now</button>
+	                <button class="btn btn-danger" data-delete-project-id="{{.Project.ID}}" data-project-name="{{.Project.Name}}">Delete</button>
+            </div>
+            {{end}}
+        </div>
+
+        <div class="card">
+            <h2>{{if .IsNew}}Create Project{{else}}Project Settings{{end}}</h2>
+	            <form id="project-form">
+                {{if not .IsNew}}<input type="hidden" name="id" value="{{.Project.ID}}">{{end}}
+
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>Project Name *</label>
+                        <input type="text" name="name" required value="{{if not .IsNew}}{{.Project.Name}}{{end}}" placeholder="e.g. AdPilot">
+                    </div>
+                    <div class="form-group">
+                        <label>Deploy Mode</label>
+	                        <select name="deploy_mode" id="deploy-mode-select">
+                            <option value="docker" {{if not .IsNew}}{{if ne .Project.DeployMode "files"}}selected{{end}}{{end}}>Docker</option>
+                            <option value="files" {{if not .IsNew}}{{if eq .Project.DeployMode "files"}}selected{{end}}{{end}}>Files</option>
+                        </select>
+                    </div>
+                    <div class="form-group docker-field">
+                        <label>Image Name <span class="docker-required">*</span></label>
+	                        <input type="text" name="image_name" value="{{if not .IsNew}}{{.Project.ImageName}}{{end}}" placeholder="e.g. myapp">
+                    </div>
+                    <div class="form-group">
+                        <label>Git Repo Path (local) *</label>
+	                        <input type="text" name="repo_path" required value="{{if not .IsNew}}{{.Project.RepoPath}}{{end}}" placeholder="e.g. /srv/repos/myapp">
+                    </div>
+                    <div class="form-group">
+                        <label>Deploy Method</label>
+	                        <select name="runner_id" id="runner-select">
+                            <option value="0" {{if .IsNew}}selected{{else}}{{if eq .Project.RunnerID 0}}selected{{end}}{{end}}>SSH (legacy)</option>
+                            {{range .Runners}}
+                            <option value="{{.ID}}" {{if not $.IsNew}}{{if eq $.Project.RunnerID .ID}}selected{{end}}{{end}}>{{.Name}} {{if eq .Status "online"}}(online){{else}}(offline){{end}}</option>
+                            {{end}}
+                        </select>
+                    </div>
+                    <div class="form-group" id="ssh-host-group">
+                        <label>SSH Host</label>
+                        <input type="text" name="ssh_host" value="{{if not .IsNew}}{{.Project.SSHHost}}{{end}}" placeholder="e.g. deploy@server.com">
+                    </div>
+                    <div class="form-group">
+                        <label>Deploy Directory (remote) *</label>
+	                        <input type="text" name="deploy_dir" required value="{{if not .IsNew}}{{.Project.DeployDir}}{{end}}" placeholder="e.g. /srv/apps/myapp">
+                    </div>
+                    <div class="form-group docker-field">
+                        <label>Dockerfile Path</label>
+                        <input type="text" name="dockerfile_path" value="{{if not .IsNew}}{{.Project.DockerfilePath}}{{else}}Dockerfile{{end}}">
+                    </div>
+                    <div class="form-group docker-field">
+                        <label>Compose File</label>
+                        <input type="text" name="compose_file" value="{{if not .IsNew}}{{.Project.ComposeFile}}{{else}}docker-compose.yml{{end}}">
+                    </div>
+                    <div class="form-group docker-field">
+                        <label>Compose Services to Restart</label>
+                        <input type="text" name="compose_services" value="{{if not .IsNew}}{{.Project.ComposeServices}}{{else}}app worker{{end}}" placeholder="e.g. app worker">
+                    </div>
+                    <div class="form-group">
+                        <label>Health Check URL (on remote)</label>
+                        <input type="text" name="health_url" value="{{if not .IsNew}}{{.Project.HealthURL}}{{end}}" placeholder="e.g. http://127.0.0.1:3000/api/health">
+                    </div>
+                    <div class="form-group docker-field">
+                        <label>Health Check Container</label>
+	                        <input type="text" name="health_container" value="{{if not .IsNew}}{{.Project.HealthContainer}}{{end}}" placeholder="e.g. myapp">
+                    </div>
+                    <div class="form-group full-width docker-field">
+                        <label>Build Args (JSON)</label>
+                        <textarea name="build_args" rows="3" placeholder='{"KEY": "value"}'>{{if not .IsNew}}{{json .Project.BuildArgs}}{{else}}{}{{end}}</textarea>
+                    </div>
+                    <div class="form-group full-width files-field">
+                        <label>Preserve (one path per line)</label>
+                        <textarea name="preserve" rows="3" placeholder="content.json&#10;uploads/">{{if not .IsNew}}{{.Project.Preserve}}{{end}}</textarea>
+                        <small>Files/directories that should not be overwritten during deploy (e.g. server-edited data)</small>
+                    </div>
+                    <div class="form-group full-width files-field">
+                        <label>Permissions (JSON)</label>
+                        <textarea name="permissions" rows="4" placeholder='{"owner": "www-data:www-data", "files": {"*.php": "0644"}, "dirs": {"uploads": "0755"}}'>{{if not .IsNew}}{{.Project.Permissions}}{{end}}</textarea>
+                        <small>Optional. Set owner and chmod after deploy.</small>
+                    </div>
+                    <div class="form-group files-field">
+                        <label>Post-deploy Command</label>
+                        <textarea name="post_deploy" rows="4" placeholder="e.g. systemctl reload apache2">{{if not .IsNew}}{{.Project.PostDeploy}}{{end}}</textarea>
+                        <small>Optional. Runs after files are deployed.</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="git_pull_before_build" {{if .IsNew}}checked{{else}}{{if .Project.GitPullBeforeBuild}}checked{{end}}{{end}}>
+                            Git pull before build
+                        </label>
+                    </div>
+                </div>
+
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">{{if .IsNew}}Create Project{{else}}Save Changes{{end}}</button>
+                    <a href="/" class="btn">Cancel</a>
+                </div>
+            </form>
+        </div>
+
+        {{with .History}}
+        {{if .Points}}
+        <div class="card">
+            <div class="card-heading-row">
+                <h2>Duration Trend</h2>
+                <div class="history-stats">
+                    <span>{{.Counts.Total}} builds</span>
+                    <span>{{.Counts.Success}} ok</span>
+                    <span>{{.Counts.Failed}} failed</span>
+                    <span>avg {{formatDuration .AverageDurationSeconds}}</span>
+                </div>
+            </div>
+            <div class="history-chart" aria-label="Build duration history">
+                {{range .Points}}
+                <a class="history-bar status-{{.Status}}" href="/builds/{{.BuildID}}" style="height: {{.HeightPercent}}%;" title="Build #{{.BuildID}} {{.Status}} {{formatDuration .DurationSeconds}}"></a>
+                {{end}}
+            </div>
+        </div>
+        {{end}}
+        {{end}}
+
+        {{if and (not .IsNew) .Builds}}
+        <div class="card">
+            <h2>Build History</h2>
+            <div class="list-toolbar">
+                <input type="search" class="filter-input" data-filter-target="#build-list" data-filter-empty="#build-filter-empty" placeholder="Search builds" aria-label="Search builds">
+            </div>
+            <div class="workflow-list" id="build-list" data-page-size="15" data-page-empty="#build-filter-empty">
+                {{range .Builds}}
+	                <div class="workflow-run" data-build-url="/builds/{{.ID}}" data-filter-text="Build #{{.ID}} {{.Status}} {{.TriggeredBy}} {{.CommitSHA}} {{.StartedAt.Format "Jan 2, 15:04"}}" style="cursor:pointer;">
+                    <div class="workflow-icon">
+                        {{if eq .Status "success"}}<span class="icon-check">✓</span>{{end}}
+                        {{if eq .Status "failed"}}<span class="icon-x">✕</span>{{end}}
+                        {{if eq .Status "running"}}<span class="icon-running">⟳</span>{{end}}
+                        {{if eq .Status "cancelled"}}<span class="icon-cancelled">⊘</span>{{end}}
+                    </div>
+                    <div class="workflow-info">
+                        <div class="workflow-title">
+                            Build #{{.ID}}
+                            <span class="workflow-event">{{.TriggeredBy}}</span>
+                        </div>
+                        <div class="workflow-meta">
+                            {{if ne .CommitSHA ""}}<code>{{shortSHA .CommitSHA}}</code> ·{{end}}
+                            {{.StartedAt.Format "Jan 2, 15:04"}}
+                        </div>
+                    </div>
+                    <div class="workflow-timing">
+                        <div class="workflow-date">{{.StartedAt.Format "Jan 2, 15:04"}}</div>
+                        <div class="workflow-duration">{{formatDuration .DurationSeconds}}</div>
+                    </div>
+                </div>
+                {{end}}
+            </div>
+            <div class="filter-empty" id="build-filter-empty" hidden>No matching builds.</div>
+        </div>
+        {{end}}
+    </div>
+
+    <script src="/static/app.js"></script>
+	</body>
+	</html>

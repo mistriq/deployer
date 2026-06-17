@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Build #{{.ID}} -- Deployer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="sidebar-logo">Deployer</div>
+        {{with securityStatus}}
+        <div class="server-status {{.Class}}" title="{{.Title}}">
+            <span class="server-status-dot"></span>
+            <span>{{.Label}}</span>
+        </div>
+        {{end}}
+        <a href="/" class="nav-item">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75V13.5h13.05a.75.75 0 010 1.5H.75a.75.75 0 01-.75-.75V1.75a.75.75 0 011.5 0zm14.28 2.53l-5.25 5.25a.75.75 0 01-1.06 0L7 7.06 4.28 9.78a.75.75 0 01-1.06-1.06l3.25-3.25a.75.75 0 011.06 0L10 8.06l4.72-4.72a.75.75 0 011.06 1.06z"/></svg>
+            Dashboard
+        </a>
+        <a href="/runners" class="nav-item">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.78 6.03l-4.25 4.5a.75.75 0 01-1.06.02L4.22 8.34a.75.75 0 011.06-1.06l1.7 1.64 3.72-3.92a.75.75 0 111.08 1.04z"/></svg>
+            Runners
+        </a>
+        <div class="nav-divider"></div>
+        <div class="sidebar-steps" id="sidebar-steps">
+            <div class="sidebar-steps-title">Build Steps</div>
+        </div>
+    </nav>
+
+    <div class="main-content">
+        <div class="page-header">
+            <div>
+                <h1>
+                    <a href="/projects/{{.ProjectID}}">{{.ProjectName}}</a>
+                    <span class="header-sep">/</span>
+                    Build #{{.ID}}
+                </h1>
+                <div class="page-subtitle">
+                    {{if ne .CommitSHA ""}}<code>{{shortSHA .CommitSHA}}</code> ·{{end}}
+                    {{.TriggeredBy}}
+                    · {{.StartedAt.Format "Jan 2, 2006 15:04:05"}}
+                    · <span id="build-timer">{{if .DurationSeconds}}{{formatDuration .DurationSeconds}}{{else}}0s{{end}}</span>
+                </div>
+            </div>
+            <div class="header-actions">
+                <span class="build-badge {{.Status}}" id="build-status">{{.Status}}</span>
+                {{if and (eq .TriggeredBy "snapshot") (eq .Status "success")}}
+                <a class="btn" href="/api/builds/{{.ID}}/artifact">Download Snapshot</a>
+                {{end}}
+                {{if eq .Status "running"}}
+	                <button class="btn btn-danger" data-cancel-build-id="{{.ID}}">Cancel</button>
+	                {{end}}
+	                <button class="btn" data-nav-url="/projects/{{.ProjectID}}">Back to project</button>
+            </div>
+        </div>
+
+	        <div id="steps-container"></div>
+	        <div id="build-data"
+	            data-build-id="{{.ID}}"
+	            data-build-status="{{.Status}}"
+	            data-build-log-b64="{{b64str .Log}}"
+	            data-build-started-at="{{.StartedAt.Format "2006-01-02T15:04:05Z"}}"
+	            data-build-duration="{{if .DurationSeconds}}{{.DurationSeconds}}{{else}}0{{end}}"
+	            hidden></div>
+	    </div>
+
+	    <script src="/static/app.js"></script>
+	</body>
+	</html>
