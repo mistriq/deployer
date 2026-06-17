@@ -63,7 +63,7 @@ Prerequisites:
 - systemd if you use the example service units.
 
 ```bash
-go build -o deployer .
+go build -o deployer ./cmd/deployer
 DEPLOYER_ADMIN_PASSWORD='change-me' ./deployer
 ```
 
@@ -421,14 +421,22 @@ go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
 Use a temporary database for local development:
 
 ```bash
-DEPLOYER_DB_PATH=/tmp/deployer-dev.db go run .
+DEPLOYER_DB_PATH=/tmp/deployer-dev.db go run ./cmd/deployer
 ```
 
 Seed public-safe screenshot data into an empty temporary database:
 
 ```bash
-DEPLOYER_DEMO_MODE=true DEPLOYER_DB_PATH=/tmp/deployer-demo.db go run .
+DEPLOYER_DEMO_MODE=true DEPLOYER_DB_PATH=/tmp/deployer-demo.db go run ./cmd/deployer
 ```
+
+## Repository Layout
+
+- `cmd/deployer` contains the binary entrypoint.
+- `internal/app` contains the server, agent, storage, builder, handlers, and
+  package tests.
+- `internal/app/web` contains embedded templates and static assets.
+- `docs` contains OpenAPI documentation and public-safe screenshots.
 
 ## Release Checklist
 

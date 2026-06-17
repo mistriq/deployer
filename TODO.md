@@ -253,8 +253,10 @@ quality gaps found during the audit.
 
 ## P2 - Design And Maintainability
 
-- [ ] Split the large `main` package into clearer packages after security work:
-  server, models/storage, agent, builder, web, and config.
+- [x] Move the binary entrypoint into `cmd/deployer` and the implementation into
+  `internal/app` so the repository no longer has a large root package.
+- [ ] Split the large `internal/app` package into clearer packages after
+  security work: server, models/storage, agent, builder, web, and config.
 - [ ] Introduce a config layer for address, database path, public URL, auth,
   artifact directory, timeouts, log retention, and update behavior.
 - [ ] Replace global `db`, `broker`, `builder`, and `tmpl` with explicit

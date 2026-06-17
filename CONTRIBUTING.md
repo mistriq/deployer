@@ -14,7 +14,7 @@ go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
 Use a temporary database while developing:
 
 ```bash
-DEPLOYER_DB_PATH=/tmp/deployer-dev.db go run .
+DEPLOYER_DB_PATH=/tmp/deployer-dev.db go run ./cmd/deployer
 ```
 
 ## Pull Requests

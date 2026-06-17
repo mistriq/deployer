@@ -21,13 +21,13 @@ jobs:
           cache: true
 
       - name: Format check
-        run: test -z "$(gofmt -l *.go)"
+        run: test -z "$(gofmt -l ./cmd ./internal)"
 
       - name: Test
         run: go test ./...
 
       - name: Build
-        run: go build -o /tmp/deployer-ci .
+        run: go build -o /tmp/deployer-ci ./cmd/deployer
 
       - name: Race test
         run: go test -race ./...
