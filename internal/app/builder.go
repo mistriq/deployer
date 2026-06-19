@@ -400,7 +400,7 @@ func (b *Builder) runPipeline(ctx context.Context, project *Project, build *Buil
 	} else {
 		// DOCKER MODE — build image
 		startGroup("Docker Build")
-		dockerArgs := []string{"build", "--no-cache", "--progress=plain", "-t", project.ImageName, "-f", project.DockerfilePath}
+		dockerArgs := []string{"build", "--progress=plain", "-t", project.ImageName, "-f", project.DockerfilePath}
 		for k, v := range project.BuildArgs {
 			v = strings.ReplaceAll(v, "${GIT_SHA}", sha)
 			dockerArgs = append(dockerArgs, "--build-arg", fmt.Sprintf("%s=%s", k, v))
@@ -445,12 +445,11 @@ func (b *Builder) runPipeline(ctx context.Context, project *Project, build *Buil
 				return
 			}
 
-			// Cleanup local Docker after save
+			// Cleanup local Docker images after save without dropping BuildKit cache.
 			startGroup("Cleanup")
 			if appConfig.DockerPrune {
-				logf("Pruning local Docker images and build cache...")
+				logf("Pruning local Docker images...")
 				logOperationalError("docker image prune", b.runStepSilent(ctx, "", "docker", "image", "prune", "-af"))
-				logOperationalError("docker builder prune", b.runStepSilent(ctx, "", "docker", "builder", "prune", "-af"))
 				logf("Cleanup done")
 			} else {
 				logf("Docker prune skipped")

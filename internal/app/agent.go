@@ -319,12 +319,11 @@ func executeJob(serverURL, token string, job *Job) {
 		endGroup()
 	}
 
-	// Cleanup old images and build cache after successful deploy
+	// Cleanup old images after successful deploy without dropping BuildKit cache.
 	startGroup("Cleanup")
 	if getenvBoolDefault("DEPLOYER_DOCKER_PRUNE", false) {
-		sendLogf("Pruning old Docker images and build cache...")
+		sendLogf("Pruning old Docker images...")
 		_ = agentRunCommandSilent(job.BuildID, "docker", "image", "prune", "-af")
-		_ = agentRunCommandSilent(job.BuildID, "docker", "builder", "prune", "-af")
 		sendLogf("Cleanup done")
 	} else {
 		sendLogf("Docker prune skipped")
