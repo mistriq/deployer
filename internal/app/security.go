@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -17,8 +16,8 @@ const requestIDHeader = "X-Request-ID"
 
 type requestIDContextKey struct{}
 
-func wrapHTTPHandler(cfg AppConfig, next http.Handler) http.Handler {
-	handler := securityHeaders(csrfMiddleware(adminAuthMiddleware(cfg, next)))
+func wrapHTTPHandler(next http.Handler) http.Handler {
+	handler := securityHeaders(csrfMiddleware(next))
 	handler = panicRecoveryMiddleware(handler)
 	handler = requestLoggingMiddleware(handler)
 	return requestIDMiddleware(handler)
@@ -163,50 +162,4 @@ func requiresCSRF(r *http.Request) bool {
 		return false
 	}
 	return true
-}
-
-func adminAuthMiddleware(cfg AppConfig, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/agent/") {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		if isAgentAccessiblePath(r.URL.Path) && hasBearerToken(r) {
-			if _, err := authenticateAgent(r); err != nil {
-				jsonErrorCode(w, errCodeInvalidAgentToken, "invalid agent token", http.StatusUnauthorized)
-				return
-			}
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		if cfg.AdminPassword == "" {
-			if isLoopbackRemoteAddr(r.RemoteAddr) {
-				next.ServeHTTP(w, r)
-				return
-			}
-			jsonErrorCode(w, errCodeAdminAuthNotConfigured, "admin authentication is not configured", http.StatusForbidden)
-			return
-		}
-
-		user, pass, ok := r.BasicAuth()
-		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(cfg.AdminUser)) == 1
-		passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.AdminPassword)) == 1
-		if !ok || !userOK || !passOK {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Deployer"`)
-			jsonErrorCode(w, errCodeAuthenticationRequired, "authentication required", http.StatusUnauthorized)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-func isAgentAccessiblePath(path string) bool {
-	return path == "/api/version" || path == "/download/deployer"
-}
-
-func hasBearerToken(r *http.Request) bool {
-	return agentTokenFromRequest(r) != ""
 }

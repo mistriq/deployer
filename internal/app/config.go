@@ -1,7 +1,6 @@
 package app
 
 import (
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,8 +11,6 @@ import (
 type AppConfig struct {
 	Addr                   string
 	DBPath                 string
-	AdminUser              string
-	AdminPassword          string
 	PublicURL              string
 	ArtifactDir            string
 	SnapshotDir            string
@@ -35,25 +32,11 @@ type SecurityStatus struct {
 	Class string
 }
 
-func securityStatus(cfg AppConfig) SecurityStatus {
-	if cfg.AdminPassword == "" {
-		return SecurityStatus{
-			Label: "Local-only",
-			Title: "Admin authentication is disabled; only loopback clients are accepted.",
-			Class: "local-only",
-		}
-	}
-	if isPublicListenAddr(cfg.Addr) {
-		return SecurityStatus{
-			Label: "Auth enabled",
-			Title: "Admin authentication is required; the server is listening on a public interface.",
-			Class: "auth-enabled",
-		}
-	}
+func securityStatus() SecurityStatus {
 	return SecurityStatus{
-		Label: "Auth enabled",
-		Title: "Admin authentication is required; the server is listening on loopback.",
-		Class: "auth-enabled",
+		Label: "External auth",
+		Title: "Interactive authentication is delegated to the upstream authorization gateway.",
+		Class: "external-auth",
 	}
 }
 
@@ -61,7 +44,6 @@ func loadConfig() AppConfig {
 	cfg := AppConfig{
 		Addr:                   getenvDefault("DEPLOYER_ADDR", "127.0.0.1:9090"),
 		DBPath:                 getenvDefault("DEPLOYER_DB_PATH", "deployer.db"),
-		AdminUser:              getenvDefault("DEPLOYER_ADMIN_USER", "admin"),
 		PublicURL:              strings.TrimRight(os.Getenv("DEPLOYER_PUBLIC_URL"), "/"),
 		ArtifactDir:            getenvDefault("DEPLOYER_ARTIFACT_DIR", filepath.Join(os.TempDir(), "deployer-artifacts")),
 		SnapshotDir:            getenvDefault("DEPLOYER_SNAPSHOT_DIR", filepath.Join(os.TempDir(), "deployer-snapshots")),
@@ -75,12 +57,6 @@ func loadConfig() AppConfig {
 		SSHTimeout:             getenvDurationDefault("DEPLOYER_SSH_TIMEOUT", 5*time.Minute),
 		HealthCheckTimeout:     getenvDurationDefault("DEPLOYER_HEALTH_CHECK_TIMEOUT", 60*time.Second),
 		DemoMode:               getenvBoolDefault("DEPLOYER_DEMO_MODE", false),
-	}
-	cfg.AdminPassword = os.Getenv("DEPLOYER_ADMIN_PASSWORD")
-	if cfg.AdminPassword == "" && isPublicListenAddr(cfg.Addr) {
-		logFatal("config_error", "DEPLOYER_ADMIN_PASSWORD is required when DEPLOYER_ADDR is not loopback-only", nil, map[string]interface{}{
-			"addr": cfg.Addr,
-		})
 	}
 	return cfg
 }
@@ -143,26 +119,4 @@ func retentionDuration(hours int) time.Duration {
 		return 0
 	}
 	return time.Duration(hours) * time.Hour
-}
-
-func isPublicListenAddr(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	host = strings.Trim(host, "[]")
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && !ip.IsLoopback()
-}
-
-func isLoopbackRemoteAddr(remoteAddr string) bool {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }

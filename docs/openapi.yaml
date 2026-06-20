@@ -4,17 +4,15 @@ info:
   version: v1
   description: >
     Machine-readable reference for the Deployer admin API and runner agent API.
-    Admin routes require Basic Auth when DEPLOYER_ADMIN_PASSWORD is configured.
-    Browser write requests also send X-Deployer-CSRF: "1". Agent routes use
-    bearer tokens created through the runner API.
+    Admin routes are intended to be protected by an upstream authorization
+    gateway; Deployer does not implement local admin password login. Browser
+    write requests also send X-Deployer-CSRF: "1". Agent routes use bearer
+    tokens created through the runner API.
 servers:
   - url: https://deployer.example.com
     description: Example production URL
   - url: http://127.0.0.1:9090
     description: Default local URL
-
-security:
-  - basicAuth: []
 
 tags:
   - name: capabilities
@@ -1036,9 +1034,6 @@ paths:
 
 components:
   securitySchemes:
-    basicAuth:
-      type: http
-      scheme: basic
     agentBearerAuth:
       type: http
       scheme: bearer
@@ -1191,14 +1186,14 @@ components:
         auth:
           type: object
           properties:
-            admin_auth_configured:
+            external_admin_auth:
+              type: boolean
+            local_password_auth:
               type: boolean
             agent_bearer_auth:
               type: boolean
             csrf_header:
               type: string
-            local_only_without_admin_password:
-              type: boolean
         features:
           type: object
           additionalProperties:

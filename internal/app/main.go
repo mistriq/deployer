@@ -130,7 +130,7 @@ func Run() {
 			return base64.StdEncoding.EncodeToString([]byte(s))
 		},
 		"securityStatus": func() SecurityStatus {
-			return securityStatus(appConfig)
+			return securityStatus()
 		},
 		"compactPath": compactPath,
 	}).ParseFS(webFS, "web/*.html")
@@ -186,18 +186,16 @@ func Run() {
 
 	server := &http.Server{
 		Addr:              appConfig.Addr,
-		Handler:           wrapHTTPHandler(appConfig, mux),
+		Handler:           wrapHTTPHandler(mux),
 		ReadTimeout:       appConfig.ServerReadTimeout,
 		WriteTimeout:      appConfig.ServerWriteTimeout,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
-	if appConfig.AdminPassword == "" {
-		logStructured("warn", "admin_auth_disabled", map[string]interface{}{
-			"addr": appConfig.Addr,
-		})
-	}
+	logStructured("info", "admin_auth_delegated", map[string]interface{}{
+		"addr": appConfig.Addr,
+	})
 	logStructured("info", "server_started", map[string]interface{}{
 		"addr": appConfig.Addr,
 	})

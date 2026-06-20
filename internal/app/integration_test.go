@@ -47,10 +47,7 @@ func TestAgentHTTPIntegrationPollLogComplete(t *testing.T) {
 	mux.HandleFunc("/api/agent/poll", handleAgentPoll)
 	mux.HandleFunc("/api/agent/log/", handleAgentLog)
 	mux.HandleFunc("/api/agent/complete/", handleAgentComplete)
-	server := httptest.NewServer(wrapHTTPHandler(AppConfig{
-		AdminUser:     "admin",
-		AdminPassword: "secret",
-	}, mux))
+	server := httptest.NewServer(wrapHTTPHandler(mux))
 	defer server.Close()
 
 	polled := agentRequest(t, server.URL, runner.Token, http.MethodGet, "/api/agent/poll", nil)
@@ -140,10 +137,7 @@ func TestAgentCompletionDoesNotOverwriteCancelledBuild(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/agent/complete/", handleAgentComplete)
-	server := httptest.NewServer(wrapHTTPHandler(AppConfig{
-		AdminUser:     "admin",
-		AdminPassword: "secret",
-	}, mux))
+	server := httptest.NewServer(wrapHTTPHandler(mux))
 	defer server.Close()
 
 	completeResp := agentRequest(t, server.URL, runner.Token, http.MethodPost, "/api/agent/complete/"+itoa(build.ID), strings.NewReader(`{"status":"success","error":""}`))
@@ -206,10 +200,7 @@ func TestAgentCompletionRejectsInvalidStatus(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/agent/complete/", handleAgentComplete)
-	server := httptest.NewServer(wrapHTTPHandler(AppConfig{
-		AdminUser:     "admin",
-		AdminPassword: "secret",
-	}, mux))
+	server := httptest.NewServer(wrapHTTPHandler(mux))
 	defer server.Close()
 
 	completeResp := agentRequest(t, server.URL, runner.Token, http.MethodPost, "/api/agent/complete/"+itoa(build.ID), strings.NewReader(`{"status":"unknown","error":""}`))
@@ -269,10 +260,7 @@ func TestAgentCompletionPersistsRuntimeErrorCodes(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/agent/complete/", handleAgentComplete)
-	server := httptest.NewServer(wrapHTTPHandler(AppConfig{
-		AdminUser:     "admin",
-		AdminPassword: "secret",
-	}, mux))
+	server := httptest.NewServer(wrapHTTPHandler(mux))
 	defer server.Close()
 
 	body := strings.NewReader(`{"status":"failed","error":"download artifact: status 404"}`)
@@ -346,10 +334,7 @@ func TestAgentArtifactAndSnapshotHandlers(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/agent/artifact/", handleAgentArtifact)
 	mux.HandleFunc("/api/agent/snapshot/", handleAgentSnapshotUpload)
-	server := httptest.NewServer(wrapHTTPHandler(AppConfig{
-		AdminUser:     "admin",
-		AdminPassword: "secret",
-	}, mux))
+	server := httptest.NewServer(wrapHTTPHandler(mux))
 	defer server.Close()
 
 	forbidden := agentRequest(t, server.URL, otherRunner.Token, http.MethodGet, "/api/agent/artifact/"+itoa(build.ID), nil)
@@ -411,10 +396,7 @@ func TestRunnerAPIHandlersHideAndRotateTokens(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/runners", handleAPIRunners)
 	mux.HandleFunc("/api/runners/", handleAPIRunner)
-	server := httptest.NewServer(wrapHTTPHandler(AppConfig{
-		AdminUser:     "admin",
-		AdminPassword: "secret",
-	}, mux))
+	server := httptest.NewServer(wrapHTTPHandler(mux))
 	defer server.Close()
 
 	client := server.Client()
@@ -423,7 +405,6 @@ func TestRunnerAPIHandlersHideAndRotateTokens(t *testing.T) {
 		t.Fatalf("create runner request: %v", err)
 	}
 	createReq.Header.Set(csrfHeader, "1")
-	createReq.SetBasicAuth("admin", "secret")
 	createResp, err := client.Do(createReq)
 	if err != nil {
 		t.Fatalf("create runner: %v", err)
@@ -444,7 +425,6 @@ func TestRunnerAPIHandlersHideAndRotateTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get runner request: %v", err)
 	}
-	getReq.SetBasicAuth("admin", "secret")
 	getResp, err := client.Do(getReq)
 	if err != nil {
 		t.Fatalf("get runner: %v", err)
@@ -462,7 +442,6 @@ func TestRunnerAPIHandlersHideAndRotateTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list runners request: %v", err)
 	}
-	listReq.SetBasicAuth("admin", "secret")
 	listResp, err := client.Do(listReq)
 	if err != nil {
 		t.Fatalf("list runners: %v", err)
@@ -481,7 +460,6 @@ func TestRunnerAPIHandlersHideAndRotateTokens(t *testing.T) {
 		t.Fatalf("rotate runner request: %v", err)
 	}
 	rotateReq.Header.Set(csrfHeader, "1")
-	rotateReq.SetBasicAuth("admin", "secret")
 	rotateResp, err := client.Do(rotateReq)
 	if err != nil {
 		t.Fatalf("rotate runner: %v", err)
@@ -503,10 +481,7 @@ func TestAdminProjectAndBuildAPIHandlers(t *testing.T) {
 	mux.HandleFunc("/api/projects", handleAPIProjects)
 	mux.HandleFunc("/api/projects/", handleAPIProject)
 	mux.HandleFunc("/api/builds/", handleAPIBuild)
-	server := httptest.NewServer(wrapHTTPHandler(AppConfig{
-		AdminUser:     "admin",
-		AdminPassword: "secret",
-	}, mux))
+	server := httptest.NewServer(wrapHTTPHandler(mux))
 	defer server.Close()
 	client := server.Client()
 
@@ -722,7 +697,6 @@ func adminRequest(t *testing.T, baseURL, method, path string, body io.Reader) *h
 	if err != nil {
 		t.Fatalf("create %s %s request: %v", method, path, err)
 	}
-	req.SetBasicAuth("admin", "secret")
 	if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete {
 		req.Header.Set(csrfHeader, "1")
 	}

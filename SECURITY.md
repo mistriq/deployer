@@ -20,8 +20,11 @@ command execution.
 
 ## Operational Guidance
 
-- Run the server behind HTTPS.
-- Set `DEPLOYER_ADMIN_PASSWORD` when exposing the UI/API beyond localhost.
+- Run the server behind HTTPS and an authorization gateway. This deployment uses
+  [Pocket ID](https://github.com/pocket-id/pocket-id) as the upstream OIDC
+  gateway.
+- Do not expose the Deployer UI/API directly to untrusted networks; local admin
+  password login is not implemented.
 - Keep runner tokens private and rotate them if they appear in logs, URLs, shell
   history, screenshots, or support bundles.
 - Do not publish `deployer.db`, build logs, screenshots, or local systemd/env

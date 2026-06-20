@@ -21,10 +21,10 @@ type capabilitiesResponse struct {
 }
 
 type capabilitiesAuth struct {
-	AdminAuthConfigured       bool   `json:"admin_auth_configured"`
-	AgentBearerAuth           bool   `json:"agent_bearer_auth"`
-	CSRFHeader                string `json:"csrf_header"`
-	LocalOnlyWithoutAdminPass bool   `json:"local_only_without_admin_password"`
+	ExternalAdminAuth bool   `json:"external_admin_auth"`
+	LocalPasswordAuth bool   `json:"local_password_auth"`
+	AgentBearerAuth   bool   `json:"agent_bearer_auth"`
+	CSRFHeader        string `json:"csrf_header"`
 }
 
 type capabilitiesLimits struct {
@@ -55,7 +55,6 @@ func newCapabilitiesResponse(cfg AppConfig) capabilitiesResponse {
 		ErrorCodes: []string{
 			errCodeAuthenticationRequired,
 			errCodeInvalidAgentToken,
-			errCodeAdminAuthNotConfigured,
 			errCodeCSRFRequired,
 			errCodeForbidden,
 			errCodeValidation,
@@ -90,10 +89,10 @@ func newCapabilitiesResponse(cfg AppConfig) capabilitiesResponse {
 			"capabilities",
 		},
 		Auth: capabilitiesAuth{
-			AdminAuthConfigured:       cfg.AdminPassword != "",
-			AgentBearerAuth:           true,
-			CSRFHeader:                csrfHeader,
-			LocalOnlyWithoutAdminPass: cfg.AdminPassword == "",
+			ExternalAdminAuth: true,
+			LocalPasswordAuth: false,
+			AgentBearerAuth:   true,
+			CSRFHeader:        csrfHeader,
 		},
 		Features: map[string]bool{
 			"artifact_downloads":      true,

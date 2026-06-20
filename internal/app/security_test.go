@@ -4,15 +4,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
-func TestAdminAuthMiddlewareRequiresBasicAuth(t *testing.T) {
-	handler := wrapHTTPHandler(AppConfig{
-		AdminUser:     "admin",
-		AdminPassword: "secret",
-	}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestAdminRequestsAreDelegatedToUpstreamAuth(t *testing.T) {
+	handler := wrapHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
@@ -20,53 +16,21 @@ func TestAdminAuthMiddlewareRequiresBasicAuth(t *testing.T) {
 	req.RemoteAddr = "203.0.113.10:1234"
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected unauthorized without credentials, got %d", rec.Code)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/projects", nil)
-	req.RemoteAddr = "203.0.113.10:1234"
-	req.SetBasicAuth("admin", "secret")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
-		t.Fatalf("expected authorized request, got %d", rec.Code)
+		t.Fatalf("expected admin request to pass local middleware, got %d", rec.Code)
 	}
-}
-
-func TestAdminAuthMiddlewareAllowsLoopbackWhenPasswordUnset(t *testing.T) {
-	handler := wrapHTTPHandler(AppConfig{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/api/projects", nil)
-	req.RemoteAddr = "127.0.0.1:1234"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("expected loopback request to be allowed, got %d", rec.Code)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/projects", nil)
-	req.RemoteAddr = "203.0.113.10:1234"
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("expected non-loopback request to be forbidden, got %d", rec.Code)
+	if got := rec.Header().Get("WWW-Authenticate"); got != "" {
+		t.Fatalf("did not expect Basic Auth challenge, got %q", got)
 	}
 }
 
 func TestCSRFMiddlewareRequiresHeaderForBrowserWrites(t *testing.T) {
-	handler := wrapHTTPHandler(AppConfig{
-		AdminUser:     "admin",
-		AdminPassword: "secret",
-	}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := wrapHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/projects", nil)
 	req.RemoteAddr = "203.0.113.10:1234"
-	req.SetBasicAuth("admin", "secret")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
@@ -75,7 +39,6 @@ func TestCSRFMiddlewareRequiresHeaderForBrowserWrites(t *testing.T) {
 
 	req = httptest.NewRequest(http.MethodPost, "/api/projects", nil)
 	req.RemoteAddr = "203.0.113.10:1234"
-	req.SetBasicAuth("admin", "secret")
 	req.Header.Set(csrfHeader, "1")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -85,7 +48,7 @@ func TestCSRFMiddlewareRequiresHeaderForBrowserWrites(t *testing.T) {
 }
 
 func TestMiddlewareSetsRequestID(t *testing.T) {
-	handler := wrapHTTPHandler(AppConfig{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := wrapHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
@@ -111,7 +74,7 @@ func TestMiddlewareSetsRequestID(t *testing.T) {
 }
 
 func TestPanicRecoveryMiddlewareReturnsCodedJSONError(t *testing.T) {
-	handler := wrapHTTPHandler(AppConfig{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := wrapHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		panic("boom")
 	}))
 
@@ -152,19 +115,11 @@ func TestLoggingResponseWriterPreservesFlusher(t *testing.T) {
 }
 
 func TestSecurityStatusReflectsAuthenticationMode(t *testing.T) {
-	localOnly := securityStatus(AppConfig{Addr: "127.0.0.1:9090"})
-	if localOnly.Label != "Local-only" || localOnly.Class != "local-only" {
-		t.Fatalf("expected local-only status, got %+v", localOnly)
+	status := securityStatus()
+	if status.Label != "External auth" || status.Class != "external-auth" {
+		t.Fatalf("expected external auth status, got %+v", status)
 	}
-	if !strings.Contains(localOnly.Title, "disabled") {
-		t.Fatalf("expected local-only title to mention disabled auth, got %q", localOnly.Title)
-	}
-
-	authenticated := securityStatus(AppConfig{Addr: "0.0.0.0:9090", AdminPassword: "secret"})
-	if authenticated.Label != "Auth enabled" || authenticated.Class != "auth-enabled" {
-		t.Fatalf("expected authenticated status, got %+v", authenticated)
-	}
-	if !strings.Contains(authenticated.Title, "public interface") {
-		t.Fatalf("expected public listen title, got %q", authenticated.Title)
+	if status.Title == "" {
+		t.Fatal("expected external auth status title")
 	}
 }

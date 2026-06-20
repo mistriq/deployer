@@ -41,12 +41,17 @@ Deployer can execute commands and write files on every configured runner. Treat
 server admin access and runner tokens as privileged production credentials.
 
 By default, the server binds to `127.0.0.1:9090`. If you bind to a non-loopback
-address, `DEPLOYER_ADMIN_PASSWORD` is required.
+address, protect the UI/API with an upstream authorization gateway. Deployer no
+longer implements local admin password login; direct network access to the
+UI/API is admin access.
 
 Recommended production setup:
 
-- Put the server behind HTTPS.
-- Set `DEPLOYER_ADMIN_PASSWORD`.
+- Put the server behind HTTPS and an authorization gateway.
+- This deployment uses [Pocket ID](https://github.com/pocket-id/pocket-id) as
+  the upstream OIDC authorization gateway.
+- Bind Deployer to loopback or a private interface unless the gateway controls
+  all public entry points.
 - Use a reverse proxy with request-size limits appropriate for your artifacts.
 - Keep runner tokens out of URLs, logs, shell history, and screenshots.
 - Do not publish `deployer.db`, logs, generated binaries, or local config files.
@@ -64,13 +69,11 @@ Prerequisites:
 
 ```bash
 go build -o deployer ./cmd/deployer
-DEPLOYER_ADMIN_PASSWORD='change-me' ./deployer
+./deployer
 ```
 
-Open `http://127.0.0.1:9090` and authenticate with:
-
-- User: `admin` unless `DEPLOYER_ADMIN_USER` is set.
-- Password: `DEPLOYER_ADMIN_PASSWORD`.
+Open `http://127.0.0.1:9090` for local development, or access the production
+URL through your authorization gateway.
 
 ## Configuration
 
@@ -78,8 +81,6 @@ Open `http://127.0.0.1:9090` and authenticate with:
 | --- | --- | --- |
 | `DEPLOYER_ADDR` | `127.0.0.1:9090` | HTTP listen address. |
 | `DEPLOYER_DB_PATH` | `deployer.db` | SQLite database path. |
-| `DEPLOYER_ADMIN_USER` | `admin` | Basic Auth username. |
-| `DEPLOYER_ADMIN_PASSWORD` | empty | Basic Auth password. Required for non-loopback binds. |
 | `DEPLOYER_PUBLIC_URL` | empty | Public URL used in generated runner setup commands. |
 | `DEPLOYER_ARTIFACT_DIR` | `/tmp/deployer-artifacts` | Managed server-side build artifact directory. |
 | `DEPLOYER_SNAPSHOT_DIR` | `/tmp/deployer-snapshots` | Managed server-side snapshot artifact directory. |
@@ -126,8 +127,6 @@ Environment=DEPLOYER_DOCKER_BUILD_TIMEOUT=15m
 Environment=DEPLOYER_SCP_TIMEOUT=10m
 Environment=DEPLOYER_SSH_TIMEOUT=5m
 Environment=DEPLOYER_HEALTH_CHECK_TIMEOUT=60s
-Environment=DEPLOYER_ADMIN_USER=admin
-Environment=DEPLOYER_ADMIN_PASSWORD=change-me
 Environment=DEPLOYER_PUBLIC_URL=https://deployer.example.com
 
 [Install]
@@ -207,8 +206,8 @@ node_modules
 
 ## API Overview
 
-Admin UI/API routes require Basic Auth when `DEPLOYER_ADMIN_PASSWORD` is set.
-Browser state-changing requests also include `X-Deployer-CSRF: 1`.
+Admin UI/API routes rely on the upstream authorization gateway. Browser
+state-changing requests also include `X-Deployer-CSRF: 1`.
 
 Agent routes require `Authorization: Bearer <runner-token>`.
 
@@ -342,8 +341,9 @@ Agent self-update is disabled by default. Set `DEPLOYER_AGENT_AUTO_UPDATE=true`
 or pass `--auto-update` to opt in.
 
 When enabled, agents check `/api/version` and download `/download/deployer` when
-the server version changes. The endpoint requires either admin auth or a valid
-runner bearer token. The agent verifies the downloaded binary against the
+the server version changes. Protect these endpoints with the same authorization
+gateway used for the UI/API, or expose them only on a trusted network for
+runner access. The agent verifies the downloaded binary against the
 `checksum_sha256` value returned by `/api/version`, stages it next to the
 current executable, atomically swaps it into place, and keeps the previous
 binary as `<name>.old`.
@@ -385,11 +385,13 @@ For internet-facing use, terminate HTTPS at a reverse proxy and forward to the
 loopback listener. Configure:
 
 - HTTPS with modern TLS settings.
+- An authorization gateway that authenticates users before forwarding UI/API
+  requests to Deployer. This deployment uses
+  [Pocket ID](https://github.com/pocket-id/pocket-id) for that gateway.
 - Request-size limits large enough for Docker image artifacts and snapshots.
 - Proxy read timeouts longer than agent long-polling and large artifact
   transfers.
 - Access logs that do not record Authorization headers.
-- Optional additional authentication such as SSO or a VPN.
 
 ## Operational Recovery
 

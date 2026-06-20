@@ -10,7 +10,6 @@ import (
 const (
 	errCodeAuthenticationRequired = "authentication_required"
 	errCodeInvalidAgentToken      = "invalid_agent_token"
-	errCodeAdminAuthNotConfigured = "admin_auth_not_configured"
 	errCodeCSRFRequired           = "csrf_required"
 	errCodeForbidden              = "forbidden"
 	errCodeValidation             = "validation_error"

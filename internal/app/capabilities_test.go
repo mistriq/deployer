@@ -17,7 +17,6 @@ func TestHandleAPICapabilitiesReturnsMachineReadableMetadata(t *testing.T) {
 
 	buildVersion = "1.2.3-test"
 	appConfig = AppConfig{
-		AdminPassword:          "secret",
 		LogRetentionDays:       14,
 		ArtifactRetentionHours: 48,
 	}
@@ -54,7 +53,7 @@ func TestHandleAPICapabilitiesReturnsMachineReadableMetadata(t *testing.T) {
 		!containsString(got.RuntimeErrors, runtimeErrRunnerOffline) {
 		t.Fatalf("expected runtime error codes to be listed, got %#v", got.RuntimeErrors)
 	}
-	if !got.Auth.AdminAuthConfigured || !got.Auth.AgentBearerAuth || got.Auth.CSRFHeader != csrfHeader {
+	if !got.Auth.ExternalAdminAuth || got.Auth.LocalPasswordAuth || !got.Auth.AgentBearerAuth || got.Auth.CSRFHeader != csrfHeader {
 		t.Fatalf("unexpected auth metadata: %+v", got.Auth)
 	}
 	if !got.Features["runner_token_rotation"] || !got.Features["sse_build_logs"] ||

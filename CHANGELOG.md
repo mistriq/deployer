@@ -4,8 +4,9 @@
 
 - Prepare repository for public release.
 - Remove private runtime artifacts and production-specific documentation.
-- Add admin authentication, CSRF checks, bearer-token agent authentication, and
-  safer security headers.
+- Delegate admin UI/API authentication to an upstream authorization gateway, and
+  keep CSRF checks, bearer-token agent authentication, and safer security
+  headers.
 - Store new runner tokens hashed at rest.
 - Migrate legacy plaintext runner tokens to hashes at startup and add runner
   token rotation.

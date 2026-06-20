@@ -13,8 +13,6 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 
 	t.Setenv("DEPLOYER_ADDR", "127.0.0.1:9191")
 	t.Setenv("DEPLOYER_DB_PATH", filepath.Join(t.TempDir(), "deployer.db"))
-	t.Setenv("DEPLOYER_ADMIN_USER", "operator")
-	t.Setenv("DEPLOYER_ADMIN_PASSWORD", "secret")
 	t.Setenv("DEPLOYER_PUBLIC_URL", "https://deployer.example.com/")
 	t.Setenv("DEPLOYER_ARTIFACT_DIR", artifactDir)
 	t.Setenv("DEPLOYER_SNAPSHOT_DIR", snapshotDir)
@@ -30,8 +28,8 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	t.Setenv("DEPLOYER_DEMO_MODE", "true")
 
 	cfg := loadConfig()
-	if cfg.Addr != "127.0.0.1:9191" || cfg.AdminUser != "operator" || cfg.AdminPassword != "secret" {
-		t.Fatalf("unexpected auth/listen config: %+v", cfg)
+	if cfg.Addr != "127.0.0.1:9191" {
+		t.Fatalf("unexpected listen config: %+v", cfg)
 	}
 	if cfg.PublicURL != "https://deployer.example.com" {
 		t.Fatalf("expected public URL to be trimmed, got %q", cfg.PublicURL)

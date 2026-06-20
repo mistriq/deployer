@@ -37,9 +37,9 @@ quality gaps found during the audit.
 
 ## P0 - Security
 
-- [x] Add authentication/authorization for the main UI and REST API. Currently
-  the server listens on `0.0.0.0:9090`, and unauthenticated users can create,
-  update, delete, deploy, cancel, snapshot, and manage runners.
+- [x] Require authentication/authorization for the main UI and REST API through
+  an upstream gateway. Deployer no longer implements local admin password login,
+  so the UI/API must not be exposed directly to untrusted networks.
 - [x] Add CSRF protection for state-changing browser endpoints.
 - [x] Do not pass agent tokens in URL query strings. Move agent authentication
   to an `Authorization: Bearer ...` header or another non-URL credential
@@ -162,7 +162,8 @@ quality gaps found during the audit.
   and cancel actions.
 - [x] Disable destructive/action buttons while requests are in flight.
 - [x] Replace `alert`/`confirm` flows with safer, clearer UI dialogs.
-- [x] Add explicit indication when the server is unauthenticated/local-only.
+- [x] Add explicit indication that interactive admin authentication is delegated
+  to an upstream gateway.
 - [x] Add pagination for projects, builds, runners, and logs.
 - [x] Add search/filtering for builds and projects.
 - [x] Add mobile review after fixing layout issues from long paths and long
