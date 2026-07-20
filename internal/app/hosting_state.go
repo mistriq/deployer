@@ -454,9 +454,10 @@ func findGenericIdempotencyReplay(ctx context.Context, conn *sql.Conn, tokenID i
 		return nil, err
 	}
 	now := time.Now().UTC()
-	if !parseSQLiteTime(expiresAt).After(now) {
+	if status.Valid && response.Valid && !parseSQLiteTime(expiresAt).After(now) {
 		_, err := conn.ExecContext(ctx, `DELETE FROM hosting_idempotency
-			WHERE issuer_token_id=? AND operation=? AND idempotency_key=? AND expires_at<=?`,
+			WHERE issuer_token_id=? AND operation=? AND idempotency_key=?
+			  AND response_status IS NOT NULL AND response_body IS NOT NULL AND expires_at<=?`,
 			tokenID, operation, key, formatSQLiteTime(now))
 		return nil, err
 	}
@@ -949,14 +950,25 @@ func loadIdempotentResponse(ctx context.Context, tokenID int64, operation, key s
 	var storedHash string
 	var status sql.NullInt64
 	var response sql.NullString
-	err := db.QueryRowContext(ctx, `SELECT request_hash, response_status, response_body FROM hosting_idempotency
-		WHERE issuer_token_id=? AND operation=? AND idempotency_key=? AND expires_at>?`,
-		tokenID, operation, key, formatSQLiteTime(time.Now().UTC())).Scan(&storedHash, &status, &response)
+	var expiresAt string
+	err := db.QueryRowContext(ctx, `SELECT request_hash, response_status, response_body, expires_at FROM hosting_idempotency
+		WHERE issuer_token_id=? AND operation=? AND idempotency_key=?`,
+		tokenID, operation, key).Scan(&storedHash, &status, &response, &expiresAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	now := time.Now().UTC()
+	if status.Valid && response.Valid && !parseSQLiteTime(expiresAt).After(now) {
+		if _, err := db.ExecContext(ctx, `DELETE FROM hosting_idempotency
+			WHERE issuer_token_id=? AND operation=? AND idempotency_key=?
+			  AND response_status IS NOT NULL AND response_body IS NOT NULL AND expires_at<=?`,
+			tokenID, operation, key, formatSQLiteTime(now)); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
 	if !hostingIdempotencyHashMatches(storedHash, hashes) {
 		return nil, &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "Idempotency-Key was already used with a different request", StatusCode: 409}
@@ -1011,299 +1023,16 @@ func handleInternalRollback(w http.ResponseWriter, r *http.Request, externalProj
 		return
 	}
 	token, _ := r.Context().Value(serviceTokenContextKey{}).(*ServiceToken)
-	release, replayed, err := rollbackHostingRelease(r.Context(), token, externalProjectID,
+	result, err := rollbackHostingReleaseResult(r.Context(), token, externalProjectID,
 		request.ExternalDeploymentID, request.ReleaseDigest, key)
 	if err != nil {
 		writeHostingAPIError(w, err)
 		return
 	}
-	if replayed {
+	if result.Replayed {
 		w.Header().Set("Idempotency-Replayed", "true")
 	}
-	jsonResponse(w, release)
-}
-
-func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID, externalDeploymentID, digest, key string) (*HostingRelease, bool, error) {
-	operation := "hosting.project.rollback"
-	hash := hashHostingOperation(operation, externalID, externalDeploymentID, digest)
-	if replay, err := loadIdempotentResponse(ctx, token.ID, operation, key, hash); err != nil || replay != nil {
-		if err != nil {
-			return nil, false, err
-		}
-		var release HostingRelease
-		if replay.StatusCode != http.StatusOK {
-			return nil, false, fmt.Errorf("invalid rollback idempotency response status %d", replay.StatusCode)
-		}
-		if err := json.Unmarshal(replay.Body, &release); err != nil {
-			return nil, false, err
-		}
-		return &release, true, nil
-	}
-	project, err := getHostingProjectByExternalID(externalID)
-	if err == sql.ErrNoRows {
-		return nil, false, &hostingAPIError{Code: errCodeProjectNotFound, Message: "project not found", StatusCode: 404}
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	allowed, err := hostingActivationAllowed(ctx, project.ID)
-	if err != nil {
-		return nil, false, err
-	}
-	if !allowed {
-		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution is disabled or suspended", StatusCode: http.StatusConflict}
-	}
-	var release HostingRelease
-	var releaseID, deploymentID, runtimeRunnerID int64
-	var createdAt string
-	var runnerStatus, runtimeJSON, runtimeInstanceID, runtimeFailureCode, activeSession, observedSession string
-	var runnerLastSeen, runtimeObservedAt sql.NullString
-	err = db.QueryRowContext(ctx, `SELECT r.id, d.id, r.release_digest, d.external_deployment_id, r.commit_sha,
-		r.artifact_digest, r.status, r.route_revision, r.previous_release_digest, r.runtime_endpoint,
-		r.created_at, hr.status, hr.last_seen, r.runtime_manifest_json, r.runtime_runner_id,
-		r.runtime_instance_id, r.runtime_failure_code, hr.active_session_id,
-		r.runtime_observed_at, r.runtime_observed_session_id FROM hosting_releases r
-		JOIN hosting_deployments d ON d.id=r.hosting_deployment_id
-		JOIN hosting_runners hr ON hr.id=r.runtime_runner_id
-		WHERE r.hosting_project_id=? AND d.external_deployment_id=? AND r.release_digest=?`,
-		project.ID, externalDeploymentID, digest).Scan(
-		&releaseID, &deploymentID, &release.Digest, &release.ExternalDeploymentID, &release.CommitSHA, &release.ArtifactDigest,
-		&release.Status, &release.RouteRevision, &release.PreviousRelease, &release.RuntimeEndpoint,
-		&createdAt, &runnerStatus, &runnerLastSeen, &runtimeJSON, &runtimeRunnerID, &runtimeInstanceID,
-		&runtimeFailureCode, &activeSession, &runtimeObservedAt, &observedSession)
-	if err == sql.ErrNoRows {
-		return nil, false, &hostingAPIError{Code: errCodeReleaseNotFound, Message: "release not found", StatusCode: 404}
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	if release.Status != "healthy" && release.Status != "inactive" && release.Status != "active" {
-		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release is not healthy and cannot be activated", StatusCode: 409}
-	}
-	if strings.TrimSpace(release.RuntimeEndpoint) == "" {
-		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release has no verified runtime endpoint", StatusCode: 409}
-	}
-	now := time.Now().UTC()
-	if runnerStatus != "online" || !runnerLastSeen.Valid || parseSQLiteTime(runnerLastSeen.String).Before(now.Add(-hostingRunnerStaleAfter)) || runtimeFailureCode != "" {
-		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release runner is not live", StatusCode: http.StatusConflict}
-	}
-	if activeSession != "" && (!runtimeObservedAt.Valid ||
-		parseSQLiteTime(runtimeObservedAt.String).Before(now.Add(-hostingRunnerStaleAfter)) || observedSession != activeSession) {
-		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy,
-			Message: "current runner session has not recently observed the exact rollback runtime", StatusCode: http.StatusConflict}
-	}
-	var releaseRuntime HostingRuntimeManifest
-	if err := json.Unmarshal([]byte(runtimeJSON), &releaseRuntime); err != nil {
-		return nil, false, fmt.Errorf("decode immutable release runtime: %w", err)
-	}
-	healthPath := releaseRuntime.HealthPath
-	if healthPath == "" {
-		healthPath = "/"
-	}
-	healthCtx, cancelHealth := context.WithTimeout(ctx, 30*time.Second)
-	_, _, healthErr := checkHostingCandidateHealth(healthCtx, strings.TrimRight(release.RuntimeEndpoint, "/")+healthPath)
-	cancelHealth()
-	if healthErr != nil {
-		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release failed a fresh rollback health gate", StatusCode: http.StatusConflict, Err: healthErr}
-	}
-	release.CreatedAt = parseSQLiteTime(createdAt)
-	var previous, previousEndpoint string
-	_ = db.QueryRowContext(ctx, `SELECT release_digest, runtime_endpoint FROM hosting_releases WHERE hosting_project_id=? AND status='active'`, project.ID).Scan(&previous, &previousEndpoint)
-	operationID := hashHostingOperation(fmt.Sprint(token.ID), operation, key)
-	intentConn, err := db.Conn(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	if _, err := intentConn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		intentConn.Close()
-		return nil, false, err
-	}
-	var desiredState, killReason string
-	var globalKill int
-	if err := intentConn.QueryRowContext(ctx, `SELECT p.desired_state, p.kill_switch_reason, s.global_kill_switch
-		FROM hosting_projects p JOIN hosting_settings s ON s.id=1 WHERE p.id=?`, project.ID).Scan(&desiredState, &killReason, &globalKill); err != nil {
-		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
-		intentConn.Close()
-		return nil, false, err
-	}
-	if desiredState != "active" || killReason != "" || globalKill != 0 {
-		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
-		intentConn.Close()
-		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution is disabled or suspended", StatusCode: http.StatusConflict}
-	}
-	currentFence, currentAvailable, fenceErr := currentHostingReleaseRuntimeFence(ctx, intentConn,
-		project.ID, digest, release.RuntimeEndpoint)
-	if fenceErr != nil || !currentAvailable || currentFence.RunnerID != runtimeRunnerID ||
-		currentFence.InstanceID != runtimeInstanceID || currentFence.SessionID != activeSession {
-		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
-		intentConn.Close()
-		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy,
-			Message: "rollback runtime identity changed before intent was persisted", StatusCode: http.StatusConflict, Err: fenceErr}
-	}
-	routeGeneration, err := nextHostingRouteGeneration(ctx, intentConn, project.ID)
-	if err != nil {
-		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
-		intentConn.Close()
-		return nil, false, err
-	}
-	intentResult, err := intentConn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
-		(operation_id, hosting_project_id, hosting_deployment_id, operation_type, release_digest, runtime_endpoint,
-		 expected_previous_release_digest, expected_previous_runtime_endpoint, target_runtime_runner_id,
-		 target_runtime_instance_id, target_runtime_session_id, route_generation, status, created_at, updated_at)
-		VALUES (?, ?, ?, 'rollback', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`,
-		operationID, project.ID, deploymentID, digest, release.RuntimeEndpoint, previous, previousEndpoint,
-		runtimeRunnerID, runtimeInstanceID, activeSession, routeGeneration, formatSQLiteTime(now), formatSQLiteTime(now))
-	if err != nil {
-		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
-		intentConn.Close()
-		return nil, false, err
-	}
-	inserted, _ := intentResult.RowsAffected()
-	if inserted == 1 {
-		metadata, _ := json.Marshal(map[string]any{"release_digest": digest, "previous_release_digest": previous})
-		if _, err := intentConn.ExecContext(ctx, `INSERT INTO hosting_audit_events
-			(issuer_token_id, hosting_project_id, event_type, reason, request_id, metadata_json, created_at)
-			VALUES (?, ?, 'hosting_release_rollback_requested', 'control-plane rollback', ?, ?, ?)`, token.ID,
-			project.ID, requestIDFromContext(ctx), redactSecrets(string(metadata)), formatSQLiteTime(now)); err != nil {
-			_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
-			intentConn.Close()
-			return nil, false, err
-		}
-	}
-	if _, err := intentConn.ExecContext(ctx, `COMMIT`); err != nil {
-		intentConn.Close()
-		return nil, false, err
-	}
-	intentConn.Close()
-	proxy, err := hostingProxyClientFactory(appConfig)
-	if err != nil {
-		return nil, false, err
-	}
-	activation, err := proxy.Activate(ctx, proxyActivationRequest{OperationID: operationID,
-		ExternalProjectID: externalID, ReleaseDigest: digest, RuntimeEndpoint: release.RuntimeEndpoint,
-		ExpectedPreviousReleaseDigest: previous, RouteGeneration: routeGeneration})
-	if err != nil {
-		_ = markHostingProxyOperationError(ctx, operationID, errCodeProxyUnavailable)
-		return nil, false, err
-	}
-	current, err := hostingProxyOperationIsCurrent(ctx, operationID)
-	if err != nil {
-		return nil, false, err
-	}
-	if !current {
-		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
-			return nil, false, err
-		}
-		return nil, false, &hostingAPIError{Code: errCodeConflict, Message: "a newer routing intent superseded rollback", StatusCode: http.StatusConflict}
-	}
-	if err := markHostingProxyOperationApplied(ctx, operationID, activation.RouteRevision); err != nil {
-		return nil, false, err
-	}
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return nil, false, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
-		}
-	}()
-	if replay, err := findGenericIdempotencyReplay(ctx, conn, token.ID, operation, key, hash); err != nil || replay != nil {
-		if err != nil {
-			return nil, false, err
-		}
-		var stored HostingRelease
-		if replay.StatusCode != http.StatusOK {
-			return nil, false, fmt.Errorf("invalid rollback idempotency response status %d", replay.StatusCode)
-		}
-		if err := json.Unmarshal(replay.Body, &stored); err != nil {
-			return nil, false, err
-		}
-		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
-			return nil, false, err
-		}
-		committed = true
-		return &stored, true, nil
-	}
-	if err := conn.QueryRowContext(ctx, `SELECT p.desired_state, p.kill_switch_reason, s.global_kill_switch
-		FROM hosting_projects p JOIN hosting_settings s ON s.id=1 WHERE p.id=?`, project.ID).Scan(&desiredState, &killReason, &globalKill); err != nil {
-		return nil, false, err
-	}
-	if desiredState != "active" || killReason != "" || globalKill != 0 {
-		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
-		committed = true
-		state := &hostingCompletionState{ProjectID: project.ID, ExternalProjectID: externalID,
-			ExternalDeploymentID: release.ExternalDeploymentID, PreviousReleaseDigest: previous,
-			PreviousRuntimeEndpoint: previousEndpoint}
-		if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operationID, state, digest); err != nil {
-			return nil, false, err
-		}
-		_ = markHostingProxyOperationCommitted(ctx, operationID)
-		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution was disabled during rollback", StatusCode: http.StatusConflict}
-	}
-	if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='inactive', deactivated_at=?
-		WHERE hosting_project_id=? AND status='active' AND id<>?`, formatSQLiteTime(now), project.ID, releaseID); err != nil {
-		return nil, false, err
-	}
-	result, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?,
-		previous_release_digest=?, activated_at=?, deactivated_at=NULL
-		WHERE id=? AND hosting_project_id=? AND hosting_deployment_id=? AND release_digest=?
-		AND status IN ('healthy','inactive','active') AND runtime_runner_id=?
-		AND runtime_instance_id=? AND runtime_failure_code='' AND runtime_missing_since IS NULL
-		AND COALESCE((SELECT active_session_id FROM hosting_runners WHERE id=?), '')=?
-		AND (?='' OR (runtime_observed_at>=? AND runtime_observed_session_id=?))
-		AND ?=(SELECT route_generation FROM hosting_projects WHERE id=?)
-		AND EXISTS (SELECT 1 FROM hosting_proxy_operations operation WHERE operation.operation_id=?
-		  AND operation.status='applied' AND operation.route_generation=?)`, activation.RouteRevision, previous,
-		formatSQLiteTime(now), releaseID, project.ID, deploymentID, digest, runtimeRunnerID, runtimeInstanceID,
-		runtimeRunnerID, activeSession, activeSession, formatSQLiteTime(now.Add(-hostingRunnerStaleAfter)), activeSession,
-		routeGeneration, project.ID, operationID, routeGeneration)
-	if err != nil {
-		return nil, false, err
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
-		committed = true
-		current, currentErr := hostingProxyOperationIsCurrent(ctx, operationID)
-		if currentErr != nil {
-			return nil, false, currentErr
-		}
-		if !current {
-			_ = markHostingProxyOperationFailed(ctx, operationID, errCodeConflict)
-			return nil, false, &hostingAPIError{Code: errCodeConflict,
-				Message: "a newer routing intent superseded rollback", StatusCode: http.StatusConflict}
-		}
-		state := &hostingCompletionState{ProjectID: project.ID, DeploymentID: deploymentID,
-			ExternalProjectID: externalID, ExternalDeploymentID: release.ExternalDeploymentID,
-			PreviousReleaseDigest: previous, PreviousRuntimeEndpoint: previousEndpoint}
-		if _, compensateErr := compensateHostingActivationIfCurrent(ctx, proxy, operationID, state, digest); compensateErr != nil {
-			return nil, false, compensateErr
-		}
-		_ = markHostingProxyOperationFailed(ctx, operationID, errCodeReleaseNotHealthy)
-		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release changed before rollback activation committed", StatusCode: http.StatusConflict}
-	}
-	if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_events (hosting_project_id, event_type, phase, metadata_json, created_at) VALUES (?, 'release_rolled_back', 'rolling_back', ?, ?)`, project.ID, fmt.Sprintf(`{"release_digest":%q}`, digest), formatSQLiteTime(now)); err != nil {
-		return nil, false, err
-	}
-	release.Status = "active"
-	release.RouteRevision = activation.RouteRevision
-	release.PreviousRelease = previous
-	release.ActivatedAt = &now
-	encoded, _ := json.Marshal(release)
-	if err := storeGenericIdempotency(ctx, conn, token.ID, operation, key, hash, http.StatusOK, encoded, now); err != nil {
-		return nil, false, err
-	}
-	if _, err := conn.ExecContext(ctx, `UPDATE hosting_proxy_operations SET status='committed', route_revision=?, updated_at=? WHERE operation_id=? AND status='applied'`, activation.RouteRevision, formatSQLiteTime(now), operationID); err != nil {
-		return nil, false, err
-	}
-	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
-		return nil, false, err
-	}
-	committed = true
-	return &release, false, nil
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(result.StatusCode)
+	_, _ = w.Write(result.ResponseBody)
 }

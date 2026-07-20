@@ -325,7 +325,18 @@ Private control-plane API:
 Rollback selects an immutable release instance with both its
 `external_deployment_id` and `release_digest`; a digest alone is intentionally
 insufficient because content-identical deployments can have distinct runtime
-instances.
+instances. Admission atomically binds one pending idempotency receipt to that
+exact release, request hash and routing generation before health or adapter
+calls. An exact retry while pending returns `409 idempotency_in_progress`; a
+different request with the same key returns `409 idempotency_conflict`, and
+neither retry creates new work. A `503` leaves the admitted rollback
+pending, so retain and retry only the same key. Pending rollback receipts do not
+expire. Once reconciliation records a completed success or terminal error, its
+status and body are retained for 24 hours and a replay returns
+`Idempotency-Replayed: true`.
+After any ambiguous transport error or `5xx`, retry the exact request only with
+the same key: admission may already have persisted work even when no response
+reached the caller.
 
 Scopes are `projects:write`, `deployments:read`, `deployments:write`, and
 `hosting:admin`. Service credentials are hashed, rotation keeps the configured
@@ -440,7 +451,10 @@ to the proxy adapter carries a positive, per-project monotonic
 `route_generation`. The adapter must atomically ignore requests below the
 highest generation it has applied for that project. Deployer persists each
 generation before the network call and reconciles pending operations after
-restart; compensations receive a newer generation.
+restart; compensations receive a newer generation. Rollback reconciliation
+atomically finalizes the idempotency receipt with the terminal response and, on
+success, the structured rollback event. An exact retry after restart therefore
+replays the completed response instead of creating another routing intent.
 
 Restore is explicitly negotiated through the runner `operations` capability.
 Legacy v1 agents that omit it are treated as build-only and never receive a

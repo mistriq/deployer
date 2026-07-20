@@ -25,6 +25,7 @@ type fakeProxyClient struct {
 	suspensions      []proxySuspendRequest
 	fail             bool
 	reject           bool
+	rejectOnce       bool
 	activateStarted  chan struct{}
 	activateContinue chan struct{}
 	suspendStarted   chan struct{}
@@ -42,6 +43,10 @@ func (fake *fakeProxyClient) Activate(_ context.Context, request proxyActivation
 	fake.activations = append(fake.activations, request)
 	fail := fake.fail
 	reject := fake.reject
+	if fake.rejectOnce {
+		reject = true
+		fake.rejectOnce = false
+	}
 	started := fake.activateStarted
 	continued := fake.activateContinue
 	fake.mu.Unlock()

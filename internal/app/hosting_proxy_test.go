@@ -80,7 +80,7 @@ func TestPrivateServiceURLsRequireHTTPSOutsideLoopback(t *testing.T) {
 	}
 }
 
-func TestHostingProxyRejectsMismatchedActivationIdentity(t *testing.T) {
+func TestHostingProxyTreatsMismatchedActivationIdentityAsAmbiguous(t *testing.T) {
 	requested := "sha256:" + strings.Repeat("b", 64)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		jsonResponse(w, proxyActivationResponse{RouteRevision: "revision-2", ActiveReleaseDigest: "sha256:" + strings.Repeat("c", 64)})
@@ -92,7 +92,27 @@ func TestHostingProxyRejectsMismatchedActivationIdentity(t *testing.T) {
 	}
 	_, err = client.Activate(context.Background(), proxyActivationRequest{OperationID: "op", ExternalProjectID: "project_01JPROXY", ReleaseDigest: requested, RuntimeEndpoint: "http://10.1.2.3:3000", RouteGeneration: 1})
 	apiErr, ok := err.(*hostingAPIError)
-	if !ok || apiErr.Code != errCodeProxyRejected {
+	if !ok || apiErr.Code != errCodeProxyUnavailable {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestHostingProxyClassifiesAdapterServerErrorAsAmbiguous(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		jsonErrorCode(w, errCodeInternal, "adapter failed after dispatch", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	client, err := newHostingProxyClient(AppConfig{ProxyAdapterURL: server.URL, ProxyAdapterToken: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Activate(t.Context(), proxyActivationRequest{
+		OperationID: "op-ambiguous-5xx", ExternalProjectID: "project_01JPROXY",
+		ReleaseDigest: "sha256:" + strings.Repeat("d", 64), RuntimeEndpoint: "http://10.1.2.3:3000",
+		RouteGeneration: 1,
+	})
+	apiErr, ok := err.(*hostingAPIError)
+	if !ok || apiErr.Code != errCodeProxyUnavailable || apiErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("error = %#v, want proxy_unavailable 503", err)
 	}
 }

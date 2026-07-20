@@ -45,6 +45,8 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/complete:",
 		"Idempotency-Key", "X-Deployer-Lease-Generation", "X-Deployer-Lease-Token",
 		"hosting:admin", "workload_policy_violation", "idempotency_conflict",
+		"idempotency_in_progress", "HostingRollbackRelease", "Pending rollback receipts do not expire",
+		"retry only the same", "completed 200 or terminal error replay", "ambiguous transport error or 5xx",
 		"HostingRestoreJobRecipe", "release_artifact_url", "artifact_unavailable",
 		"X-Deployer-Event-ID", "outside a five-minute window", "at-least-once",
 		"source-broker-openapi.yaml", "HostingSourceReference", "source_reference",
@@ -57,6 +59,20 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 	for _, value := range required {
 		if !strings.Contains(document, value) {
 			t.Errorf("OpenAPI is missing %q", value)
+		}
+	}
+	readmeContent, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{
+		"An exact retry while pending returns `409 idempotency_in_progress`",
+		"Pending rollback receipts do not",
+		"expire. Once reconciliation records a completed success or terminal error",
+		"replays the completed response instead of creating another routing intent",
+	} {
+		if !strings.Contains(string(readmeContent), value) {
+			t.Errorf("README is missing rollback contract %q", value)
 		}
 	}
 	brokerContract, err := os.ReadFile(filepath.Join("..", "..", "docs", "source-broker-openapi.yaml"))

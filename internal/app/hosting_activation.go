@@ -842,7 +842,21 @@ func executeHostingCompensation(ctx context.Context, proxy hostingProxyClient, o
 			ExternalProjectID: externalProjectID, Suspended: true, RouteGeneration: generation})
 	}
 	if err != nil {
-		_ = markHostingProxyOperationError(ctx, operationID, errCodeProxyUnavailable)
+		errorCode := errCodeProxyUnavailable
+		var apiErr *hostingAPIError
+		if errorsAsHosting(err, &apiErr) && apiErr.Code == errCodeProxyRejected {
+			errorCode = errCodeProxyRejected
+		}
+		_ = markHostingProxyOperationError(ctx, operationID, errorCode)
+		if errorCode == errCodeProxyRejected && storedDigest != "" {
+			correctiveID, stageErr := stageCorrectiveHostingSuspensionContext(ctx, operationID,
+				projectID, deploymentID, candidateDigest)
+			if stageErr != nil {
+				return stageErr
+			}
+			return executeHostingCompensation(ctx, proxy, correctiveID, "", projectID,
+				deploymentID, externalProjectID, candidateDigest, "", "")
+		}
 		return err
 	}
 	correctiveID, err := finalizeHostingCompensation(ctx, operationID, projectID, deploymentID,
@@ -884,6 +898,34 @@ func stageCorrectiveHostingSuspension(ctx context.Context, conn *sql.Conn, sourc
 			return "", err
 		}
 	}
+	return correctiveID, nil
+}
+
+func stageCorrectiveHostingSuspensionContext(ctx context.Context, sourceOperationID string,
+	projectID, deploymentID int64, candidateDigest string) (string, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return "", err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	correctiveID, err := stageCorrectiveHostingSuspension(ctx, conn, sourceOperationID,
+		projectID, deploymentID, candidateDigest)
+	if err != nil {
+		return "", err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return "", err
+	}
+	committed = true
 	return correctiveID, nil
 }
 

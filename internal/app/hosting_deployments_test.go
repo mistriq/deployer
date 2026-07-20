@@ -1124,7 +1124,7 @@ func TestHostingMigrationsCreateDurableLifecycleSchema(t *testing.T) {
 	for table, columns := range map[string][]string{
 		"hosting_projects":                             {"desired_state", "kill_switch_reason", "runner_selector_json", "route_generation"},
 		"hosting_deployments":                          {"phase", "failure_code", "cancel_requested_at", "request_hash"},
-		"hosting_idempotency":                          {"issuer_token_id", "operation", "request_hash", "response_body"},
+		"hosting_idempotency":                          {"issuer_token_id", "operation", "request_hash", "response_body", "operation_reference"},
 		"hosting_jobs":                                 {"lease_generation", "lease_expires_at", "cancel_requested_at", "completion_fingerprint", "runtime_observed_at", "runtime_observed_session_id", "runtime_observed_release_digest", "runtime_observed_instance_id"},
 		"hosting_releases":                             {"health_evidence_json", "route_revision", "runtime_endpoint", "runtime_runner_id", "runtime_generation", "runtime_instance_id", "runtime_manifest_json", "runtime_observed_at", "runtime_observed_session_id", "runtime_missing_since", "runtime_missing_observations", "runtime_failure_code"},
 		"hosting_runners":                              {"operation_capabilities_json", "active_session_id", "last_heartbeat_sequence"},
@@ -1142,11 +1142,21 @@ func TestHostingMigrationsCreateDurableLifecycleSchema(t *testing.T) {
 			}
 		}
 	}
-	for _, migrationID := range []string{"017_hosting_lifecycle", "018_hosting_idempotency_events", "019_hosting_runners_jobs", "020_hosting_releases_callbacks", "021_service_credentials_audit", "022_hosting_release_runtime_endpoint", "023_callback_outbox_leases", "024_hosting_job_source_artifact", "025_hosting_audit_events", "026_hosting_recovery_invariants", "027_hosting_release_artifacts", "028_hosting_runtime_recovery", "029_hosting_runtime_capabilities", "030_hosting_recovery_completion_fingerprint", "031_hosting_recovery_completion_receipts", "032_hosting_job_completion_fingerprint", "033_hosting_release_runtime_snapshot", "034_hosting_proxy_previous_runtime", "035_hosting_proxy_route_generation", "036_hosting_runtime_inventory", "037_hosting_runner_session_handoff"} {
+	for _, migrationID := range []string{"017_hosting_lifecycle", "018_hosting_idempotency_events", "019_hosting_runners_jobs", "020_hosting_releases_callbacks", "021_service_credentials_audit", "022_hosting_release_runtime_endpoint", "023_callback_outbox_leases", "024_hosting_job_source_artifact", "025_hosting_audit_events", "026_hosting_recovery_invariants", "027_hosting_release_artifacts", "028_hosting_runtime_recovery", "029_hosting_runtime_capabilities", "030_hosting_recovery_completion_fingerprint", "031_hosting_recovery_completion_receipts", "032_hosting_job_completion_fingerprint", "033_hosting_release_runtime_snapshot", "034_hosting_proxy_previous_runtime", "035_hosting_proxy_route_generation", "036_hosting_runtime_inventory", "037_hosting_runner_session_handoff", "038_hosting_idempotency_operation_reference"} {
 		var count int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE id=?`, migrationID).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("migration %s count=%d err=%v", migrationID, count, err)
 		}
+	}
+	var operationReferenceIndexSQL string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master
+		WHERE type='index' AND name='idx_hosting_idempotency_operation_reference'`).Scan(&operationReferenceIndexSQL); err != nil {
+		t.Fatal(err)
+	}
+	compactIndexSQL := strings.Join(strings.Fields(operationReferenceIndexSQL), " ")
+	if !strings.Contains(compactIndexSQL, "CREATE UNIQUE INDEX") ||
+		!strings.Contains(compactIndexSQL, "WHERE operation_reference<>''") {
+		t.Fatalf("unexpected operation reference index: %s", operationReferenceIndexSQL)
 	}
 }
 
@@ -1179,5 +1189,13 @@ func TestMigrationsAreIdempotentUnderConcurrentStartup(t *testing.T) {
 	}
 	if duplicates != 0 {
 		t.Fatalf("migration IDs with duplicate records=%d", duplicates)
+	}
+	var operationReferenceIndexes int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type='index' AND name='idx_hosting_idempotency_operation_reference'`).Scan(&operationReferenceIndexes); err != nil {
+		t.Fatal(err)
+	}
+	if operationReferenceIndexes != 1 {
+		t.Fatalf("operation reference indexes=%d", operationReferenceIndexes)
 	}
 }

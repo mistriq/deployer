@@ -80,6 +80,43 @@ func TestCleanupHostingRecordsAppliesConfiguredRetention(t *testing.T) {
 	}
 }
 
+func TestCleanupHostingRecordsPreservesExpiredIncompleteIdempotencyReceipts(t *testing.T) {
+	withTempDB(t)
+	token, err := createServiceToken("idempotency-retention", []string{serviceScopeDeploymentsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	createdAt := formatSQLiteTime(now.Add(-48 * time.Hour))
+	expiresAt := formatSQLiteTime(now.Add(-24 * time.Hour))
+	pendingReference := hashHostingOperation("rollback-pending-retention")
+	completedReference := hashHostingOperation("rollback-completed-retention")
+	if _, err := db.Exec(`INSERT INTO hosting_idempotency
+		(issuer_token_id, operation, idempotency_key, request_hash, response_status, response_body,
+		 operation_reference, created_at, expires_at)
+		VALUES (?, 'hosting.project.rollback', 'rollback_pending_retention', ?, NULL, NULL, ?, ?, ?),
+		       (?, 'hosting.project.rollback', 'rollback_complete_retention', ?, 200, '{}', ?, ?, ?)`,
+		token.ID, hashHostingOperation("pending-request"), pendingReference, createdAt, expiresAt,
+		token.ID, hashHostingOperation("completed-request"), completedReference, createdAt, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanupHostingRecords(t.Context(), AppConfig{}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	var pending, completed int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_idempotency WHERE operation_reference=?`, pendingReference).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_idempotency WHERE operation_reference=?`, completedReference).Scan(&completed); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 || completed != 0 {
+		t.Fatalf("expired idempotency receipts pending=%d completed=%d", pending, completed)
+	}
+}
+
 func TestProtectActiveHostingArtifactsRefreshesReferencedSourceAndRelease(t *testing.T) {
 	withTempDB(t)
 	oldConfig := appConfig

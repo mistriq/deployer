@@ -35,7 +35,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [ ] Idempotent cancel for queued and running deployments.
 - [ ] Cancellation intent and recovery remain durable after process restart.
 - [x] Generation-fence all proxy intents and persist compensations before external calls.
-- [ ] Immutable release persistence and selected-release rollback.
+- [x] Immutable release persistence and selected-release rollback.
 - [x] Bind rollback and runtime recovery to each release's immutable runtime manifest.
 - [x] Make rollback identity unambiguous for content-identical release instances.
 - [ ] Candidate health gate before activation.
@@ -75,7 +75,7 @@ The primary agent owns this checklist and updates it only after implementation a
 
 - [x] Fresh DB and legacy migration tests.
 - [x] Auth, scope, rotation, revocation and audit tests.
-- [ ] Idempotency replay and concurrent duplicate tests.
+- [x] Idempotency replay and concurrent duplicate tests.
 - [x] Per-project deployment serialization tests.
 - [x] Exact commit/artifact mismatch rejection tests.
 - [ ] Callback signing, retry, replay and polling reconciliation tests.

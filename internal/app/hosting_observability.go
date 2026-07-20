@@ -205,7 +205,8 @@ func cleanupHostingRecords(ctx context.Context, cfg AppConfig, now time.Time) er
 	if err := deleteOlder(`DELETE FROM service_token_audit_events WHERE created_at<?`, cfg.HostingAuditRetentionDays); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM hosting_idempotency WHERE expires_at<?`, formatSQLiteTime(now)); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM hosting_idempotency
+		WHERE expires_at<? AND response_status IS NOT NULL AND response_body IS NOT NULL`, formatSQLiteTime(now)); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

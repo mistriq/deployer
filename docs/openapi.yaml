@@ -1203,7 +1203,23 @@ paths:
     post:
       tags: [internal]
       summary: Activate a selected retained healthy release
-      description: Requires deployments:write. The JSON request body is limited to 8 KiB.
+      description: >
+        Requires deployments:write. The JSON request body is limited to 8 KiB.
+        Admission atomically persists a pending idempotency receipt scoped to
+        the stable issuer, rollback operation, key, and canonical request hash,
+        and binds it to one immutable routing intent and route generation before
+        health or adapter calls. An exact retry while that receipt is pending
+        returns 409 idempotency_in_progress; reusing the key with a different
+        request returns 409 idempotency_conflict. Neither case creates new work
+        or advances the route generation. A 503 after admission leaves
+        the intent pending, so the caller must retain and retry only the same
+        Idempotency-Key. Pending rollback receipts do not expire. Reconciliation,
+        including after restart, atomically records the terminal response and,
+        on success, the rollback event. Completed responses are retained for 24
+        hours; a completed 200 or terminal error replay includes
+        Idempotency-Replayed true. After any ambiguous transport error or 5xx,
+        the caller must retry the exact request only with the same key because
+        admission may already have persisted work.
       operationId: rollbackInternalRelease
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1223,23 +1239,53 @@ paths:
                 release_digest: {$ref: "#/components/schemas/SHA256Digest"}
       responses:
         "200":
-          description: Selected release is active; replays return the original response.
+          description: Selected release is active. This may be the synchronous result or the completed response replayed after reconciliation or restart.
           headers:
             Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
             application/json:
-              schema: {$ref: "#/components/schemas/HostingRelease"}
+              schema: {$ref: "#/components/schemas/HostingRollbackRelease"}
         "400": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
         "405": {$ref: "#/components/responses/Error"}
-        "409": {$ref: "#/components/responses/Error"}
+        "409":
+          description: >
+            The exact request is still pending (idempotency_in_progress), the
+            key was reused with a different canonical request
+            (idempotency_conflict), or rollback reached a terminal state
+            conflict. Idempotency-Replayed is present only for a retained
+            terminal error, not while work is pending.
+          headers:
+            Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
         "413": {$ref: "#/components/responses/Error"}
         "415": {$ref: "#/components/responses/Error"}
-        "502": {$ref: "#/components/responses/Error"}
-        "503": {$ref: "#/components/responses/Error"}
-        "500": {$ref: "#/components/responses/Error"}
+        "502":
+          description: The adapter rejected the immutable rollback intent. A retained terminal-error replay includes Idempotency-Replayed true.
+          headers:
+            Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "503":
+          description: >
+            The adapter is unavailable or returned an activation result whose
+            identity could not be confirmed. Once admission has persisted the
+            receipt, the rollback remains pending and the caller must retry the
+            exact request with the same Idempotency-Key; changing the key can
+            create a distinct later routing intent.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "500":
+          description: An internal error may occur after admission. Retry only the exact request with the same Idempotency-Key so durable work is reconciled rather than duplicated.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
 
   /api/internal/v1/projects/{externalProjectId}/suspend:
     post:
@@ -2112,7 +2158,7 @@ components:
 
   headers:
     IdempotencyReplayed:
-      description: Present with value `true` only when this response replays a previously completed operation.
+      description: Present with value `true` only when this response replays a previously completed success or terminal error.
       schema:
         type: string
         enum: ["true"]
@@ -2702,6 +2748,16 @@ components:
         created_at: {type: string, format: date-time}
         activated_at: {type: string, format: date-time}
         deactivated_at: {type: string, format: date-time}
+
+    HostingRollbackRelease:
+      allOf:
+        - $ref: "#/components/schemas/HostingRelease"
+        - type: object
+          required: [status, route_revision, activated_at]
+          properties:
+            status: {type: string, const: active}
+            route_revision: {type: string, minLength: 1}
+            activated_at: {type: string, format: date-time}
 
     HostingEvent:
       type: object

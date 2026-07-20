@@ -72,7 +72,9 @@ func (client *httpHostingProxyClient) Activate(ctx context.Context, request prox
 		return nil, err
 	}
 	if !validSHA256Digest(response.ActiveReleaseDigest) || response.ActiveReleaseDigest != request.ReleaseDigest || strings.TrimSpace(response.RouteRevision) == "" {
-		return nil, &hostingAPIError{Code: errCodeProxyRejected, Message: "reverse-proxy adapter returned an invalid activation identity", StatusCode: http.StatusBadGateway}
+		return nil, &hostingAPIError{Code: errCodeProxyUnavailable,
+			Message:    "reverse-proxy adapter returned an invalid activation identity",
+			StatusCode: http.StatusServiceUnavailable}
 	}
 	return &response, nil
 }
@@ -107,6 +109,13 @@ func (client *httpHostingProxyClient) doJSON(ctx context.Context, method, path s
 		return fmt.Errorf("read proxy adapter response: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if response.StatusCode >= http.StatusInternalServerError ||
+			response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooEarly ||
+			response.StatusCode == http.StatusTooManyRequests {
+			return &hostingAPIError{Code: errCodeProxyUnavailable,
+				Message:    "reverse-proxy adapter returned a transient or ambiguous response",
+				StatusCode: http.StatusServiceUnavailable}
+		}
 		return &hostingAPIError{Code: errCodeProxyRejected, Message: "reverse-proxy adapter rejected the operation", StatusCode: http.StatusBadGateway}
 	}
 	if responseBody == nil || response.StatusCode == http.StatusNoContent || len(bytes.TrimSpace(limited)) == 0 {

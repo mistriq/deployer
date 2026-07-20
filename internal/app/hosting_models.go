@@ -539,6 +539,14 @@ func applyHostingMigrations() error {
 				)`,
 			},
 		},
+		{
+			id: "038_hosting_idempotency_operation_reference",
+			statements: []string{
+				`ALTER TABLE hosting_idempotency ADD COLUMN operation_reference TEXT NOT NULL DEFAULT ''`,
+				`CREATE UNIQUE INDEX idx_hosting_idempotency_operation_reference
+					ON hosting_idempotency(operation_reference) WHERE operation_reference<>''`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {
