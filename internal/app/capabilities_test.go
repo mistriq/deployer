@@ -45,7 +45,10 @@ func TestHandleAPICapabilitiesReturnsMachineReadableMetadata(t *testing.T) {
 	}
 	if !containsString(got.ErrorCodes, errCodeProjectBusy) ||
 		!containsString(got.ErrorCodes, errCodeArtifactUnavailable) ||
-		!containsString(got.ErrorCodes, errCodeMethodNotAllowed) {
+		!containsString(got.ErrorCodes, errCodeMethodNotAllowed) ||
+		!containsString(got.ErrorCodes, errCodeInvalidManifest) ||
+		!containsString(got.ErrorCodes, errCodeInvalidManifestSignature) ||
+		!containsString(got.ErrorCodes, errCodeUnsupportedMediaType) {
 		t.Fatalf("expected stable error codes to be listed, got %#v", got.ErrorCodes)
 	}
 	if !containsString(got.RuntimeErrors, runtimeErrArtifactFailed) ||
@@ -58,7 +61,8 @@ func TestHandleAPICapabilitiesReturnsMachineReadableMetadata(t *testing.T) {
 	}
 	if !got.Features["runner_token_rotation"] || !got.Features["sse_build_logs"] ||
 		!got.Features["project_import_export"] || !got.Features["build_history_charts"] ||
-		!got.Features["build_release_notes"] || !got.Features["project_cloning"] {
+		!got.Features["build_release_notes"] || !got.Features["project_cloning"] ||
+		!got.Features["hosting_project_upsert"] || !got.Features["signed_hosting_manifests"] {
 		t.Fatalf("expected core features to be enabled, got %#v", got.Features)
 	}
 	if got.Limits.MaxPersistedBuildLogBytes != maxPersistedBuildLogBytes ||

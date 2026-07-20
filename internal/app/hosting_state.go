@@ -1,0 +1,848 @@
+package app
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type hostingEventResponse struct {
+	ID          int64          `json:"id"`
+	EventType   string         `json:"event_type"`
+	Phase       string         `json:"phase"`
+	FailureCode string         `json:"failure_code,omitempty"`
+	Metadata    map[string]any `json:"metadata"`
+	CreatedAt   time.Time      `json:"created_at"`
+}
+
+type hostingLogResponse struct {
+	ID        int64     `json:"id"`
+	Stream    string    `json:"stream"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type internalCapabilitiesResponse struct {
+	APIVersion             string                           `json:"api_version"`
+	ManifestVersions       []string                         `json:"manifest_versions"`
+	RunnerProtocolVersions []string                         `json:"runner_protocol_versions"`
+	NodeVersions           []string                         `json:"node_versions"`
+	RuntimeKinds           []string                         `json:"runtime_kinds"`
+	ResourceProfiles       map[string]hostingWorkloadLimits `json:"resource_profiles"`
+	FailureCodes           []string                         `json:"failure_codes"`
+}
+
+type internalRunnerResponse struct {
+	ID               int64       `json:"id"`
+	Name             string      `json:"name"`
+	Labels           []string    `json:"labels"`
+	ProtocolVersion  string      `json:"protocol_version"`
+	ManifestVersions []string    `json:"manifest_versions"`
+	RuntimeVersions  []string    `json:"runtime_versions"`
+	Capacity         capacityDTO `json:"capacity"`
+	Free             capacityDTO `json:"free"`
+	Reserve          capacityDTO `json:"reserve"`
+	Draining         bool        `json:"draining"`
+	Status           string      `json:"status"`
+	LastSeen         *time.Time  `json:"last_seen,omitempty"`
+}
+
+type capacityDTO struct {
+	CPUMillis int64 `json:"cpu_millis"`
+	RAMBytes  int64 `json:"ram_bytes"`
+	DiskBytes int64 `json:"disk_bytes"`
+	PIDs      int64 `json:"pids"`
+}
+
+func handleInternalCapabilities(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsRead) {
+		return
+	}
+	starter, _ := hostingLimitsForProfile("starter")
+	standard, _ := hostingLimitsForProfile("standard")
+	jsonResponse(w, internalCapabilitiesResponse{
+		APIVersion:             "v1",
+		ManifestVersions:       []string{hostingManifestVersion},
+		RunnerProtocolVersions: []string{hostingRunnerProtocolVersion},
+		NodeVersions:           []string{"20", "22"},
+		RuntimeKinds:           []string{"static", "node"},
+		ResourceProfiles:       map[string]hostingWorkloadLimits{"starter": starter, "standard": standard},
+		FailureCodes: []string{
+			"artifact_digest_mismatch", "build_failed", "build_timeout", "cancelled", "health_check_failed",
+			"proxy_activation_failed", "release_persistence_failed", "runner_lost", "runtime_start_failed",
+			"source_fetch_failed", "workload_policy_violation",
+		},
+	})
+}
+
+func handleInternalRunners(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsRead) {
+		return
+	}
+	rows, err := db.QueryContext(r.Context(), `SELECT id, name, labels_json, protocol_version,
+		manifest_versions_json, runtime_versions_json,
+		capacity_cpu_millis, capacity_ram_bytes, capacity_disk_bytes, capacity_pids,
+		free_cpu_millis, free_ram_bytes, free_disk_bytes, free_pids,
+		reserve_cpu_millis, reserve_ram_bytes, reserve_disk_bytes, reserve_pids,
+		draining, status, last_seen FROM hosting_runners ORDER BY name`)
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "list hosting runners failed", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	runners := make([]internalRunnerResponse, 0)
+	for rows.Next() {
+		var runner internalRunnerResponse
+		var labelsJSON, manifestsJSON, runtimesJSON string
+		var draining int
+		var lastSeen sql.NullString
+		if err := rows.Scan(&runner.ID, &runner.Name, &labelsJSON, &runner.ProtocolVersion,
+			&manifestsJSON, &runtimesJSON,
+			&runner.Capacity.CPUMillis, &runner.Capacity.RAMBytes, &runner.Capacity.DiskBytes, &runner.Capacity.PIDs,
+			&runner.Free.CPUMillis, &runner.Free.RAMBytes, &runner.Free.DiskBytes, &runner.Free.PIDs,
+			&runner.Reserve.CPUMillis, &runner.Reserve.RAMBytes, &runner.Reserve.DiskBytes, &runner.Reserve.PIDs,
+			&draining, &runner.Status, &lastSeen); err != nil {
+			jsonErrorCode(w, errCodeInternal, "read hosting runner failed", http.StatusInternalServerError)
+			return
+		}
+		if json.Unmarshal([]byte(labelsJSON), &runner.Labels) != nil ||
+			json.Unmarshal([]byte(manifestsJSON), &runner.ManifestVersions) != nil ||
+			json.Unmarshal([]byte(runtimesJSON), &runner.RuntimeVersions) != nil {
+			jsonErrorCode(w, errCodeInternal, "hosting runner capabilities are invalid", http.StatusInternalServerError)
+			return
+		}
+		runner.Draining = draining != 0
+		runner.LastSeen = nullableSQLiteTime(lastSeen)
+		runners = append(runners, runner)
+	}
+	if err := rows.Err(); err != nil {
+		jsonErrorCode(w, errCodeInternal, "list hosting runners failed", http.StatusInternalServerError)
+		return
+	}
+	jsonResponse(w, runners)
+}
+
+func handleInternalDeploymentEvents(w http.ResponseWriter, r *http.Request, externalDeploymentID string) {
+	if !requireMethod(w, r, http.MethodGet) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsRead) {
+		return
+	}
+	rows, err := db.QueryContext(r.Context(), `SELECT e.id, e.event_type, e.phase, e.failure_code,
+		e.metadata_json, e.created_at FROM hosting_events e
+		JOIN hosting_deployments d ON d.id=e.hosting_deployment_id
+		WHERE d.external_deployment_id=? ORDER BY e.id`, externalDeploymentID)
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "read deployment events failed", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	events := make([]hostingEventResponse, 0)
+	for rows.Next() {
+		var event hostingEventResponse
+		var metadataJSON, createdAt string
+		if err := rows.Scan(&event.ID, &event.EventType, &event.Phase, &event.FailureCode, &metadataJSON, &createdAt); err != nil {
+			jsonErrorCode(w, errCodeInternal, "read deployment event failed", http.StatusInternalServerError)
+			return
+		}
+		metadataJSON = redactSecrets(metadataJSON)
+		if err := json.Unmarshal([]byte(metadataJSON), &event.Metadata); err != nil {
+			event.Metadata = map[string]any{"redacted": true}
+		}
+		event.CreatedAt = parseSQLiteTime(createdAt)
+		events = append(events, event)
+	}
+	if len(events) == 0 {
+		if _, err := getHostingDeploymentByExternalID(r.Context(), externalDeploymentID); errors.Is(err, sql.ErrNoRows) {
+			jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
+			return
+		}
+	}
+	jsonResponse(w, events)
+}
+
+func handleInternalDeploymentLogs(w http.ResponseWriter, r *http.Request, externalDeploymentID string) {
+	if !requireMethod(w, r, http.MethodGet) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsRead) {
+		return
+	}
+	rows, err := db.QueryContext(r.Context(), `SELECT l.id, l.stream, l.message, l.created_at
+		FROM hosting_logs l JOIN hosting_deployments d ON d.id=l.hosting_deployment_id
+		WHERE d.external_deployment_id=? ORDER BY l.id`, externalDeploymentID)
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "read deployment logs failed", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	logs := make([]hostingLogResponse, 0)
+	for rows.Next() {
+		var entry hostingLogResponse
+		var createdAt string
+		if err := rows.Scan(&entry.ID, &entry.Stream, &entry.Message, &createdAt); err != nil {
+			jsonErrorCode(w, errCodeInternal, "read deployment log failed", http.StatusInternalServerError)
+			return
+		}
+		entry.Message = redactSecrets(entry.Message)
+		entry.CreatedAt = parseSQLiteTime(createdAt)
+		logs = append(logs, entry)
+	}
+	if len(logs) == 0 {
+		if _, err := getHostingDeploymentByExternalID(r.Context(), externalDeploymentID); errors.Is(err, sql.ErrNoRows) {
+			jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
+			return
+		}
+	}
+	jsonResponse(w, logs)
+}
+
+func handleInternalDeploymentCancel(w http.ResponseWriter, r *http.Request, externalDeploymentID string) {
+	if !requireMethod(w, r, http.MethodPost) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsWrite) {
+		return
+	}
+	idempotencyKey := strings.TrimSpace(r.Header.Get(idempotencyKeyHeader))
+	if !validIdempotencyKey(idempotencyKey) {
+		jsonErrorCode(w, errCodeInvalidIdempotencyKey, "Idempotency-Key must contain 8-128 safe characters", http.StatusBadRequest)
+		return
+	}
+	token, _ := r.Context().Value(serviceTokenContextKey{}).(*ServiceToken)
+	deployment, replayed, err := cancelHostingDeployment(r.Context(), token, externalDeploymentID, idempotencyKey)
+	if err != nil {
+		writeHostingAPIError(w, err)
+		return
+	}
+	if replayed {
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	jsonResponse(w, deployment)
+}
+
+func cancelHostingDeployment(ctx context.Context, token *ServiceToken, externalID, key string) (*HostingDeployment, bool, error) {
+	requestHash := hashHostingOperation("cancel", externalID)
+	operation := "hosting.deployment.cancel"
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	if replay, err := findGenericIdempotencyReplay(ctx, conn, token.ID, operation, key, requestHash); err != nil || replay != nil {
+		if err != nil {
+			return nil, false, err
+		}
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return nil, false, err
+		}
+		committed = true
+		var deployment HostingDeployment
+		if err := json.Unmarshal(replay, &deployment); err != nil {
+			return nil, false, err
+		}
+		return &deployment, true, nil
+	}
+
+	var deploymentID, projectID int64
+	var status string
+	err = conn.QueryRowContext(ctx, `SELECT id, hosting_project_id, status FROM hosting_deployments WHERE external_deployment_id=?`, externalID).Scan(&deploymentID, &projectID, &status)
+	if err == sql.ErrNoRows {
+		return nil, false, &hostingAPIError{Code: errCodeDeploymentNotFound, Message: "deployment not found", StatusCode: 404}
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	now := time.Now().UTC()
+	if !isHostingTerminalStatus(status) {
+		var jobStatus string
+		var runnerID sql.NullInt64
+		var limits hostingWorkloadLimits
+		err := conn.QueryRowContext(ctx, `SELECT status, hosting_runner_id, required_cpu_millis, required_ram_bytes,
+			required_disk_bytes, required_pids FROM hosting_jobs WHERE hosting_deployment_id=?`, deploymentID).Scan(
+			&jobStatus, &runnerID, &limits.CPUMillis, &limits.RAMBytes, &limits.DiskBytes, &limits.PIDs)
+		if err != nil {
+			return nil, false, err
+		}
+		if jobStatus == "queued" {
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET status='cancelled', cancel_requested_at=?, completed_at=? WHERE hosting_deployment_id=? AND status='queued'`, formatSQLiteTime(now), formatSQLiteTime(now), deploymentID); err != nil {
+				return nil, false, err
+			}
+			if runnerID.Valid {
+				if err := restoreHostingRunnerCapacity(ctx, conn, runnerID.Int64, limits); err != nil {
+					return nil, false, err
+				}
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_deployments SET status='cancelled', phase='cancelled', failure_code='cancelled', cancel_requested_at=?, finished_at=?, updated_at=? WHERE id=? AND status='queued'`, formatSQLiteTime(now), formatSQLiteTime(now), formatSQLiteTime(now), deploymentID); err != nil {
+				return nil, false, err
+			}
+			if err := recordHostingEvent(ctx, conn, projectID, deploymentID, "deployment_cancelled", hostingPhaseCancelled, "cancelled", nil, now); err != nil {
+				return nil, false, err
+			}
+			if err := enqueueTerminalCallback(ctx, conn, deploymentID, now); err != nil {
+				return nil, false, err
+			}
+		} else {
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET cancel_requested_at=? WHERE hosting_deployment_id=? AND status IN ('leased','running')`, formatSQLiteTime(now), deploymentID); err != nil {
+				return nil, false, err
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_deployments SET phase='cancelling', cancel_requested_at=?, updated_at=? WHERE id=? AND status='running'`, formatSQLiteTime(now), formatSQLiteTime(now), deploymentID); err != nil {
+				return nil, false, err
+			}
+			if err := recordHostingEvent(ctx, conn, projectID, deploymentID, "cancellation_requested", hostingPhaseCancelling, "", nil, now); err != nil {
+				return nil, false, err
+			}
+		}
+	}
+	deployment, err := getHostingDeploymentOnConn(ctx, conn, externalID)
+	if err != nil {
+		return nil, false, err
+	}
+	response, err := json.Marshal(deployment)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := storeGenericIdempotency(ctx, conn, token.ID, operation, key, requestHash, http.StatusOK, response, now); err != nil {
+		return nil, false, err
+	}
+	metadata, _ := json.Marshal(map[string]any{"external_deployment_id": externalID, "result_status": deployment.Status})
+	if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_audit_events
+		(issuer_token_id, hosting_project_id, event_type, reason, request_id, metadata_json, created_at)
+		VALUES (?, ?, 'hosting_deployment_cancel_requested', 'control-plane cancellation', ?, ?, ?)`,
+		token.ID, projectID, requestIDFromContext(ctx), redactSecrets(string(metadata)), formatSQLiteTime(now)); err != nil {
+		return nil, false, err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return nil, false, err
+	}
+	committed = true
+	return deployment, false, nil
+}
+
+func getHostingDeploymentOnConn(ctx context.Context, conn *sql.Conn, externalID string) (*HostingDeployment, error) {
+	return scanHostingDeployment(conn.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
+		d.commit_sha, d.manifest_digest, d.artifact_digest, d.status, d.phase, d.failure_code,
+		d.failure_message, d.release_digest, d.previous_release_digest, d.callback_state,
+		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at
+		FROM hosting_deployments d JOIN hosting_projects p ON p.id=d.hosting_project_id
+		WHERE d.external_deployment_id=?`, externalID))
+}
+
+func restoreHostingRunnerCapacity(ctx context.Context, conn *sql.Conn, runnerID int64, limits hostingWorkloadLimits) error {
+	_, err := conn.ExecContext(ctx, `UPDATE hosting_runners SET
+		free_cpu_millis=MIN(capacity_cpu_millis, free_cpu_millis+?),
+		free_ram_bytes=MIN(capacity_ram_bytes, free_ram_bytes+?),
+		free_disk_bytes=MIN(capacity_disk_bytes, free_disk_bytes+?),
+		free_pids=MIN(capacity_pids, free_pids+?) WHERE id=?`, limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs, runnerID)
+	return err
+}
+
+func recordHostingEvent(ctx context.Context, conn *sql.Conn, projectID, deploymentID int64, eventType, phase, failureCode string, metadata map[string]any, now time.Time) error {
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	encoded = []byte(redactSecrets(string(encoded)))
+	var deployment any
+	if deploymentID != 0 {
+		deployment = deploymentID
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO hosting_events
+		(hosting_project_id, hosting_deployment_id, event_type, phase, failure_code, metadata_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, projectID, deployment, eventType, phase, failureCode, string(encoded), formatSQLiteTime(now))
+	return err
+}
+
+func enqueueTerminalCallback(ctx context.Context, conn *sql.Conn, deploymentID int64, now time.Time) error {
+	deployment, err := getHostingDeploymentByIDOnConn(ctx, conn, deploymentID)
+	if err != nil {
+		return err
+	}
+	eventIdentity := sha256.Sum256([]byte(deployment.ExternalDeploymentID + "\x00" + deployment.Status + "\x00" + deployment.Phase))
+	eventID := "evt_" + hex.EncodeToString(eventIdentity[:16])
+	payload := map[string]any{
+		"event_id": eventID, "timestamp": now, "external_project_id": deployment.ExternalProjectID,
+		"external_deployment_id": deployment.ExternalDeploymentID, "phase": deployment.Phase,
+		"status": deployment.Status, "failure_code": deployment.FailureCode,
+		"artifact_digest": deployment.ArtifactDigest, "release_digest": deployment.ReleaseDigest,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	hash := sha256.Sum256(encoded)
+	_, err = conn.ExecContext(ctx, `INSERT INTO callback_outbox
+		(event_id, hosting_deployment_id, payload_json, payload_hash, status, attempts, next_attempt_at, created_at)
+		VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
+		ON CONFLICT(hosting_deployment_id) DO NOTHING`, eventID, deploymentID, string(encoded),
+		"sha256:"+hex.EncodeToString(hash[:]), formatSQLiteTime(now), formatSQLiteTime(now))
+	return err
+}
+
+func getHostingDeploymentByIDOnConn(ctx context.Context, conn *sql.Conn, id int64) (*HostingDeployment, error) {
+	return scanHostingDeployment(conn.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
+		d.commit_sha, d.manifest_digest, d.artifact_digest, d.status, d.phase, d.failure_code,
+		d.failure_message, d.release_digest, d.previous_release_digest, d.callback_state,
+		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at
+		FROM hosting_deployments d JOIN hosting_projects p ON p.id=d.hosting_project_id WHERE d.id=?`, id))
+}
+
+func randomEventID() (string, error) {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return "evt_" + hex.EncodeToString(value), nil
+}
+
+func hashHostingOperation(parts ...string) string {
+	digest := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func findGenericIdempotencyReplay(ctx context.Context, conn *sql.Conn, tokenID int64, operation, key, hash string) ([]byte, error) {
+	var storedHash string
+	var response sql.NullString
+	err := conn.QueryRowContext(ctx, `SELECT request_hash, response_body FROM hosting_idempotency
+		WHERE issuer_token_id=? AND operation=? AND idempotency_key=?`, tokenID, operation, key).Scan(&storedHash, &response)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if storedHash != hash {
+		return nil, &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "Idempotency-Key was already used with a different request", StatusCode: 409}
+	}
+	if !response.Valid {
+		return nil, &hostingAPIError{Code: errCodeIdempotencyInProgress, Message: "the original request is still being processed", StatusCode: 409}
+	}
+	return []byte(response.String), nil
+}
+
+func storeGenericIdempotency(ctx context.Context, conn *sql.Conn, tokenID int64, operation, key, hash string, status int, response []byte, now time.Time) error {
+	_, err := conn.ExecContext(ctx, `INSERT INTO hosting_idempotency
+		(issuer_token_id, operation, idempotency_key, request_hash, response_status, response_body, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, tokenID, operation, key, hash, status, string(response),
+		formatSQLiteTime(now), formatSQLiteTime(now.Add(hostingIdempotencyTTL)))
+	return err
+}
+
+func handleInternalReleases(w http.ResponseWriter, r *http.Request, externalProjectID string) {
+	if !requireMethod(w, r, http.MethodGet) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsRead) {
+		return
+	}
+	project, err := getHostingProjectByExternalID(externalProjectID)
+	if err == sql.ErrNoRows {
+		jsonErrorCode(w, errCodeProjectNotFound, "project not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "read project failed", http.StatusInternalServerError)
+		return
+	}
+	releases, err := listHostingReleases(r.Context(), project.ID)
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "list releases failed", http.StatusInternalServerError)
+		return
+	}
+	jsonResponse(w, releases)
+}
+
+func handleInternalDesiredState(w http.ResponseWriter, r *http.Request, externalProjectID, desired string) {
+	if !requireMethod(w, r, http.MethodPost) || !requireServiceTokenScope(w, r, serviceScopeProjectsWrite) {
+		return
+	}
+	key := strings.TrimSpace(r.Header.Get(idempotencyKeyHeader))
+	if !validIdempotencyKey(key) {
+		jsonErrorCode(w, errCodeInvalidIdempotencyKey, "Idempotency-Key must contain 8-128 safe characters", http.StatusBadRequest)
+		return
+	}
+	token, _ := r.Context().Value(serviceTokenContextKey{}).(*ServiceToken)
+	response, replayed, err := setHostingProjectDesiredState(r.Context(), token, externalProjectID, desired, key)
+	if err != nil {
+		writeHostingAPIError(w, err)
+		return
+	}
+	if replayed {
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	jsonResponse(w, response)
+}
+
+func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, externalID, desired, key string) (map[string]string, bool, error) {
+	operation := "hosting.project." + desired
+	hash := hashHostingOperation(operation, externalID)
+	if replay, err := loadIdempotentResponse(ctx, token.ID, operation, key, hash); err != nil || replay != nil {
+		if err != nil {
+			return nil, false, err
+		}
+		var response map[string]string
+		if err := json.Unmarshal(replay, &response); err != nil {
+			return nil, false, err
+		}
+		return response, true, nil
+	}
+	operationID := hashHostingOperation(fmt.Sprint(token.ID), operation, key)
+	now := time.Now().UTC()
+	response := map[string]string{"external_project_id": externalID, "desired_state": desired}
+	encoded, _ := json.Marshal(response)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	if replay, err := findGenericIdempotencyReplay(ctx, conn, token.ID, operation, key, hash); err != nil || replay != nil {
+		if err != nil {
+			return nil, false, err
+		}
+		var stored map[string]string
+		if err := json.Unmarshal(replay, &stored); err != nil {
+			return nil, false, err
+		}
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return nil, false, err
+		}
+		committed = true
+		return stored, true, nil
+	}
+	var projectID int64
+	if err := conn.QueryRowContext(ctx, `SELECT id FROM hosting_projects WHERE external_project_id=?`, externalID).Scan(&projectID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, false, &hostingAPIError{Code: errCodeProjectNotFound, Message: "project not found", StatusCode: 404}
+		}
+		return nil, false, err
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_projects SET desired_state=?, updated_at=? WHERE id=?`, desired, formatSQLiteTime(now), projectID); err != nil {
+		return nil, false, err
+	}
+	if err := recordHostingEvent(ctx, conn, projectID, 0, "project_"+desired, "", "", nil, now); err != nil {
+		return nil, false, err
+	}
+	if desired == "suspended" {
+		if err := cancelHostingJobsForKillSwitch(ctx, conn, sql.NullInt64{Int64: projectID, Valid: true}, "project suspended", now); err != nil {
+			return nil, false, err
+		}
+	}
+	operationType := "resume"
+	if desired == "suspended" {
+		operationType = "suspend"
+	}
+	if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
+		(operation_id, hosting_project_id, operation_type, status, created_at, updated_at)
+		VALUES (?, ?, ?, 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`, operationID,
+		projectID, operationType, formatSQLiteTime(now), formatSQLiteTime(now)); err != nil {
+		return nil, false, err
+	}
+	metadata, _ := json.Marshal(map[string]any{"desired_state": desired, "external_project_id": externalID})
+	if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_audit_events
+		(issuer_token_id, hosting_project_id, event_type, reason, request_id, metadata_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, token.ID, projectID, "hosting_project_"+desired,
+		"control-plane desired state change", requestIDFromContext(ctx), redactSecrets(string(metadata)), formatSQLiteTime(now)); err != nil {
+		return nil, false, err
+	}
+	if err := storeGenericIdempotency(ctx, conn, token.ID, operation, key, hash, http.StatusOK, encoded, now); err != nil {
+		return nil, false, err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return nil, false, err
+	}
+	committed = true
+	proxy, err := hostingProxyClientFactory(appConfig)
+	if err != nil {
+		_ = markHostingProxyOperationError(ctx, operationID, errCodeProxyUnavailable)
+		return nil, false, err
+	}
+	if err := proxy.SetSuspended(ctx, proxySuspendRequest{OperationID: operationID, ExternalProjectID: externalID, Suspended: desired == "suspended"}); err != nil {
+		code := errCodeProxyUnavailable
+		var apiErr *hostingAPIError
+		if errorsAsHosting(err, &apiErr) {
+			code = apiErr.Code
+		}
+		_ = markHostingProxyOperationError(ctx, operationID, code)
+		return nil, false, err
+	}
+	if err := markHostingProxyOperationCommitted(ctx, operationID); err != nil {
+		return nil, false, err
+	}
+	return response, false, nil
+}
+
+func loadIdempotentResponse(ctx context.Context, tokenID int64, operation, key, hash string) ([]byte, error) {
+	var storedHash string
+	var response sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT request_hash, response_body FROM hosting_idempotency WHERE issuer_token_id=? AND operation=? AND idempotency_key=?`, tokenID, operation, key).Scan(&storedHash, &response)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if storedHash != hash {
+		return nil, &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "Idempotency-Key was already used with a different request", StatusCode: 409}
+	}
+	if !response.Valid {
+		return nil, &hostingAPIError{Code: errCodeIdempotencyInProgress, Message: "the original request is still being processed", StatusCode: 409}
+	}
+	return []byte(response.String), nil
+}
+
+type rollbackRequest struct {
+	ReleaseDigest string `json:"release_digest"`
+}
+
+func handleInternalRollback(w http.ResponseWriter, r *http.Request, externalProjectID string) {
+	if !requireMethod(w, r, http.MethodPost) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsWrite) {
+		return
+	}
+	if !requireJSONContentType(w, r) {
+		return
+	}
+	key := strings.TrimSpace(r.Header.Get(idempotencyKeyHeader))
+	if !validIdempotencyKey(key) {
+		jsonErrorCode(w, errCodeInvalidIdempotencyKey, "Idempotency-Key must contain 8-128 safe characters", http.StatusBadRequest)
+		return
+	}
+	var request rollbackRequest
+	if !decodeInternalJSON(w, r, 8<<10, &request) {
+		return
+	}
+	request.ReleaseDigest = strings.ToLower(strings.TrimSpace(request.ReleaseDigest))
+	if !validSHA256Digest(request.ReleaseDigest) {
+		jsonErrorCode(w, errCodeValidation, "release_digest must be a sha256 digest", http.StatusBadRequest)
+		return
+	}
+	token, _ := r.Context().Value(serviceTokenContextKey{}).(*ServiceToken)
+	release, replayed, err := rollbackHostingRelease(r.Context(), token, externalProjectID, request.ReleaseDigest, key)
+	if err != nil {
+		writeHostingAPIError(w, err)
+		return
+	}
+	if replayed {
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	jsonResponse(w, release)
+}
+
+func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID, digest, key string) (*HostingRelease, bool, error) {
+	operation := "hosting.project.rollback"
+	hash := hashHostingOperation(operation, externalID, digest)
+	if replay, err := loadIdempotentResponse(ctx, token.ID, operation, key, hash); err != nil || replay != nil {
+		if err != nil {
+			return nil, false, err
+		}
+		var release HostingRelease
+		if err := json.Unmarshal(replay, &release); err != nil {
+			return nil, false, err
+		}
+		return &release, true, nil
+	}
+	project, err := getHostingProjectByExternalID(externalID)
+	if err == sql.ErrNoRows {
+		return nil, false, &hostingAPIError{Code: errCodeProjectNotFound, Message: "project not found", StatusCode: 404}
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	allowed, err := hostingActivationAllowed(ctx, project.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !allowed {
+		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution is disabled or suspended", StatusCode: http.StatusConflict}
+	}
+	var release HostingRelease
+	var createdAt string
+	var runnerStatus string
+	var runnerLastSeen sql.NullString
+	err = db.QueryRowContext(ctx, `SELECT r.release_digest, d.external_deployment_id, r.commit_sha,
+		r.artifact_digest, r.status, r.route_revision, r.previous_release_digest, r.runtime_endpoint,
+		r.created_at, hr.status, hr.last_seen FROM hosting_releases r
+		JOIN hosting_deployments d ON d.id=r.hosting_deployment_id
+		JOIN hosting_jobs j ON j.hosting_deployment_id=d.id
+		JOIN hosting_runners hr ON hr.id=j.hosting_runner_id
+		WHERE r.hosting_project_id=? AND r.release_digest=?`, project.ID, digest).Scan(
+		&release.Digest, &release.ExternalDeploymentID, &release.CommitSHA, &release.ArtifactDigest,
+		&release.Status, &release.RouteRevision, &release.PreviousRelease, &release.RuntimeEndpoint,
+		&createdAt, &runnerStatus, &runnerLastSeen)
+	if err == sql.ErrNoRows {
+		return nil, false, &hostingAPIError{Code: errCodeReleaseNotFound, Message: "release not found", StatusCode: 404}
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if release.Status != "healthy" && release.Status != "inactive" && release.Status != "active" {
+		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release is not healthy and cannot be activated", StatusCode: 409}
+	}
+	if strings.TrimSpace(release.RuntimeEndpoint) == "" {
+		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release has no verified runtime endpoint", StatusCode: 409}
+	}
+	if runnerStatus != "online" || !runnerLastSeen.Valid || parseSQLiteTime(runnerLastSeen.String).Before(time.Now().UTC().Add(-hostingRunnerStaleAfter)) {
+		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release runner is not live", StatusCode: http.StatusConflict}
+	}
+	healthPath := project.Manifest.Runtime.HealthPath
+	if healthPath == "" {
+		healthPath = "/"
+	}
+	healthCtx, cancelHealth := context.WithTimeout(ctx, 30*time.Second)
+	_, _, healthErr := checkHostingCandidateHealth(healthCtx, strings.TrimRight(release.RuntimeEndpoint, "/")+healthPath)
+	cancelHealth()
+	if healthErr != nil {
+		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release failed a fresh rollback health gate", StatusCode: http.StatusConflict, Err: healthErr}
+	}
+	release.CreatedAt = parseSQLiteTime(createdAt)
+	var previous, previousEndpoint string
+	_ = db.QueryRowContext(ctx, `SELECT release_digest, runtime_endpoint FROM hosting_releases WHERE hosting_project_id=? AND status='active'`, project.ID).Scan(&previous, &previousEndpoint)
+	operationID := hashHostingOperation(fmt.Sprint(token.ID), operation, key)
+	now := time.Now().UTC()
+	intentConn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, err := intentConn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		intentConn.Close()
+		return nil, false, err
+	}
+	var desiredState, killReason string
+	var globalKill int
+	if err := intentConn.QueryRowContext(ctx, `SELECT p.desired_state, p.kill_switch_reason, s.global_kill_switch
+		FROM hosting_projects p JOIN hosting_settings s ON s.id=1 WHERE p.id=?`, project.ID).Scan(&desiredState, &killReason, &globalKill); err != nil {
+		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
+		intentConn.Close()
+		return nil, false, err
+	}
+	if desiredState != "active" || killReason != "" || globalKill != 0 {
+		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
+		intentConn.Close()
+		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution is disabled or suspended", StatusCode: http.StatusConflict}
+	}
+	intentResult, err := intentConn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
+		(operation_id, hosting_project_id, operation_type, release_digest, runtime_endpoint,
+		 expected_previous_release_digest, status, created_at, updated_at)
+		VALUES (?, ?, 'rollback', ?, ?, ?, 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`,
+		operationID, project.ID, digest, release.RuntimeEndpoint, previous, formatSQLiteTime(now), formatSQLiteTime(now))
+	if err != nil {
+		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
+		intentConn.Close()
+		return nil, false, err
+	}
+	inserted, _ := intentResult.RowsAffected()
+	if inserted == 1 {
+		metadata, _ := json.Marshal(map[string]any{"release_digest": digest, "previous_release_digest": previous})
+		if _, err := intentConn.ExecContext(ctx, `INSERT INTO hosting_audit_events
+			(issuer_token_id, hosting_project_id, event_type, reason, request_id, metadata_json, created_at)
+			VALUES (?, ?, 'hosting_release_rollback_requested', 'control-plane rollback', ?, ?, ?)`, token.ID,
+			project.ID, requestIDFromContext(ctx), redactSecrets(string(metadata)), formatSQLiteTime(now)); err != nil {
+			_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
+			intentConn.Close()
+			return nil, false, err
+		}
+	}
+	if _, err := intentConn.ExecContext(ctx, `COMMIT`); err != nil {
+		intentConn.Close()
+		return nil, false, err
+	}
+	intentConn.Close()
+	proxy, err := hostingProxyClientFactory(appConfig)
+	if err != nil {
+		return nil, false, err
+	}
+	activation, err := proxy.Activate(ctx, proxyActivationRequest{OperationID: operationID, ExternalProjectID: externalID, ReleaseDigest: digest, RuntimeEndpoint: release.RuntimeEndpoint, ExpectedPreviousReleaseDigest: previous})
+	if err != nil {
+		_ = markHostingProxyOperationError(ctx, operationID, errCodeProxyUnavailable)
+		return nil, false, err
+	}
+	if err := markHostingProxyOperationApplied(ctx, operationID, activation.RouteRevision); err != nil {
+		return nil, false, err
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	if replay, err := findGenericIdempotencyReplay(ctx, conn, token.ID, operation, key, hash); err != nil || replay != nil {
+		if err != nil {
+			return nil, false, err
+		}
+		var stored HostingRelease
+		if err := json.Unmarshal(replay, &stored); err != nil {
+			return nil, false, err
+		}
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return nil, false, err
+		}
+		committed = true
+		return &stored, true, nil
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT p.desired_state, p.kill_switch_reason, s.global_kill_switch
+		FROM hosting_projects p JOIN hosting_settings s ON s.id=1 WHERE p.id=?`, project.ID).Scan(&desiredState, &killReason, &globalKill); err != nil {
+		return nil, false, err
+	}
+	if desiredState != "active" || killReason != "" || globalKill != 0 {
+		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		committed = true
+		state := &hostingCompletionState{ProjectID: project.ID, ExternalProjectID: externalID,
+			ExternalDeploymentID: release.ExternalDeploymentID, PreviousReleaseDigest: previous,
+			PreviousRuntimeEndpoint: previousEndpoint}
+		if err := compensateCancelledActivation(ctx, proxy, state, digest); err != nil {
+			return nil, false, err
+		}
+		_ = markHostingProxyOperationCommitted(ctx, operationID)
+		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution was disabled during rollback", StatusCode: http.StatusConflict}
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='inactive', deactivated_at=? WHERE hosting_project_id=? AND status='active' AND release_digest<>?`, formatSQLiteTime(now), project.ID, digest); err != nil {
+		return nil, false, err
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?, previous_release_digest=?, activated_at=?, deactivated_at=NULL WHERE hosting_project_id=? AND release_digest=?`, activation.RouteRevision, previous, formatSQLiteTime(now), project.ID, digest); err != nil {
+		return nil, false, err
+	}
+	if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_events (hosting_project_id, event_type, phase, metadata_json, created_at) VALUES (?, 'release_rolled_back', 'rolling_back', ?, ?)`, project.ID, fmt.Sprintf(`{"release_digest":%q}`, digest), formatSQLiteTime(now)); err != nil {
+		return nil, false, err
+	}
+	release.Status = "active"
+	release.RouteRevision = activation.RouteRevision
+	release.PreviousRelease = previous
+	release.ActivatedAt = &now
+	encoded, _ := json.Marshal(release)
+	if err := storeGenericIdempotency(ctx, conn, token.ID, operation, key, hash, http.StatusOK, encoded, now); err != nil {
+		return nil, false, err
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_proxy_operations SET status='committed', route_revision=?, updated_at=? WHERE operation_id=? AND status='applied'`, activation.RouteRevision, formatSQLiteTime(now), operationID); err != nil {
+		return nil, false, err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return nil, false, err
+	}
+	committed = true
+	return &release, false, nil
+}

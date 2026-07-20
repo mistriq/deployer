@@ -9,21 +9,36 @@ import (
 )
 
 type AppConfig struct {
-	Addr                   string
-	DBPath                 string
-	PublicURL              string
-	ArtifactDir            string
-	SnapshotDir            string
-	LogRetentionDays       int
-	ArtifactRetentionHours int
-	DockerPrune            bool
-	ServerReadTimeout      time.Duration
-	ServerWriteTimeout     time.Duration
-	DockerBuildTimeout     time.Duration
-	SCPTimeout             time.Duration
-	SSHTimeout             time.Duration
-	HealthCheckTimeout     time.Duration
-	DemoMode               bool
+	Addr                         string
+	DBPath                       string
+	PublicURL                    string
+	ArtifactDir                  string
+	SnapshotDir                  string
+	LogRetentionDays             int
+	ArtifactRetentionHours       int
+	DockerPrune                  bool
+	ServerReadTimeout            time.Duration
+	ServerWriteTimeout           time.Duration
+	DockerBuildTimeout           time.Duration
+	SCPTimeout                   time.Duration
+	SSHTimeout                   time.Duration
+	HealthCheckTimeout           time.Duration
+	DemoMode                     bool
+	HostingRepoRoot              string
+	HostingDeployRoot            string
+	ProxyAdapterURL              string
+	ProxyAdapterToken            string
+	ProxyAdapterTimeout          time.Duration
+	CallbackURL                  string
+	CallbackSigningSecret        string
+	CallbackTimeout              time.Duration
+	CallbackMaxAttempts          int
+	ServiceTokenOverlap          time.Duration
+	HostingLogRetentionDays      int
+	HostingEventRetentionDays    int
+	HostingReleaseRetentionDays  int
+	HostingCallbackRetentionDays int
+	HostingAuditRetentionDays    int
 }
 
 type SecurityStatus struct {
@@ -42,21 +57,36 @@ func securityStatus() SecurityStatus {
 
 func loadConfig() AppConfig {
 	cfg := AppConfig{
-		Addr:                   getenvDefault("DEPLOYER_ADDR", "127.0.0.1:9090"),
-		DBPath:                 getenvDefault("DEPLOYER_DB_PATH", "deployer.db"),
-		PublicURL:              strings.TrimRight(os.Getenv("DEPLOYER_PUBLIC_URL"), "/"),
-		ArtifactDir:            getenvDefault("DEPLOYER_ARTIFACT_DIR", filepath.Join(os.TempDir(), "deployer-artifacts")),
-		SnapshotDir:            getenvDefault("DEPLOYER_SNAPSHOT_DIR", filepath.Join(os.TempDir(), "deployer-snapshots")),
-		LogRetentionDays:       getenvIntDefault("DEPLOYER_LOG_RETENTION_DAYS", 30),
-		ArtifactRetentionHours: getenvIntDefault("DEPLOYER_ARTIFACT_RETENTION_HOURS", 24),
-		DockerPrune:            getenvBoolDefault("DEPLOYER_DOCKER_PRUNE", false),
-		ServerReadTimeout:      getenvDurationDefault("DEPLOYER_SERVER_READ_TIMEOUT", 30*time.Second),
-		ServerWriteTimeout:     getenvDurationDefault("DEPLOYER_SERVER_WRITE_TIMEOUT", 5*time.Minute),
-		DockerBuildTimeout:     getenvDurationDefault("DEPLOYER_DOCKER_BUILD_TIMEOUT", 15*time.Minute),
-		SCPTimeout:             getenvDurationDefault("DEPLOYER_SCP_TIMEOUT", 10*time.Minute),
-		SSHTimeout:             getenvDurationDefault("DEPLOYER_SSH_TIMEOUT", 5*time.Minute),
-		HealthCheckTimeout:     getenvDurationDefault("DEPLOYER_HEALTH_CHECK_TIMEOUT", 60*time.Second),
-		DemoMode:               getenvBoolDefault("DEPLOYER_DEMO_MODE", false),
+		Addr:                         getenvDefault("DEPLOYER_ADDR", "127.0.0.1:9090"),
+		DBPath:                       getenvDefault("DEPLOYER_DB_PATH", "deployer.db"),
+		PublicURL:                    strings.TrimRight(os.Getenv("DEPLOYER_PUBLIC_URL"), "/"),
+		ArtifactDir:                  getenvDefault("DEPLOYER_ARTIFACT_DIR", filepath.Join(os.TempDir(), "deployer-artifacts")),
+		SnapshotDir:                  getenvDefault("DEPLOYER_SNAPSHOT_DIR", filepath.Join(os.TempDir(), "deployer-snapshots")),
+		LogRetentionDays:             getenvIntDefault("DEPLOYER_LOG_RETENTION_DAYS", 30),
+		ArtifactRetentionHours:       getenvIntDefault("DEPLOYER_ARTIFACT_RETENTION_HOURS", 24),
+		DockerPrune:                  getenvBoolDefault("DEPLOYER_DOCKER_PRUNE", false),
+		ServerReadTimeout:            getenvDurationDefault("DEPLOYER_SERVER_READ_TIMEOUT", 30*time.Second),
+		ServerWriteTimeout:           getenvDurationDefault("DEPLOYER_SERVER_WRITE_TIMEOUT", 5*time.Minute),
+		DockerBuildTimeout:           getenvDurationDefault("DEPLOYER_DOCKER_BUILD_TIMEOUT", 15*time.Minute),
+		SCPTimeout:                   getenvDurationDefault("DEPLOYER_SCP_TIMEOUT", 10*time.Minute),
+		SSHTimeout:                   getenvDurationDefault("DEPLOYER_SSH_TIMEOUT", 5*time.Minute),
+		HealthCheckTimeout:           getenvDurationDefault("DEPLOYER_HEALTH_CHECK_TIMEOUT", 60*time.Second),
+		DemoMode:                     getenvBoolDefault("DEPLOYER_DEMO_MODE", false),
+		HostingRepoRoot:              getenvDefault("DEPLOYER_HOSTING_REPO_ROOT", "/srv/deployer/hosting/repos"),
+		HostingDeployRoot:            getenvDefault("DEPLOYER_HOSTING_DEPLOY_ROOT", "/srv/deployer/hosting/apps"),
+		ProxyAdapterURL:              strings.TrimRight(os.Getenv("DEPLOYER_PROXY_ADAPTER_URL"), "/"),
+		ProxyAdapterToken:            os.Getenv("DEPLOYER_PROXY_ADAPTER_TOKEN"),
+		ProxyAdapterTimeout:          getenvDurationDefault("DEPLOYER_PROXY_ADAPTER_TIMEOUT", 15*time.Second),
+		CallbackURL:                  strings.TrimSpace(os.Getenv("DEPLOYER_HOSTING_CALLBACK_URL")),
+		CallbackSigningSecret:        os.Getenv("DEPLOYER_HOSTING_CALLBACK_SECRET"),
+		CallbackTimeout:              getenvDurationDefault("DEPLOYER_HOSTING_CALLBACK_TIMEOUT", 15*time.Second),
+		CallbackMaxAttempts:          getenvIntDefault("DEPLOYER_HOSTING_CALLBACK_MAX_ATTEMPTS", 12),
+		ServiceTokenOverlap:          getenvDurationDefault("DEPLOYER_SERVICE_TOKEN_ROTATION_OVERLAP", 24*time.Hour),
+		HostingLogRetentionDays:      getenvIntDefault("DEPLOYER_HOSTING_LOG_RETENTION_DAYS", 30),
+		HostingEventRetentionDays:    getenvIntDefault("DEPLOYER_HOSTING_EVENT_RETENTION_DAYS", 90),
+		HostingReleaseRetentionDays:  getenvIntDefault("DEPLOYER_HOSTING_RELEASE_RETENTION_DAYS", 90),
+		HostingCallbackRetentionDays: getenvIntDefault("DEPLOYER_HOSTING_CALLBACK_RETENTION_DAYS", 30),
+		HostingAuditRetentionDays:    getenvIntDefault("DEPLOYER_HOSTING_AUDIT_RETENTION_DAYS", 365),
 	}
 	return cfg
 }

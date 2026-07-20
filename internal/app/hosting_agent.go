@@ -1,0 +1,808 @@
+package app
+
+import (
+	"archive/tar"
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+type hostingAgentConfig struct {
+	ServerURL          string
+	Token              string
+	WorkRoot           string
+	RuntimeBindAddress string
+	BuildNetwork       string
+	BuildTimeout       time.Duration
+	Draining           bool
+}
+
+func runHostingAgent() {
+	flags := flag.NewFlagSet("hosting-agent", flag.ExitOnError)
+	serverURL := flags.String("server", os.Getenv("DEPLOYER_SERVER"), "Deployer server URL")
+	token := flags.String("token", os.Getenv("DEPLOYER_TOKEN"), "Dedicated hosting runner token")
+	workRoot := flags.String("work-root", getenvDefault("DEPLOYER_HOSTING_AGENT_WORK_ROOT", filepath.Join(os.TempDir(), "deployer-hosting-agent")), "Hosting runner work directory")
+	runtimeBindAddress := flags.String("runtime-bind-address", getenvDefault("DEPLOYER_HOSTING_AGENT_RUNTIME_BIND_ADDRESS", "127.0.0.1"), "Private IPv4 address used for candidate ports")
+	buildNetwork := flags.String("build-network", os.Getenv("DEPLOYER_HOSTING_AGENT_BUILD_NETWORK"), "Docker network restricted to approved package mirrors")
+	buildTimeout := flags.Duration("build-timeout", getenvDurationDefault("DEPLOYER_HOSTING_AGENT_BUILD_TIMEOUT", 15*time.Minute), "Maximum customer build duration")
+	draining := flags.Bool("draining", getenvBoolDefault("DEPLOYER_HOSTING_AGENT_DRAINING", false), "Advertise drain state and do not claim new work")
+	flags.Parse(os.Args[2:])
+	if *serverURL == "" || *token == "" || !filepath.IsAbs(*workRoot) {
+		fmt.Fprintln(os.Stderr, "Usage: deployer hosting-agent --server URL --token TOKEN --work-root ABSOLUTE_PATH")
+		os.Exit(1)
+	}
+	*serverURL = strings.TrimRight(*serverURL, "/")
+	if err := validateServerURL(*serverURL); err != nil {
+		logFatal("hosting_agent_config_error", "invalid server URL", err, nil)
+	}
+	if err := validateHostingRuntimeBindAddress(*runtimeBindAddress); err != nil {
+		logFatal("hosting_agent_config_error", "invalid runtime bind address", err, nil)
+	}
+	if !validHostingDockerObjectName(*buildNetwork) || *buildTimeout < time.Minute || *buildTimeout > time.Hour {
+		logFatal("hosting_agent_config_error", "build network is required and build timeout must be between 1m and 1h", nil, nil)
+	}
+	if err := os.MkdirAll(*workRoot, 0750); err != nil {
+		logFatal("hosting_agent_config_error", "prepare work root", err, nil)
+	}
+	if err := requireHostingContainerRuntime(*buildNetwork); err != nil {
+		logFatal("hosting_agent_runtime_error", "container runtime does not satisfy hosting policy", err, nil)
+	}
+	config := hostingAgentConfig{ServerURL: *serverURL, Token: *token, WorkRoot: filepath.Clean(*workRoot), RuntimeBindAddress: *runtimeBindAddress, BuildNetwork: *buildNetwork, BuildTimeout: *buildTimeout, Draining: *draining}
+	for {
+		if err := flushHostingAgentCompletions(context.Background(), config); err != nil {
+			logOperationalError("retry hosting job completions", err)
+		}
+		if err := sendHostingAgentHeartbeat(context.Background(), config); err != nil {
+			logOperationalError("hosting runner heartbeat", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if config.Draining {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		job, err := pollHostingAgentJob(context.Background(), config)
+		if err != nil {
+			logOperationalError("hosting runner poll", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if job == nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		executeHostingAgentJob(config, job)
+	}
+}
+
+func requireHostingContainerRuntime(buildNetwork string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "docker", "version", "--format", "{{.Server.Version}}").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(output)) == "" {
+		return fmt.Errorf("Docker engine is required: %w", err)
+	}
+	output, err = exec.CommandContext(ctx, "docker", "network", "inspect", "--format", `{{.Internal}} {{index .Labels "light-apps.hosting.restricted-egress"}}`, buildNetwork).CombinedOutput()
+	if err != nil || strings.TrimSpace(string(output)) != "true true" {
+		return fmt.Errorf("build network must be internal and labeled light-apps.hosting.restricted-egress=true")
+	}
+	return nil
+}
+
+func validHostingDockerObjectName(value string) bool {
+	if len(value) < 1 || len(value) > 128 {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '_' || character == '-' || (character == '.' && index > 0) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func detectHostingAgentCapacity(workRoot string) (capacityDTO, capacityDTO, error) {
+	capacity := capacityDTO{CPUMillis: int64(runtime.NumCPU()) * 1000}
+	free := capacityDTO{CPUMillis: capacity.CPUMillis}
+	file, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return capacityDTO{}, capacityDTO{}, err
+	}
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		value, _ := strconv.ParseInt(fields[1], 10, 64)
+		switch fields[0] {
+		case "MemTotal:":
+			capacity.RAMBytes = value << 10
+		case "MemAvailable:":
+			free.RAMBytes = value << 10
+		}
+	}
+	file.Close()
+	if err := scanner.Err(); err != nil {
+		return capacityDTO{}, capacityDTO{}, err
+	}
+	var filesystem syscall.Statfs_t
+	if err := syscall.Statfs(workRoot, &filesystem); err != nil {
+		return capacityDTO{}, capacityDTO{}, err
+	}
+	capacity.DiskBytes = int64(filesystem.Blocks) * int64(filesystem.Bsize)
+	free.DiskBytes = int64(filesystem.Bavail) * int64(filesystem.Bsize)
+	pidMax, err := os.ReadFile("/proc/sys/kernel/pid_max")
+	if err != nil {
+		return capacityDTO{}, capacityDTO{}, err
+	}
+	capacity.PIDs, err = strconv.ParseInt(strings.TrimSpace(string(pidMax)), 10, 64)
+	if err != nil {
+		return capacityDTO{}, capacityDTO{}, err
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return capacityDTO{}, capacityDTO{}, err
+	}
+	var used int64
+	for _, entry := range entries {
+		if _, err := strconv.Atoi(entry.Name()); err == nil {
+			used++
+		}
+	}
+	free.PIDs = capacity.PIDs - used
+	return capacity, free, nil
+}
+
+func sendHostingAgentHeartbeat(ctx context.Context, config hostingAgentConfig) error {
+	_, free, err := detectHostingAgentCapacity(config.WorkRoot)
+	if err != nil {
+		return err
+	}
+	payload := hostingHeartbeatRequest{Free: free, Draining: config.Draining, ProtocolVersion: hostingRunnerProtocolVersion, ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"20", "22"}}
+	var response hostingHeartbeatResponse
+	if err := hostingAgentJSON(ctx, config, http.MethodPost, "/api/hosting-agent/v1/heartbeat", payload, &response, nil); err != nil {
+		return err
+	}
+	return reconcileHostingAgentReleases(ctx, response.RetainedReleases)
+}
+
+func pollHostingAgentJob(ctx context.Context, config hostingAgentConfig) (*hostingClaimedJob, error) {
+	var job hostingClaimedJob
+	status, err := hostingAgentJSONStatus(ctx, config, http.MethodPost, "/api/hosting-agent/v1/poll", nil, &job, nil)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusNoContent {
+		return nil, nil
+	}
+	return &job, nil
+}
+
+func hostingAgentJSON(ctx context.Context, config hostingAgentConfig, method, path string, body, response any, headers map[string]string) error {
+	_, err := hostingAgentJSONStatus(ctx, config, method, path, body, response, headers)
+	return err
+}
+
+func hostingAgentJSONStatus(ctx context.Context, config hostingAgentConfig, method, path string, body, response any, headers map[string]string) (int, error) {
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return 0, err
+		}
+		reader = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, config.ServerURL+path, reader)
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("Authorization", "Bearer "+config.Token)
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	httpResponse, err := agentControlClient.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer httpResponse.Body.Close()
+	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
+		limited, _ := io.ReadAll(io.LimitReader(httpResponse.Body, 64<<10))
+		return httpResponse.StatusCode, fmt.Errorf("hosting agent API returned HTTP %d: %s", httpResponse.StatusCode, redactSecrets(string(limited)))
+	}
+	if response != nil && httpResponse.StatusCode != http.StatusNoContent {
+		decoder := json.NewDecoder(io.LimitReader(httpResponse.Body, 1<<20))
+		if err := decoder.Decode(response); err != nil {
+			return httpResponse.StatusCode, err
+		}
+	}
+	return httpResponse.StatusCode, nil
+}
+
+func executeHostingAgentJob(config hostingAgentConfig, job *hostingClaimedJob) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	headers := hostingLeaseHeaders(job)
+	done := make(chan struct{})
+	var cancellationRequested atomic.Bool
+	var controlPlaneUnavailable atomic.Bool
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				var state map[string]bool
+				if err := hostingAgentJSON(ctx, config, http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/heartbeat", job.JobID), nil, &state, headers); err != nil {
+					controlPlaneUnavailable.Store(true)
+					cancel()
+					return
+				}
+				if state["cancel_requested"] {
+					cancellationRequested.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	completion := runHostingWorkload(ctx, config, job)
+	cancel()
+	<-done
+	if cancellationRequested.Load() {
+		completion.Status = "cancelled"
+		completion.FailureCode = "cancelled"
+		completion.FailureMessage = "hosting job cancelled"
+	} else if controlPlaneUnavailable.Load() && completion.Status == "failed" {
+		completion.FailureCode = "runner_lost"
+		completion.FailureMessage = "hosting runner lost its control-plane lease"
+	}
+	if err := queueHostingAgentCompletion(config, job, completion); err != nil {
+		logOperationalError("persist hosting job completion", err)
+		return
+	}
+	if err := flushHostingAgentCompletions(context.Background(), config); err != nil {
+		logOperationalError("complete hosting job", err)
+	}
+}
+
+type hostingAgentCompletionEnvelope struct {
+	JobID           int64                    `json:"job_id"`
+	LeaseGeneration int64                    `json:"lease_generation"`
+	LeaseToken      string                   `json:"lease_token"`
+	Completion      hostingCompletionRequest `json:"completion"`
+}
+
+func hostingAgentCompletionDir(config hostingAgentConfig) string {
+	return filepath.Join(config.WorkRoot, "completion-outbox")
+}
+
+func queueHostingAgentCompletion(config hostingAgentConfig, job *hostingClaimedJob, completion hostingCompletionRequest) error {
+	directory := hostingAgentCompletionDir(config)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	envelope := hostingAgentCompletionEnvelope{JobID: job.JobID, LeaseGeneration: job.LeaseGeneration, LeaseToken: job.LeaseToken, Completion: completion}
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(directory, fmt.Sprintf("job-%d-%d.json", job.JobID, job.LeaseGeneration))
+	temporary := path + ".tmp"
+	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(encoded); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporary, path)
+}
+
+func flushHostingAgentCompletions(ctx context.Context, config hostingAgentConfig) error {
+	directory := hostingAgentCompletionDir(config)
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		encoded, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		var envelope hostingAgentCompletionEnvelope
+		if err := json.Unmarshal(encoded, &envelope); err != nil || envelope.JobID <= 0 || envelope.LeaseGeneration <= 0 || envelope.LeaseToken == "" {
+			return fmt.Errorf("invalid persisted completion %s", entry.Name())
+		}
+		headers := map[string]string{
+			"X-Deployer-Lease-Generation": strconv.FormatInt(envelope.LeaseGeneration, 10),
+			"X-Deployer-Lease-Token":      envelope.LeaseToken,
+		}
+		status, deliveryErr := hostingAgentJSONStatus(ctx, config, http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/complete", envelope.JobID), envelope.Completion, nil, headers)
+		if deliveryErr != nil {
+			if status == http.StatusBadRequest || status == http.StatusForbidden || status == http.StatusNotFound {
+				return fmt.Errorf("persisted completion was permanently rejected with HTTP %d: %w", status, deliveryErr)
+			}
+			return deliveryErr
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func hostingLeaseHeaders(job *hostingClaimedJob) map[string]string {
+	return map[string]string{
+		"X-Deployer-Lease-Generation": strconv.FormatInt(job.LeaseGeneration, 10),
+		"X-Deployer-Lease-Token":      job.LeaseToken,
+	}
+}
+
+func runHostingWorkload(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob) hostingCompletionRequest {
+	fail := func(code string, err error) hostingCompletionRequest {
+		return hostingCompletionRequest{Status: "failed", FailureCode: code, FailureMessage: redactSecrets(err.Error())}
+	}
+	workDir := filepath.Join(config.WorkRoot, fmt.Sprintf("job-%d-%d", job.JobID, job.LeaseGeneration))
+	if err := os.RemoveAll(workDir); err != nil {
+		return fail("workload_policy_violation", err)
+	}
+	if err := os.Mkdir(workDir, 0750); err != nil {
+		return fail("workload_policy_violation", err)
+	}
+	defer os.RemoveAll(workDir)
+	sourceTar := filepath.Join(workDir, "source.tar")
+	if err := downloadHostingSource(ctx, config, job, sourceTar); err != nil {
+		return fail("source_fetch_failed", err)
+	}
+	if err := verifyFileDigest(sourceTar, job.Recipe.ArtifactDigest); err != nil {
+		return fail("artifact_digest_mismatch", err)
+	}
+	sourceDir := filepath.Join(workDir, "source")
+	if err := os.Mkdir(sourceDir, 0750); err != nil {
+		return fail("workload_policy_violation", err)
+	}
+	if err := extractHostingSource(sourceTar, sourceDir); err != nil {
+		return fail("workload_policy_violation", err)
+	}
+	if err := writeGeneratedHostingRecipe(sourceDir, job.Recipe); err != nil {
+		return fail("workload_policy_violation", err)
+	}
+	if err := reportHostingPhase(ctx, config, job, hostingPhaseBuilding); err != nil {
+		return fail("build_failed", err)
+	}
+	imageTag := "deployer-hosting:" + safeFileName(job.Recipe.ExternalDeploymentID)
+	buildTimeout := config.BuildTimeout
+	if buildTimeout <= 0 {
+		buildTimeout = 15 * time.Minute
+	}
+	buildCtx, cancelBuild := context.WithTimeout(ctx, buildTimeout)
+	defer cancelBuild()
+	buildArgs := []string{"build", "--pull", "--no-cache", "--network", config.BuildNetwork,
+		"--memory", strconv.FormatInt(job.Recipe.Limits.RAMBytes, 10),
+		"--memory-swap", strconv.FormatInt(job.Recipe.Limits.RAMBytes, 10),
+		"--cpu-period", "100000", "--cpu-quota", strconv.FormatInt(job.Recipe.Limits.CPUMillis*100, 10),
+		"--ulimit", fmt.Sprintf("nproc=%d:%d", job.Recipe.Limits.PIDs, job.Recipe.Limits.PIDs),
+		"--ulimit", "nofile=4096:4096", "--shm-size", "64m",
+		"-f", ".deployer/Dockerfile", "-t", imageTag, "."}
+	if err := runHostingCommand(buildCtx, config, job, sourceDir, "docker", buildArgs...); err != nil {
+		if errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
+			return fail("build_timeout", fmt.Errorf("build exceeded %s", buildTimeout))
+		}
+		return fail("build_failed", err)
+	}
+	imageIDBytes, err := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", imageTag).Output()
+	if err != nil {
+		return fail("build_failed", err)
+	}
+	releaseDigest := strings.TrimSpace(string(imageIDBytes))
+	if !validSHA256Digest(releaseDigest) {
+		return fail("build_failed", fmt.Errorf("container runtime returned invalid image digest"))
+	}
+	releaseArtifactPath := filepath.Join(workDir, "release-image.tar")
+	if err := runHostingCommand(ctx, config, job, "", "docker", "image", "save", "-o", releaseArtifactPath, imageTag); err != nil {
+		return fail("release_persistence_failed", err)
+	}
+	releaseArtifactHash, err := fileSHA256(releaseArtifactPath)
+	if err != nil {
+		return fail("release_persistence_failed", err)
+	}
+	releaseArtifactDigest := "sha256:" + releaseArtifactHash
+	if err := uploadHostingReleaseArtifact(ctx, config, job, releaseDigest, releaseArtifactDigest, releaseArtifactPath); err != nil {
+		return fail("release_persistence_failed", err)
+	}
+	if err := reportHostingPhase(ctx, config, job, hostingPhaseStarting); err != nil {
+		return fail("runtime_start_failed", err)
+	}
+	containerName := "deployer-hosting-" + safeFileName(job.Recipe.ExternalDeploymentID)
+	containerPort := job.Recipe.Runtime.Port
+	if job.Recipe.Runtime.Kind == "static" {
+		containerPort = 8080
+	}
+	runArgs := []string{"run", "-d", "--name", containerName, "--restart", "unless-stopped",
+		"--label", "light-apps.hosting.managed=true", "--label", "light-apps.hosting.release=" + releaseDigest,
+		"--label", "light-apps.hosting.project=" + job.Recipe.ExternalProjectID,
+		"--label", "light-apps.hosting.deployment=" + job.Recipe.ExternalDeploymentID,
+		"--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit", strconv.FormatInt(job.Recipe.Limits.PIDs, 10), "--memory", strconv.FormatInt(job.Recipe.Limits.RAMBytes, 10), "--cpus", fmt.Sprintf("%.3f", float64(job.Recipe.Limits.CPUMillis)/1000), "--storage-opt", "size=" + strconv.FormatInt(job.Recipe.Limits.DiskBytes, 10), "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "-p", fmt.Sprintf("%s::%d", config.RuntimeBindAddress, containerPort)}
+	for index, reference := range job.SecretRefs {
+		runArgs = append(runArgs, "--env", fmt.Sprintf("DEPLOYER_SECRET_REF_%d=%s", index, reference.Reference), "--env", fmt.Sprintf("DEPLOYER_SECRET_PROVIDER_%d=%s", index, reference.Provider))
+	}
+	runArgs = append(runArgs, imageTag)
+	if err := runHostingCommand(ctx, config, job, "", "docker", runArgs...); err != nil {
+		return fail("runtime_start_failed", err)
+	}
+	keepContainer := false
+	defer func() {
+		if !keepContainer {
+			_ = exec.Command("docker", "rm", "-f", containerName).Run()
+		}
+	}()
+	portOutput, err := exec.CommandContext(ctx, "docker", "port", containerName, fmt.Sprintf("%d/tcp", containerPort)).Output()
+	if err != nil {
+		return fail("runtime_start_failed", err)
+	}
+	hostPort, err := parseDockerBoundPort(string(portOutput), config.RuntimeBindAddress)
+	if err != nil {
+		return fail("runtime_start_failed", err)
+	}
+	healthPath := job.Recipe.Runtime.HealthPath
+	if healthPath == "" {
+		healthPath = "/"
+	}
+	endpoint := fmt.Sprintf("http://%s:%d", config.RuntimeBindAddress, hostPort)
+	if err := reportHostingPhase(ctx, config, job, hostingPhaseHealth); err != nil {
+		return fail("health_check_failed", err)
+	}
+	attempts, statusCode, err := checkHostingCandidateHealth(ctx, endpoint+healthPath)
+	if err != nil {
+		return hostingCompletionRequest{Status: "failed", FailureCode: "health_check_failed", FailureMessage: redactSecrets(err.Error()), HealthEvidence: map[string]any{"healthy": false, "attempts": attempts, "status_code": statusCode}}
+	}
+	keepContainer = true
+	return hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: releaseArtifactDigest, RuntimeEndpoint: endpoint, HealthEvidence: map[string]any{"healthy": true, "attempts": attempts, "status_code": statusCode}}
+}
+
+func uploadHostingReleaseArtifact(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, releaseDigest, artifactDigest, path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		config.ServerURL+fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/release-artifact", job.JobID), file)
+	if err != nil {
+		return err
+	}
+	request.ContentLength = info.Size()
+	request.Header.Set("Authorization", "Bearer "+config.Token)
+	request.Header.Set("Content-Type", "application/x-tar")
+	request.Header.Set("X-Deployer-Release-Digest", releaseDigest)
+	request.Header.Set("X-Deployer-Artifact-Digest", artifactDigest)
+	for key, value := range hostingLeaseHeaders(job) {
+		request.Header.Set(key, value)
+	}
+	response, err := agentArtifactClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		limited, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		return fmt.Errorf("release artifact upload returned HTTP %d: %s", response.StatusCode, redactSecrets(string(limited)))
+	}
+	return nil
+}
+
+func reconcileHostingAgentReleases(ctx context.Context, retained []hostingRetainedRelease) error {
+	retainedSet := make(map[string]struct{}, len(retained))
+	for _, release := range retained {
+		if !validSHA256Digest(release.ReleaseDigest) || !externalIDPattern.MatchString(release.ExternalProjectID) || !externalIDPattern.MatchString(release.ExternalDeploymentID) {
+			return fmt.Errorf("control plane returned invalid retained release identity")
+		}
+		retainedSet[release.ExternalProjectID+"\x00"+release.ExternalDeploymentID] = struct{}{}
+	}
+	output, err := exec.CommandContext(ctx, "docker", "ps", "-a", "--filter", "label=light-apps.hosting.managed=true", "--format", `{{.ID}}\t{{.Label "light-apps.hosting.release"}}\t{{.Label "light-apps.hosting.project"}}\t{{.Label "light-apps.hosting.deployment"}}`).Output()
+	if err != nil {
+		return fmt.Errorf("list managed hosting containers: %w", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 4 || strings.TrimSpace(fields[0]) == "" || !validSHA256Digest(strings.TrimSpace(fields[1])) {
+			return fmt.Errorf("container runtime returned invalid managed container metadata")
+		}
+		containerID := strings.TrimSpace(fields[0])
+		identity := strings.TrimSpace(fields[2]) + "\x00" + strings.TrimSpace(fields[3])
+		if _, ok := retainedSet[identity]; ok {
+			continue
+		}
+		imageOutput, _ := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.Image}}", containerID).Output()
+		if err := exec.CommandContext(ctx, "docker", "rm", "-f", containerID).Run(); err != nil {
+			return fmt.Errorf("remove expired managed hosting container: %w", err)
+		}
+		imageID := strings.TrimSpace(string(imageOutput))
+		if validSHA256Digest(imageID) {
+			_ = exec.CommandContext(ctx, "docker", "image", "rm", imageID).Run()
+		}
+	}
+	return nil
+}
+
+func downloadHostingSource(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, destination string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, config.ServerURL+job.Recipe.SourceArtifactURL, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+config.Token)
+	for key, value := range hostingLeaseHeaders(job) {
+		request.Header.Set(key, value)
+	}
+	response, err := agentArtifactClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("source download returned HTTP %d", response.StatusCode)
+	}
+	if response.ContentLength > maxAgentArtifactDownloadBytes {
+		return fmt.Errorf("source artifact exceeds size limit")
+	}
+	file, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	written, copyErr := io.Copy(file, io.LimitReader(response.Body, maxAgentArtifactDownloadBytes+1))
+	closeErr := file.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if written > maxAgentArtifactDownloadBytes {
+		_ = os.Remove(destination)
+		return fmt.Errorf("source artifact exceeds size limit")
+	}
+	return closeErr
+}
+
+func verifyFileDigest(path, expected string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return err
+	}
+	actual := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	if actual != expected {
+		return fmt.Errorf("artifact digest mismatch")
+	}
+	return nil
+}
+
+func extractHostingSource(archivePath, destination string) error {
+	file, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	reader := tar.NewReader(file)
+	var extractedBytes int64
+	var entries int
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		entries++
+		if entries > 100000 {
+			return fmt.Errorf("archive contains too many entries")
+		}
+		clean := filepath.Clean(header.Name)
+		if clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("archive path is unsafe")
+		}
+		target := filepath.Join(destination, clean)
+		relative, err := filepath.Rel(destination, target)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("archive path escapes destination")
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0755); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if header.Size < 0 || header.Size > maxAgentArtifactDownloadBytes-extractedBytes {
+				return fmt.Errorf("archive expanded size exceeds limit")
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+			if err != nil {
+				return err
+			}
+			written, copyErr := io.Copy(output, io.LimitReader(reader, header.Size))
+			closeErr := output.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			if written != header.Size {
+				return fmt.Errorf("archive entry was truncated")
+			}
+			extractedBytes += written
+		default:
+			return fmt.Errorf("archive contains forbidden non-regular entry")
+		}
+	}
+}
+
+func writeGeneratedHostingRecipe(sourceDir string, recipe hostingJobRecipe) error {
+	directory := filepath.Join(sourceDir, ".deployer")
+	if err := os.Mkdir(directory, 0750); err != nil {
+		return err
+	}
+	install, runBuild, command, err := hostingPackageCommands(recipe.Runtime)
+	if err != nil {
+		return err
+	}
+	var dockerfile string
+	if recipe.Runtime.Kind == "static" {
+		dockerfile = fmt.Sprintf("FROM node:%s-bookworm-slim AS build\nWORKDIR /app\nCOPY . .\nRUN %s\nRUN %s\nFROM nginxinc/nginx-unprivileged:1.27-alpine\nCOPY .deployer/nginx.conf /etc/nginx/conf.d/default.conf\nCOPY --from=build /app/%s /usr/share/nginx/html\nEXPOSE 8080\n", recipe.Runtime.NodeVersion, install, runBuild, recipe.Runtime.OutputDirectory)
+		nginx := "server { listen 8080; server_name _; root /usr/share/nginx/html; location / { try_files $uri $uri/ /index.html; } }\n"
+		if err := os.WriteFile(filepath.Join(directory, "nginx.conf"), []byte(nginx), 0640); err != nil {
+			return err
+		}
+	} else {
+		buildStep := ""
+		if recipe.Runtime.BuildScript != "" {
+			buildStep = "RUN " + runBuild + "\n"
+		}
+		dockerfile = fmt.Sprintf("FROM node:%s-bookworm-slim\nWORKDIR /app\nCOPY . .\nRUN %s\n%sENV NODE_ENV=production\nENV PORT=%d\nUSER node\nEXPOSE %d\nCMD %s\n", recipe.Runtime.NodeVersion, install, buildStep, recipe.Runtime.Port, recipe.Runtime.Port, command)
+	}
+	return os.WriteFile(filepath.Join(directory, "Dockerfile"), []byte(dockerfile), 0640)
+}
+
+func hostingPackageCommands(runtime HostingRuntimeManifest) (string, string, string, error) {
+	script := runtime.BuildScript
+	switch runtime.PackageManager {
+	case "npm":
+		return "npm ci --ignore-scripts", "npm run " + script, fmt.Sprintf(`["npm","run",%q]`, runtime.StartScript), nil
+	case "pnpm":
+		return "corepack enable && pnpm install --frozen-lockfile --ignore-scripts", "pnpm run " + script, fmt.Sprintf(`["pnpm","run",%q]`, runtime.StartScript), nil
+	case "yarn":
+		return "corepack enable && yarn install --immutable --mode=skip-builds", "yarn run " + script, fmt.Sprintf(`["yarn","run",%q]`, runtime.StartScript), nil
+	default:
+		return "", "", "", fmt.Errorf("unsupported package manager")
+	}
+}
+
+func reportHostingPhase(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, phase string) error {
+	return hostingAgentJSON(ctx, config, http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/phase", job.JobID), hostingPhaseRequest{Phase: phase}, nil, hostingLeaseHeaders(job))
+}
+
+func runHostingCommand(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, directory, name string, args ...string) error {
+	command := exec.CommandContext(ctx, name, args...)
+	command.Dir = directory
+	pipe, err := command.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	command.Stderr = command.Stdout
+	if err := command.Start(); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(pipe)
+	buffer := make([]byte, 64<<10)
+	scanner.Buffer(buffer, 1<<20)
+	for scanner.Scan() {
+		message := redactSecrets(scanner.Text())
+		_ = hostingAgentJSON(ctx, config, http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/logs", job.JobID), hostingLogRequest{Stream: "build", Message: message}, nil, hostingLeaseHeaders(job))
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return command.Wait()
+}
+
+func parseLoopbackDockerPort(output string) (int, error) {
+	return parseDockerBoundPort(output, "127.0.0.1")
+}
+
+func validateHostingRuntimeBindAddress(value string) error {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if ip == nil || ip.To4() == nil || ip.IsUnspecified() || (!ip.IsPrivate() && !ip.IsLoopback()) {
+		return fmt.Errorf("runtime bind address must be a private or loopback IPv4 address")
+	}
+	return nil
+}
+
+func parseDockerBoundPort(output, expectedAddress string) (int, error) {
+	line := strings.TrimSpace(strings.Split(output, "\n")[0])
+	host, portText, err := net.SplitHostPort(line)
+	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).Equal(net.ParseIP(expectedAddress)) {
+		return 0, fmt.Errorf("container runtime did not bind the configured private address")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1024 || port > 65535 {
+		return 0, fmt.Errorf("container runtime returned invalid host port")
+	}
+	return port, nil
+}
+
+func checkHostingCandidateHealth(ctx context.Context, target string) (int, int, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	lastStatus := 0
+	for attempt := 1; attempt <= 10; attempt++ {
+		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		response, err := client.Do(request)
+		if err == nil {
+			lastStatus = response.StatusCode
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+			response.Body.Close()
+			if response.StatusCode >= 200 && response.StatusCode < 400 {
+				return attempt, response.StatusCode, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return attempt, lastStatus, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return 10, lastStatus, fmt.Errorf("candidate health check failed")
+}

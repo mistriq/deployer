@@ -35,6 +35,10 @@ func Run() {
 		runAgent()
 		return
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "hosting-agent" {
+		runHostingAgent()
+		return
+	}
 
 	appConfig = loadConfig()
 	configureArtifactStorage(appConfig)
@@ -57,6 +61,10 @@ func Run() {
 	// Init SSE broker and builder
 	broker = NewSSEBroker()
 	builder = NewBuilder(broker)
+	hostingBackgroundCtx, stopHostingBackground := context.WithCancel(context.Background())
+	defer stopHostingBackground()
+	go runHostingCallbackDispatcher(hostingBackgroundCtx)
+	go runHostingReconciler(hostingBackgroundCtx)
 
 	// Background: mark stale runners as offline
 	go func() {
@@ -175,6 +183,17 @@ func Run() {
 	mux.HandleFunc("/api/builds/", handleAPIBuild)
 	mux.HandleFunc("/api/runners", handleAPIRunners)
 	mux.HandleFunc("/api/runners/", handleAPIRunner)
+	mux.HandleFunc("/api/service-tokens", handleAPIServiceTokens)
+	mux.HandleFunc("/api/service-tokens/", handleAPIServiceToken)
+	mux.HandleFunc("/api/hosting-runners", handleAPIHostingRunners)
+	mux.HandleFunc("/api/hosting-runners/", handleAPIHostingRunner)
+
+	// Private control-plane API. The customer frontend only calls the hosting
+	// control plane and never talks to Deployer directly.
+	mux.Handle("/api/internal/v1/", serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI)))
+	mux.Handle("/api/hosting-agent/v1/heartbeat", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentHeartbeat)))
+	mux.Handle("/api/hosting-agent/v1/poll", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentPoll)))
+	mux.Handle("/api/hosting-agent/v1/jobs/", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentJob)))
 
 	// Agent API routes
 	mux.HandleFunc("/api/agent/poll", handleAgentPoll)
@@ -220,6 +239,7 @@ func Run() {
 		})
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		stopHostingBackground()
 		if builder != nil {
 			builder.Shutdown(shutdownCtx)
 		}
@@ -230,6 +250,7 @@ func Run() {
 }
 
 func cleanupRuntimeState(cfg AppConfig) {
+	protectActiveHostingArtifacts()
 	cleanupStaleArtifacts(cfg)
 	if cfg.LogRetentionDays > 0 {
 		affected, err := cleanupOldBuildLogs(cfg.LogRetentionDays)
@@ -238,6 +259,9 @@ func cleanupRuntimeState(cfg AppConfig) {
 		} else if affected > 0 {
 			logOperationalInfo("Cleared logs from %d old builds", affected)
 		}
+	}
+	if err := cleanupHostingRecords(context.Background(), cfg, time.Now().UTC()); err != nil {
+		logOperationalError("cleanup hosting records", err)
 	}
 }
 

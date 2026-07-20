@@ -26,6 +26,23 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	t.Setenv("DEPLOYER_SSH_TIMEOUT", "90s")
 	t.Setenv("DEPLOYER_HEALTH_CHECK_TIMEOUT", "15s")
 	t.Setenv("DEPLOYER_DEMO_MODE", "true")
+	hostingRepoRoot := filepath.Join(t.TempDir(), "hosting-repos")
+	hostingDeployRoot := filepath.Join(t.TempDir(), "hosting-apps")
+	t.Setenv("DEPLOYER_HOSTING_REPO_ROOT", hostingRepoRoot)
+	t.Setenv("DEPLOYER_HOSTING_DEPLOY_ROOT", hostingDeployRoot)
+	t.Setenv("DEPLOYER_PROXY_ADAPTER_URL", "https://proxy.internal.example/")
+	t.Setenv("DEPLOYER_PROXY_ADAPTER_TOKEN", "proxy-token")
+	t.Setenv("DEPLOYER_PROXY_ADAPTER_TIMEOUT", "9s")
+	t.Setenv("DEPLOYER_HOSTING_CALLBACK_URL", "https://control.internal.example/callback")
+	t.Setenv("DEPLOYER_HOSTING_CALLBACK_SECRET", "callback-secret-at-least-thirty-two-bytes")
+	t.Setenv("DEPLOYER_HOSTING_CALLBACK_TIMEOUT", "11s")
+	t.Setenv("DEPLOYER_HOSTING_CALLBACK_MAX_ATTEMPTS", "7")
+	t.Setenv("DEPLOYER_SERVICE_TOKEN_ROTATION_OVERLAP", "2h")
+	t.Setenv("DEPLOYER_HOSTING_LOG_RETENTION_DAYS", "10")
+	t.Setenv("DEPLOYER_HOSTING_EVENT_RETENTION_DAYS", "20")
+	t.Setenv("DEPLOYER_HOSTING_RELEASE_RETENTION_DAYS", "30")
+	t.Setenv("DEPLOYER_HOSTING_CALLBACK_RETENTION_DAYS", "40")
+	t.Setenv("DEPLOYER_HOSTING_AUDIT_RETENTION_DAYS", "50")
 
 	cfg := loadConfig()
 	if cfg.Addr != "127.0.0.1:9191" {
@@ -47,6 +64,15 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	}
 	if !cfg.DemoMode {
 		t.Fatal("expected demo mode to be enabled")
+	}
+	if cfg.HostingRepoRoot != hostingRepoRoot || cfg.HostingDeployRoot != hostingDeployRoot {
+		t.Fatalf("unexpected hosting config: %+v", cfg)
+	}
+	if cfg.ProxyAdapterURL != "https://proxy.internal.example" || cfg.ProxyAdapterToken != "proxy-token" || cfg.ProxyAdapterTimeout != 9*time.Second ||
+		cfg.CallbackURL != "https://control.internal.example/callback" || cfg.CallbackSigningSecret == "" || cfg.CallbackTimeout != 11*time.Second || cfg.CallbackMaxAttempts != 7 ||
+		cfg.ServiceTokenOverlap != 2*time.Hour || cfg.HostingLogRetentionDays != 10 || cfg.HostingEventRetentionDays != 20 || cfg.HostingReleaseRetentionDays != 30 ||
+		cfg.HostingCallbackRetentionDays != 40 || cfg.HostingAuditRetentionDays != 50 {
+		t.Fatalf("unexpected hosting integration config: %+v", cfg)
 	}
 }
 

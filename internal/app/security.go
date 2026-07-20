@@ -161,5 +161,11 @@ func requiresCSRF(r *http.Request) bool {
 	if strings.HasPrefix(r.URL.Path, "/api/agent/") {
 		return false
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/internal/") {
+		return false
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/hosting-agent/") {
+		return false
+	}
 	return true
 }

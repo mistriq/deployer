@@ -95,8 +95,28 @@ URL through your authorization gateway.
 | `DEPLOYER_SSH_TIMEOUT` | `5m` | Remote SSH deploy timeout. |
 | `DEPLOYER_HEALTH_CHECK_TIMEOUT` | `60s` | Health-check timeout. |
 | `DEPLOYER_DEMO_MODE` | `false` | Seeds public-safe demo projects, runners, and builds into an empty database for screenshots. |
+| `DEPLOYER_HOSTING_REPO_ROOT` | `/srv/deployer/hosting/repos` | Base directory used to derive hosted-project checkout paths. The API never accepts an arbitrary checkout path. |
+| `DEPLOYER_HOSTING_DEPLOY_ROOT` | `/srv/deployer/hosting/apps` | Base directory used to derive hosted-project deploy paths. The API never accepts an arbitrary deploy path. |
+| `DEPLOYER_PROXY_ADAPTER_URL` | empty | Colleague-owned versioned reverse-proxy adapter URL. HTTPS is required except for loopback development. |
+| `DEPLOYER_PROXY_ADAPTER_TOKEN` | empty | Private adapter bearer credential. Never written to the database or logs. |
+| `DEPLOYER_PROXY_ADAPTER_TIMEOUT` | `15s` | Activation/suspension adapter request timeout. |
+| `DEPLOYER_HOSTING_CALLBACK_URL` | empty | Hosting control-plane terminal callback URL. HTTPS is required except for loopback tests. |
+| `DEPLOYER_HOSTING_CALLBACK_SECRET` | empty | HMAC callback key; use at least 32 random bytes. |
+| `DEPLOYER_HOSTING_CALLBACK_TIMEOUT` | `15s` | Per-attempt callback timeout. |
+| `DEPLOYER_HOSTING_CALLBACK_MAX_ATTEMPTS` | `12` | Attempts before a callback enters `dead_letter`. |
+| `DEPLOYER_SERVICE_TOKEN_ROTATION_OVERLAP` | `24h` | Validity overlap retained for the prior service-token credential during rotation. |
+| `DEPLOYER_HOSTING_LOG_RETENTION_DAYS` | `30` | Hosting log retention; `0` disables deletion. |
+| `DEPLOYER_HOSTING_EVENT_RETENTION_DAYS` | `90` | Hosting event retention; `0` disables deletion. |
+| `DEPLOYER_HOSTING_RELEASE_RETENTION_DAYS` | `90` | Inactive/failed release retention; active releases are never aged out. |
+| `DEPLOYER_HOSTING_CALLBACK_RETENTION_DAYS` | `30` | Delivered/dead-letter callback retention. |
+| `DEPLOYER_HOSTING_AUDIT_RETENTION_DAYS` | `365` | Hosting and service-token audit retention. |
 | `DEPLOYER_AGENT_CONTROL_TIMEOUT` | `45s` | Agent heartbeat, poll, log, completion, and version-check HTTP timeout. Agent-side setting. |
 | `DEPLOYER_AGENT_ARTIFACT_TIMEOUT` | `30m` | Agent artifact download/upload/update HTTP timeout. Agent-side setting. |
+| `DEPLOYER_HOSTING_AGENT_WORK_ROOT` | `/tmp/deployer-hosting-agent` | Absolute dedicated hosting-agent work root. Agent-side setting. |
+| `DEPLOYER_HOSTING_AGENT_RUNTIME_BIND_ADDRESS` | `127.0.0.1` | Loopback or private IPv4 address reachable by the staging/production proxy adapter; public binds are rejected. |
+| `DEPLOYER_HOSTING_AGENT_BUILD_NETWORK` | required | Docker internal network labeled `light-apps.hosting.restricted-egress=true` and connected only to approved package mirrors. |
+| `DEPLOYER_HOSTING_AGENT_BUILD_TIMEOUT` | `15m` | Hard customer-build deadline; accepted range is 1–60 minutes. |
+| `DEPLOYER_HOSTING_AGENT_DRAINING` | `false` | Advertise drain and stop claiming new hosting work. Agent-side setting. |
 
 See `.env.example` for a starter environment file.
 
@@ -211,6 +231,11 @@ state-changing requests also include `X-Deployer-CSRF: 1`.
 
 Agent routes require `Authorization: Bearer <runner-token>`.
 
+Private control-plane routes require a scoped Deployer service token. Create
+the token through the admin API; its plaintext value is returned only once and
+is stored hashed. Customer-facing applications must not call these routes
+directly.
+
 See `docs/openapi.yaml` for a machine-readable OpenAPI reference with request
 and response examples.
 
@@ -261,6 +286,88 @@ Admin API:
 - `GET /api/runners/:id/history`
 - `POST /api/runners/:id/rotate`
 - `DELETE /api/runners/:id`
+- `GET /api/service-tokens`
+- `POST /api/service-tokens`
+- `POST /api/service-tokens/:id/rotate`
+- `DELETE /api/service-tokens/:id`
+
+Private control-plane API:
+
+- `PUT /api/internal/v1/projects/:externalProjectId`
+- `POST /api/internal/v1/projects/:externalProjectId/deployments`
+- `GET /api/internal/v1/deployments/:externalDeploymentId`
+- `POST /api/internal/v1/deployments/:externalDeploymentId/cancel`
+- `GET /api/internal/v1/deployments/:externalDeploymentId/events`
+- `GET /api/internal/v1/deployments/:externalDeploymentId/logs`
+- `GET /api/internal/v1/projects/:externalProjectId/releases`
+- `POST /api/internal/v1/projects/:externalProjectId/rollback`
+- `POST /api/internal/v1/projects/:externalProjectId/suspend`
+- `POST /api/internal/v1/projects/:externalProjectId/resume`
+- `PUT /api/internal/v1/projects/:externalProjectId/kill-switch`
+- `PUT /api/internal/v1/settings/kill-switch`
+- `GET /api/internal/v1/capabilities`
+- `GET /api/internal/v1/runners`
+- `GET /api/internal/v1/metrics`
+
+Scopes are `projects:write`, `deployments:read`, `deployments:write`, and
+`hosting:admin`. Service credentials are hashed, rotation keeps the configured
+overlap window, revocation invalidates every credential, and authentication,
+scope denial, rotation, revocation, runner credential changes, and kill-switch
+changes are audited. Mutating lifecycle calls use `Idempotency-Key`; a key is
+scoped to issuer and operation and conflicts if reused for a different payload.
+
+Provision accepts only the versioned hosting manifest documented in OpenAPI:
+GitHub App installation/repository IDs, `static` or `node`, an allowlisted Node
+version and package manager, package.json script names, paths, port, health
+path, and a resource profile. It does not accept repository/deploy filesystem
+paths, SSH targets, Compose, build args, environment secrets, or shell hooks.
+The Deployer derives local paths from `external_project_id` and stores hosting
+state separately from trusted admin projects/builds. Hosting jobs cannot enter
+the legacy builder, Compose, Dockerfile, SSH, or `post_deploy` paths.
+
+The exact provision request body must be authenticated with the service token
+and sent as `Content-Type: application/json`, signed using these headers:
+
+- `X-Deployer-Timestamp`: current Unix timestamp in seconds (maximum clock
+  skew five minutes).
+- `X-Deployer-Signature`: `sha256=<hex HMAC-SHA256>`, where the HMAC key is the
+  service token and the signed bytes are `<timestamp>.<raw request body>`.
+
+Deployment creation verifies a full 40-character commit SHA, archives that
+exact Git object, verifies the caller's SHA-256 artifact digest, reserves a
+compatible runner without crossing its reserve, and creates the deployment,
+job, event, and original idempotent response in one transaction. Only opaque,
+short-lived `control-plane` secret references are persisted. Callers must branch
+on stable JSON `code`, `status`, `phase`, and `failure_code` values rather than
+human text.
+
+Terminal callbacks are delivered at least once. Their signature covers
+`<timestamp>.<event_id>.<raw body>`; receivers reject timestamps outside five
+minutes and deduplicate event IDs. Polling remains authoritative when delivery
+is missed or reaches `dead_letter`. See [the hosting operations runbook](docs/HOSTING_RUNBOOK.md)
+and `docs/openapi.yaml` for the complete schemas and recovery contract.
+
+Dedicated hosting runner:
+
+```bash
+./deployer hosting-agent \
+  --server https://deployer.internal.example \
+  --token 'htr_…' \
+  --work-root /var/lib/deployer-hosting-agent \
+  --runtime-bind-address 10.20.0.15 \
+  --build-network hosting-build-egress \
+  --build-timeout 15m
+```
+
+Register and rotate hosting runners through `/api/hosting-runners`; credentials
+are separate from legacy runner and service-token credentials. The agent
+requires Docker and a pre-created internal, restricted-egress build network,
+accepts only generated static/Node recipes, rejects unsafe tar entries, binds
+candidate ports to the configured private address, drops all capabilities,
+enables `no-new-privileges`, uses a read-only root filesystem, and enforces CPU,
+RAM, disk, PID, build-time, and temporary-filesystem limits. Before activation
+it uploads a digest-verified Docker image archive to Deployer-managed artifact
+storage. Heartbeats reconcile exact project/deployment release instances.
 
 Agent API:
 
@@ -270,6 +377,12 @@ Agent API:
 - `POST /api/agent/log/:buildId`
 - `POST /api/agent/complete/:buildId`
 - `POST /api/agent/heartbeat`
+
+Dedicated hosting-agent API:
+
+- `POST /api/hosting-agent/v1/heartbeat`
+- `POST /api/hosting-agent/v1/poll`
+- `/api/hosting-agent/v1/jobs/:jobId/{source,release-artifact,heartbeat,phase,logs,complete}`
 
 Agent-accessible release endpoints:
 

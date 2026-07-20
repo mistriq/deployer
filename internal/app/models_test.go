@@ -839,6 +839,8 @@ func TestInitDBMigratesOlderSchema(t *testing.T) {
 			picked_at DATETIME,
 			completed_at DATETIME
 		);
+		INSERT INTO projects (id, name, repo_path, image_name, deploy_dir)
+		VALUES (7, 'Legacy Dashboard', '/srv/legacy/dashboard', 'legacy-dashboard', '/srv/apps/legacy-dashboard');
 	`)
 	if err != nil {
 		preDB.Close()
@@ -858,9 +860,11 @@ func TestInitDBMigratesOlderSchema(t *testing.T) {
 	})
 
 	for table, columns := range map[string][]string{
-		"projects": {"runner_id", "deploy_mode", "post_deploy", "permissions", "preserve"},
-		"builds":   {"error_code"},
-		"jobs":     {"mode", "post_deploy", "permissions", "preserve", "error_code"},
+		"projects":            {"runner_id", "deploy_mode", "post_deploy", "permissions", "preserve"},
+		"builds":              {"error_code"},
+		"jobs":                {"mode", "post_deploy", "permissions", "preserve", "error_code"},
+		"hosting_projects":    {"external_project_id", "manifest_version", "manifest_digest", "runtime_kind"},
+		"hosting_deployments": {"external_deployment_id", "commit_sha", "artifact_digest", "status"},
 	} {
 		for _, column := range columns {
 			exists, err := columnExists(table, column)
@@ -873,12 +877,21 @@ func TestInitDBMigratesOlderSchema(t *testing.T) {
 		}
 	}
 
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
-		t.Fatalf("count migrations: %v", err)
+	for _, migrationID := range []string{"015_hosting_projects", "016_hosting_deployments"} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE id=?`, migrationID).Scan(&count); err != nil {
+			t.Fatalf("check migration %s: %v", migrationID, err)
+		}
+		if count != 1 {
+			t.Fatalf("expected migration %s to be recorded once, got %d", migrationID, count)
+		}
 	}
-	if count != 12 {
-		t.Fatalf("expected 12 migration records, got %d", count)
+	legacy, err := getProject(7)
+	if err != nil {
+		t.Fatalf("read representative legacy project: %v", err)
+	}
+	if legacy.Name != "Legacy Dashboard" || legacy.RepoPath != "/srv/legacy/dashboard" || legacy.DeployMode != "docker" || legacy.RunnerID != 0 {
+		t.Fatalf("legacy project changed during migration: %+v", legacy)
 	}
 }
 

@@ -2,7 +2,7 @@ module github.com/mistriq/deployer
 
 go 1.25.0
 
-toolchain go1.26.4
+toolchain go1.26.5
 
 require modernc.org/sqlite v1.52.0
 

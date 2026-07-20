@@ -1,0 +1,83 @@
+# Deployer hosting TODO
+
+The primary agent owns this checklist and updates it only after implementation and verification. Existing completed work must still be reviewed against the current diff before it is trusted.
+
+## P0 — current WIP stabilization
+
+- [ ] Inventory every current modified/untracked file and classify complete/partial/failing/unrelated without discarding anything.
+- [ ] Repair fresh DB and legacy migration expectations.
+- [ ] Establish green `test`, `race` and `vet` baseline before trusting inherited hosting changes.
+- [ ] Preserve legacy trusted-admin deployment behavior and tests.
+- [ ] Keep `deployer.db.bak-*` untracked and untouched unless the user explicitly decides otherwise.
+
+## P0 — contract and security
+
+- [ ] Verify hashed service tokens, scopes, rotation and revocation against the current WIP and full test gate.
+- [ ] Verify private versioned API and CSRF separation against the current WIP and full test gate.
+- [ ] Replace simple deployment-key persistence with issuer + operation + key + request hash + original response.
+- [ ] Add service-token audit events and overlapping no-downtime rotation.
+- [ ] Add `external_project_id` and `external_deployment_id` with unique constraints.
+- [ ] Define and document all internal schemas, scopes and stable error codes in OpenAPI.
+- [ ] Add strict manifest schema/version/hash validation.
+- [ ] Ensure hosting APIs accept no arbitrary shell, host path, Compose or privileged runtime fields.
+- [ ] Automatic path uses platform-generated static/Node recipes and never executes customer Dockerfiles.
+- [ ] Add request size limits, content-type validation and consistent JSON errors.
+
+## P0 — project and deployment lifecycle
+
+- [ ] Idempotent hosting project provision/upsert endpoint.
+- [ ] Separate hosting projects/jobs/runners from trusted admin projects.
+- [ ] Exact commit SHA and immutable artifact digest on every hosting deployment.
+- [ ] Atomic idempotency and one-active-deployment guard under concurrency.
+- [ ] Stable deployment phases and transition validation.
+- [ ] Idempotent cancel for queued and running deployments.
+- [ ] Cancellation intent and recovery remain durable after process restart.
+- [ ] Immutable release persistence and selected-release rollback.
+- [ ] Candidate health gate before activation.
+- [ ] Failed candidate leaves previous healthy release untouched.
+- [ ] Suspend/resume without deleting releases.
+- [ ] Restart reconciliation for Deployer and runner interruptions.
+
+## P0 — callbacks and reconciliation
+
+- [ ] Transactional callback outbox with unique event IDs.
+- [ ] HMAC signature, timestamp validation contract and replay protection.
+- [ ] Retry/backoff/dead-letter behavior.
+- [ ] Terminal callback safe to deliver more than once.
+- [ ] Polling endpoint contains enough state to repair a missed callback.
+- [ ] Redact secrets from logs, callbacks, errors and structured events.
+
+## P1 — runner and capacity
+
+- [ ] Hosting runner class, capability/version negotiation and labels.
+- [ ] Heartbeat includes free CPU/RAM/disk/PID capacity and drain state.
+- [ ] Scheduler refuses placement below configured reserve.
+- [ ] Structured workload limits propagated and enforced.
+- [ ] Deny public host ports, privileged mode, capabilities, host mounts and Docker socket.
+- [ ] Runtime receives secrets by short-lived reference/identity; Deployer/build DB and logs never persist plaintext.
+- [ ] Runner loss and recovery state are deterministic.
+- [ ] Per-project and global execution kill switches with audit reason.
+
+## P1 — observability and operations
+
+- [ ] Deployment event timeline with phase durations and stable failure codes.
+- [ ] Metrics for queue age, success rate, duration, capacity and callback lag.
+- [ ] Service token, DB backup/restore, stale job and runner-loss runbooks.
+- [ ] Retention and cleanup for artifacts, releases, logs and callback records.
+- [ ] Update README, SECURITY, CHANGELOG and OpenAPI.
+
+## Required verification
+
+- [ ] Fresh DB and legacy migration tests.
+- [ ] Auth, scope, rotation, revocation and audit tests.
+- [ ] Idempotency replay and concurrent duplicate tests.
+- [ ] Per-project deployment serialization tests.
+- [ ] Exact commit/artifact mismatch rejection tests.
+- [ ] Callback signing, retry, replay and polling reconciliation tests.
+- [ ] Health failure preserves active release test.
+- [ ] Cancel, rollback, suspend/resume and restart recovery tests.
+- [ ] Forbidden workload and secret-redaction security tests.
+- [ ] Full `go test ./...`, `go test -race ./...`, `go vet ./...` and `git diff --check` pass.
+- [ ] `govulncheck ./...` passes when available or blocker is documented.
+- [ ] No open P0/P1 issue and no demo/placeholder production path remains.
+- [ ] Real staging static + Node deployment, proxy activation and rollback pass; test fake alone is insufficient.

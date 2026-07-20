@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Add a private `/api/internal/v1` Light Apps Hosting execution API with scoped,
+  hashed, overlapping service credentials, strict signed manifests, canonical
+  idempotency, stable errors, and audit records.
+- Separate hosting projects, deployments, jobs, runners, releases, events,
+  logs, callbacks, and capacity from the legacy trusted-admin deployment path.
+- Verify full Git commit identity and immutable source-artifact digests before
+  atomically reserving runner capacity and creating hosting work.
+- Add the dedicated `hosting-agent` protocol and executable with generated
+  static/Node recipes, safe archive extraction, private ports, workload limits,
+  lease fencing, cancellation, health evidence, and retained-release cleanup.
+- Add immutable health-gated activation through the private versioned proxy
+  adapter client, selected-release rollback, suspend/resume, and compensation
+  when cancellation races activation.
+- Add a transactional signed callback outbox with retries, dead-letter state,
+  polling reconciliation, runner-loss recovery/reassignment, and deterministic
+  retry exhaustion.
+- Add per-project and global execution kill switches, aggregate hosting metrics,
+  hosting retention policies, expanded secret redaction, OpenAPI contracts, and
+  hosting operations/security runbooks.
+- Make legacy and hosting schema migrations atomic and test fresh,
+  representative legacy, concurrent migration, idempotency, lease, capacity,
+  activation, rollback, callback, and recovery behavior.
 - Prepare repository for public release.
 - Remove private runtime artifacts and production-specific documentation.
 - Delegate admin UI/API authentication to an upstream authorization gateway, and

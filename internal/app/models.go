@@ -161,7 +161,7 @@ func formatSQLiteTime(t time.Time) string {
 
 func initDB(path string) error {
 	var err error
-	db, err = sql.Open("sqlite", path)
+	db, err = sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
@@ -244,12 +244,25 @@ func initDB(path string) error {
 		note TEXT NOT NULL,
 		created_at DATETIME DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 	);
+
+	CREATE TABLE IF NOT EXISTS service_tokens (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		token_hash TEXT NOT NULL UNIQUE,
+		scopes TEXT NOT NULL,
+		created_at DATETIME NOT NULL,
+		last_used_at DATETIME,
+		revoked_at DATETIME
+	);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
 
 	if err := applyMigrations(); err != nil {
+		return err
+	}
+	if err := applyHostingMigrations(); err != nil {
 		return err
 	}
 
@@ -281,8 +294,17 @@ func initDB(path string) error {
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_running_per_project ON builds(project_id) WHERE status='running'`); err != nil {
 		return fmt.Errorf("create running build guard: %w", err)
 	}
-
 	return nil
+}
+
+func sqliteDSN(path string) string {
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	// These pragmas are connection-local. Supplying them in the DSN applies
+	// them to every connection opened by database/sql, not only the first one.
+	return path + separator + "_pragma=foreign_keys%3dON&_pragma=busy_timeout%3d5000"
 }
 
 func applyMigrations() error {
@@ -303,19 +325,49 @@ func applyMigrations() error {
 			note TEXT NOT NULL,
 			created_at DATETIME DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		)`},
+		{"013_service_tokens", `CREATE TABLE IF NOT EXISTS service_tokens (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE,
+			token_hash TEXT NOT NULL UNIQUE,
+			scopes TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			last_used_at DATETIME,
+			revoked_at DATETIME
+		)`},
+		{"015_hosting_projects", `CREATE TABLE IF NOT EXISTS hosting_projects (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			external_project_id TEXT NOT NULL UNIQUE CHECK (external_project_id <> ''),
+			manifest_version TEXT NOT NULL,
+			manifest_json TEXT NOT NULL,
+			manifest_digest TEXT NOT NULL,
+			repository_installation_id INTEGER NOT NULL,
+			repository_id INTEGER NOT NULL,
+			repository_full_name TEXT NOT NULL,
+			runtime_kind TEXT NOT NULL CHECK (runtime_kind IN ('static', 'node')),
+			resource_profile TEXT NOT NULL CHECK (resource_profile IN ('starter', 'standard')),
+			repo_path TEXT NOT NULL,
+			deploy_path TEXT NOT NULL,
+			runner_id INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		)`},
+		{"016_hosting_deployments", `CREATE TABLE IF NOT EXISTS hosting_deployments (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			hosting_project_id INTEGER NOT NULL REFERENCES hosting_projects(id) ON DELETE RESTRICT,
+			external_deployment_id TEXT NOT NULL UNIQUE CHECK (external_deployment_id <> ''),
+			commit_sha TEXT NOT NULL,
+			manifest_digest TEXT NOT NULL,
+			artifact_digest TEXT NOT NULL,
+			status TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		)`},
 	}
 	for _, migration := range tableMigrations {
-		applied, err := migrationApplied(migration.id)
-		if err != nil {
+		if err := applyBaseMigration(migration.id, func(ctx context.Context, conn *sql.Conn) error {
+			_, err := conn.ExecContext(ctx, migration.sql)
 			return err
-		}
-		if applied {
-			continue
-		}
-		if _, err := db.Exec(migration.sql); err != nil {
-			return fmt.Errorf("apply migration %s: %w", migration.id, err)
-		}
-		if err := recordMigration(migration.id); err != nil {
+		}); err != nil {
 			return err
 		}
 	}
@@ -339,41 +391,52 @@ func applyMigrations() error {
 		{"012_jobs_error_code", "jobs", "error_code", "error_code TEXT DEFAULT ''"},
 	}
 	for _, migration := range migrations {
-		applied, err := migrationApplied(migration.id)
-		if err != nil {
-			return err
-		}
-		if applied {
-			continue
-		}
-		if err := addColumnIfMissing(migration.table, migration.column, migration.definition); err != nil {
-			return err
-		}
-		if err := recordMigration(migration.id); err != nil {
+		if err := applyBaseMigration(migration.id, func(ctx context.Context, conn *sql.Conn) error {
+			return addColumnIfMissing(ctx, conn, migration.table, migration.column, migration.definition)
+		}); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func migrationApplied(id string) (bool, error) {
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE id=?`, id).Scan(&count); err != nil {
-		return false, fmt.Errorf("check migration %s: %w", id, err)
-	}
-	return count > 0, nil
-}
-
-func recordMigration(id string) error {
-	_, err := db.Exec(`INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)`, id, formatSQLiteTime(time.Now()))
+func applyBaseMigration(id string, apply func(context.Context, *sql.Conn) error) error {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("record migration %s: %w", id, err)
+		return fmt.Errorf("open migration connection: %w", err)
 	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return fmt.Errorf("begin migration %s: %w", id, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	var count int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE id=?`, id).Scan(&count); err != nil {
+		return fmt.Errorf("check migration %s: %w", id, err)
+	}
+	if count == 0 {
+		if err := apply(ctx, conn); err != nil {
+			return fmt.Errorf("apply migration %s: %w", id, err)
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)`, id, formatSQLiteTime(time.Now())); err != nil {
+			return fmt.Errorf("record migration %s: %w", id, err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return fmt.Errorf("commit migration %s: %w", id, err)
+	}
+	committed = true
 	return nil
 }
 
-func addColumnIfMissing(table, column, definition string) error {
-	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+func addColumnIfMissing(ctx context.Context, conn *sql.Conn, table, column, definition string) error {
+	rows, err := conn.QueryContext(ctx, "PRAGMA table_info("+table+")")
 	if err != nil {
 		return fmt.Errorf("inspect %s schema: %w", table, err)
 	}
@@ -396,7 +459,7 @@ func addColumnIfMissing(table, column, definition string) error {
 		return fmt.Errorf("iterate %s schema: %w", table, err)
 	}
 
-	if _, err := db.Exec("ALTER TABLE " + table + " ADD COLUMN " + definition); err != nil {
+	if _, err := conn.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+definition); err != nil {
 		return fmt.Errorf("add %s.%s: %w", table, column, err)
 	}
 	return nil
@@ -788,8 +851,9 @@ func createBuild(projectID int64, triggeredBy string) (*Build, error) {
 }
 
 func updateBuild(b *Build) error {
-	b.Log = trimBuildLog(b.Log)
 	b.ErrorCode = normalizedBuildErrorCode(b.Status, b.ErrorMessage, b.ErrorCode)
+	b.Log = trimBuildLog(redactSecrets(b.Log))
+	b.ErrorMessage = redactSecrets(b.ErrorMessage)
 	var finishedStr *string
 	if b.FinishedAt != nil && !b.FinishedAt.IsZero() {
 		s := formatSQLiteTime(*b.FinishedAt)
@@ -875,6 +939,7 @@ func cleanupOldBuildLogs(retentionDays int) (int64, error) {
 
 func cancelRunningBuild(buildID int64, message string) (bool, error) {
 	now := formatSQLiteTime(time.Now())
+	message = redactSecrets(message)
 	res, err := db.Exec(`
 		UPDATE builds
 		SET status='cancelled',

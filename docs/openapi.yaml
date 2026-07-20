@@ -7,7 +7,8 @@ info:
     Admin routes are intended to be protected by an upstream authorization
     gateway; Deployer does not implement local admin password login. Browser
     write requests also send X-Deployer-CSRF: "1". Agent routes use bearer
-    tokens created through the runner API.
+    tokens created through the runner API. Private control-plane routes use
+    scoped Deployer service tokens and are not customer-facing endpoints.
 servers:
   - url: https://deployer.example.com
     description: Example production URL
@@ -21,6 +22,9 @@ tags:
   - name: runners
   - name: agent
   - name: release
+  - name: service-tokens
+  - name: internal
+  - name: hosting-agent
 
 paths:
   /api/capabilities:
@@ -854,6 +858,622 @@ paths:
         "404":
           $ref: "#/components/responses/Error"
 
+  /api/service-tokens:
+    get:
+      tags: [service-tokens]
+      summary: List service tokens without their secret values
+      operationId: listServiceTokens
+      responses:
+        "200":
+          description: Service token metadata.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ServiceToken"
+    post:
+      tags: [service-tokens]
+      summary: Create a scoped service token
+      operationId: createServiceToken
+      parameters:
+        - $ref: "#/components/parameters/CSRFHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServiceTokenInput"
+      responses:
+        "201":
+          description: Token metadata with the secret returned once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceToken"
+
+  /api/service-tokens/{serviceTokenId}/rotate:
+    post:
+      tags: [service-tokens]
+      summary: Rotate a service token and return the new secret once
+      operationId: rotateServiceToken
+      parameters:
+        - $ref: "#/components/parameters/ServiceTokenId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "200":
+          description: Rotated token metadata with the new secret.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceToken"
+
+  /api/service-tokens/{serviceTokenId}:
+    delete:
+      tags: [service-tokens]
+      summary: Revoke a service token
+      operationId: revokeServiceToken
+      parameters:
+        - $ref: "#/components/parameters/ServiceTokenId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "204":
+          description: Service token revoked.
+
+  /api/hosting-runners:
+    get:
+      tags: [runners]
+      summary: List dedicated hosting runners
+      operationId: listHostingRunners
+      responses:
+        "200":
+          description: Hosting runner metadata without credentials.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/HostingRunnerAdmin"}
+    post:
+      tags: [runners]
+      summary: Register a dedicated hosting runner
+      operationId: createHostingRunner
+      parameters:
+        - $ref: "#/components/parameters/CSRFHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/HostingRunnerInput"}
+      responses:
+        "201":
+          description: Runner with one-time dedicated hosting credential.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingRunnerAdmin"}
+        "400": {$ref: "#/components/responses/Error"}
+
+  /api/hosting-runners/{hostingRunnerId}/rotate:
+    post:
+      tags: [runners]
+      summary: Rotate a dedicated hosting-runner credential
+      operationId: rotateHostingRunner
+      parameters:
+        - $ref: "#/components/parameters/HostingRunnerId"
+        - $ref: "#/components/parameters/CSRFHeader"
+      responses:
+        "200":
+          description: New credential returned once.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, token]
+                properties:
+                  id: {type: integer, format: int64}
+                  token: {type: string, readOnly: true, description: Returned only by this rotation response.}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/projects/{externalProjectId}:
+    put:
+      tags: [internal]
+      summary: Idempotently provision or update a hosted project
+      description: >
+        Accepts a signed, versioned, structured manifest. Repeating an identical
+        external_project_id and manifest returns the existing project; a changed
+        manifest updates the same project. Arbitrary shell, filesystem targets,
+        SSH, Compose, build arguments, and environment secrets are not accepted.
+        X-Deployer-Signature is HMAC-SHA256 over
+        "<X-Deployer-Timestamp>.<raw request body>" using the bearer token as
+        the HMAC key.
+      operationId: upsertInternalProject
+      security:
+        - serviceBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ExternalProjectId"
+        - $ref: "#/components/parameters/ManifestTimestamp"
+        - $ref: "#/components/parameters/ManifestSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalProjectUpsertInput"
+      responses:
+        "201":
+          description: A new hosted project was provisioned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalProject"
+        "200":
+          description: The existing hosted project was replayed or updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalProject"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "415":
+          $ref: "#/components/responses/Error"
+
+  /api/internal/v1/projects/{externalProjectId}/deployments:
+    post:
+      tags: [internal]
+      summary: Create an exact, immutable hosting deployment
+      description: >
+        Requires deployments:write. The commit must be a full Git SHA and the
+        artifact digest must match Deployer's archive of that exact commit.
+        Placement, capacity reservation, deployment, job, event, and
+        idempotency response are committed atomically. This endpoint accepts no
+        shell, Dockerfile, Compose, host path, privileged option, or plaintext secret.
+      operationId: createInternalDeployment
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalProjectId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/HostingDeploymentInput"}
+      responses:
+        "202":
+          description: Deployment accepted; an identical replay returns the original response and Idempotency-Replayed true.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingDeployment"}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "423": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/projects/{externalProjectId}/releases:
+    get:
+      tags: [internal]
+      summary: List immutable retained releases
+      operationId: listInternalReleases
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalProjectId"
+      responses:
+        "200":
+          description: Releases ordered newest first. Private runtime endpoints are omitted.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/HostingRelease"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/projects/{externalProjectId}/rollback:
+    post:
+      tags: [internal]
+      summary: Activate a selected retained healthy release
+      operationId: rollbackInternalRelease
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalProjectId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [release_digest]
+              properties:
+                release_digest: {$ref: "#/components/schemas/SHA256Digest"}
+      responses:
+        "200":
+          description: Selected release is active; replays return the original response.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingRelease"}
+        "400": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "502": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/projects/{externalProjectId}/suspend:
+    post:
+      tags: [internal]
+      summary: Suspend routing without deleting releases
+      operationId: suspendInternalProject
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalProjectId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Project desired state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingDesiredState"}
+        "502": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/projects/{externalProjectId}/resume:
+    post:
+      tags: [internal]
+      summary: Resume routing for the retained active release
+      operationId: resumeInternalProject
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalProjectId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Project desired state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingDesiredState"}
+        "502": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/projects/{externalProjectId}/kill-switch:
+    put:
+      tags: [internal]
+      summary: Change a project's execution kill switch
+      description: Requires projects:write. Enabling cancels queued work and durably requests cancellation of leased work.
+      operationId: setInternalProjectKillSwitch
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalProjectId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KillSwitchInput"}
+      responses:
+        "200":
+          description: Audited kill-switch state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/KillSwitchState"}
+        "400": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/deployments/{externalDeploymentId}:
+    get:
+      tags: [internal]
+      summary: Poll authoritative deployment state
+      operationId: getInternalDeployment
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalDeploymentId"
+      responses:
+        "200":
+          description: Structured deployment state sufficient to reconcile a missed callback.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingDeployment"}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/deployments/{externalDeploymentId}/cancel:
+    post:
+      tags: [internal]
+      summary: Idempotently cancel queued or running work
+      operationId: cancelInternalDeployment
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalDeploymentId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Current deployment, including durable cancellation intent.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingDeployment"}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/deployments/{externalDeploymentId}/events:
+    get:
+      tags: [internal]
+      summary: Get the structured deployment event timeline
+      operationId: getInternalDeploymentEvents
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalDeploymentId"
+      responses:
+        "200":
+          description: Ordered redacted events with stable phases and failure codes.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/HostingEvent"}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/deployments/{externalDeploymentId}/logs:
+    get:
+      tags: [internal]
+      summary: Get redacted structured deployment logs
+      operationId: getInternalDeploymentLogs
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalDeploymentId"
+      responses:
+        "200":
+          description: Ordered redacted log chunks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/HostingLog"}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/internal/v1/capabilities:
+    get:
+      tags: [internal]
+      summary: Negotiate hosting manifest, runner, runtime, resource, and failure-code capabilities
+      operationId: getInternalCapabilities
+      security: [{serviceBearerAuth: []}]
+      responses:
+        "200":
+          description: Hosting execution capabilities.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingCapabilities"}
+
+  /api/internal/v1/runners:
+    get:
+      tags: [internal]
+      summary: List hosting-only runner capabilities and free capacity
+      operationId: listInternalHostingRunners
+      security: [{serviceBearerAuth: []}]
+      responses:
+        "200":
+          description: Hosting runners; legacy trusted-admin runners are excluded.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/HostingRunnerState"}
+
+  /api/internal/v1/metrics:
+    get:
+      tags: [internal]
+      summary: Get aggregate hosting operational metrics
+      operationId: getInternalHostingMetrics
+      security: [{serviceBearerAuth: []}]
+      responses:
+        "200":
+          description: Queue age, 24-hour outcomes and duration, runner capacity, and callback lag.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingMetrics"}
+
+  /api/internal/v1/settings/kill-switch:
+    put:
+      tags: [internal]
+      summary: Change the global hosting execution kill switch
+      description: Requires hosting:admin. Enabling cancels queued work and durably requests cancellation of leased work.
+      operationId: setInternalGlobalKillSwitch
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KillSwitchInput"}
+      responses:
+        "200":
+          description: Audited global kill-switch state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/KillSwitchState"}
+        "400": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+
+  /api/hosting-agent/v1/heartbeat:
+    post:
+      tags: [hosting-agent]
+      summary: Publish hosting runner liveness, free capacity, drain state, and negotiated versions
+      operationId: heartbeatHostingAgent
+      security: [{hostingAgentBearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/HostingHeartbeat"}
+      responses:
+        "200":
+          description: Heartbeat accepted with the authoritative release-retention set for this runner.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [retained_releases]
+                properties:
+                  retained_releases:
+                    type: array
+                    items: {$ref: "#/components/schemas/HostingRetainedRelease"}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+
+  /api/hosting-agent/v1/poll:
+    post:
+      tags: [hosting-agent]
+      summary: Atomically claim one job assigned to this hosting runner
+      operationId: pollHostingAgent
+      security: [{hostingAgentBearerAuth: []}]
+      responses:
+        "200":
+          description: Lease-bound generated workload recipe and opaque secret references.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingClaimedJob"}
+        "204": {description: No assigned job is available.}
+
+  /api/hosting-agent/v1/jobs/{hostingJobId}/source:
+    get:
+      tags: [hosting-agent]
+      summary: Download the exact immutable source archive for the current lease
+      operationId: downloadHostingSource
+      security: [{hostingAgentBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/HostingJobId"
+        - $ref: "#/components/parameters/LeaseGeneration"
+        - $ref: "#/components/parameters/LeaseToken"
+      responses:
+        "200":
+          description: Git archive whose SHA-256 is the recipe artifact digest.
+          content:
+            application/x-tar:
+              schema: {type: string, format: binary}
+        "403": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/hosting-agent/v1/jobs/{hostingJobId}/heartbeat:
+    post:
+      tags: [hosting-agent]
+      summary: Renew a current job lease and receive durable cancellation intent
+      operationId: heartbeatHostingJob
+      security: [{hostingAgentBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/HostingJobId"
+        - $ref: "#/components/parameters/LeaseGeneration"
+        - $ref: "#/components/parameters/LeaseToken"
+      responses:
+        "200":
+          description: Lease state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cancel_requested]
+                properties:
+                  cancel_requested: {type: boolean}
+        "403": {$ref: "#/components/responses/Error"}
+
+  /api/hosting-agent/v1/jobs/{hostingJobId}/release-artifact:
+    put:
+      tags: [hosting-agent]
+      summary: Persist the immutable Docker image archive produced by the current lease
+      operationId: uploadHostingReleaseArtifact
+      security: [{hostingAgentBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/HostingJobId"
+        - $ref: "#/components/parameters/LeaseGeneration"
+        - $ref: "#/components/parameters/LeaseToken"
+        - name: X-Deployer-Release-Digest
+          in: header
+          required: true
+          schema: {$ref: "#/components/schemas/SHA256Digest"}
+        - name: X-Deployer-Artifact-Digest
+          in: header
+          required: true
+          schema: {$ref: "#/components/schemas/SHA256Digest"}
+      requestBody:
+        required: true
+        content:
+          application/x-tar:
+            schema: {type: string, format: binary}
+      responses:
+        "204": {description: Content-addressed release artifact durably persisted or identical upload replayed.}
+        "400": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
+
+  /api/hosting-agent/v1/jobs/{hostingJobId}/phase:
+    post:
+      tags: [hosting-agent]
+      summary: Report a validated workload phase using a current lease
+      operationId: reportHostingJobPhase
+      security: [{hostingAgentBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/HostingJobId"
+        - $ref: "#/components/parameters/LeaseGeneration"
+        - $ref: "#/components/parameters/LeaseToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [phase]
+              properties:
+                phase:
+                  type: string
+                  enum: [fetching_source, building, starting_candidate, health_checking]
+      responses:
+        "204": {description: Phase accepted.}
+        "403": {$ref: "#/components/responses/Error"}
+
+  /api/hosting-agent/v1/jobs/{hostingJobId}/logs:
+    post:
+      tags: [hosting-agent]
+      summary: Persist a bounded redacted structured log chunk
+      operationId: reportHostingJobLog
+      security: [{hostingAgentBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/HostingJobId"
+        - $ref: "#/components/parameters/LeaseGeneration"
+        - $ref: "#/components/parameters/LeaseToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/HostingLogInput"}
+      responses:
+        "204": {description: Redacted log accepted.}
+        "403": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+
+  /api/hosting-agent/v1/jobs/{hostingJobId}/complete:
+    post:
+      tags: [hosting-agent]
+      summary: Complete a lease with stable structured outcome and health evidence
+      operationId: completeHostingJob
+      security: [{hostingAgentBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/HostingJobId"
+        - $ref: "#/components/parameters/LeaseGeneration"
+        - $ref: "#/components/parameters/LeaseToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/HostingCompletion"}
+      responses:
+        "204": {description: Completion committed or identical terminal completion replayed.}
+        "400": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+
   /api/agent/poll:
     get:
       tags: [agent]
@@ -1032,11 +1652,52 @@ paths:
                 type: string
                 format: binary
 
+webhooks:
+  hostingTerminal:
+    post:
+      tags: [internal]
+      summary: Signed at-least-once terminal hosting callback
+      description: >
+        Deployer signs "<timestamp>.<event_id>.<raw body>" with HMAC-SHA256.
+        Receivers MUST reject timestamps outside a five-minute window, compare
+        signatures in constant time, and deduplicate X-Deployer-Event-ID. A 2xx
+        response acknowledges delivery. Non-2xx and network failures retry with
+        bounded exponential backoff and may reach dead_letter. Poll the deployment
+        endpoint to reconcile any missed callback.
+      parameters:
+        - name: X-Deployer-Timestamp
+          in: header
+          required: true
+          schema: {type: string, pattern: '^[0-9]+$'}
+        - name: X-Deployer-Event-ID
+          in: header
+          required: true
+          schema: {type: string, pattern: '^evt_[a-f0-9]{32}$'}
+        - name: X-Deployer-Signature
+          in: header
+          required: true
+          schema: {type: string, pattern: '^sha256=[a-f0-9]{64}$'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/HostingCallback"}
+      responses:
+        "204": {description: Callback accepted or already processed.}
+
 components:
   securitySchemes:
     agentBearerAuth:
       type: http
       scheme: bearer
+    serviceBearerAuth:
+      type: http
+      scheme: bearer
+      description: Hashed scoped service token. Supported scopes are deployments:read, deployments:write, projects:write, and hosting:admin.
+    hostingAgentBearerAuth:
+      type: http
+      scheme: bearer
+      description: Dedicated hashed hosting-runner credential; never interchangeable with a legacy runner or service token.
 
   parameters:
     CSRFHeader:
@@ -1075,6 +1736,77 @@ components:
       schema:
         type: integer
         format: int64
+    ServiceTokenId:
+      name: serviceTokenId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    ExternalProjectId:
+      name: externalProjectId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+    ExternalDeploymentId:
+      name: externalDeploymentId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Scoped to issuer and operation. Reuse with a different canonical request hash returns idempotency_conflict.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._:-]{8,128}$'
+    HostingJobId:
+      name: hostingJobId
+      in: path
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    HostingRunnerId:
+      name: hostingRunnerId
+      in: path
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    LeaseGeneration:
+      name: X-Deployer-Lease-Generation
+      in: header
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    LeaseToken:
+      name: X-Deployer-Lease-Token
+      in: header
+      required: true
+      schema: {type: string, minLength: 64, maxLength: 64, pattern: '^[a-f0-9]{64}$'}
+    ManifestTimestamp:
+      name: X-Deployer-Timestamp
+      in: header
+      required: true
+      description: Unix timestamp in seconds; accepted within five minutes of server time.
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ManifestSignature:
+      name: X-Deployer-Signature
+      in: header
+      required: true
+      description: HMAC-SHA256 of timestamp, a period, and the exact raw request body, keyed with the service token.
+      schema:
+        type: string
+        pattern: '^sha256=[a-fA-F0-9]{64}$'
 
   responses:
     Error:
@@ -1093,11 +1825,59 @@ components:
           type: string
         code:
           type: string
-          examples:
+          description: Stable machine-readable code; clients never parse error text.
+          enum:
+            - authentication_required
+            - invalid_agent_token
+            - service_token_required
+            - invalid_service_token
+            - service_token_not_found
+            - insufficient_scope
+            - invalid_idempotency_key
+            - idempotency_conflict
+            - idempotency_in_progress
+            - invalid_deployment
+            - external_deployment_conflict
+            - deployment_not_found
+            - manifest_digest_mismatch
+            - artifact_digest_mismatch
+            - source_fetch_failed
+            - project_suspended
+            - execution_disabled
+            - runner_capacity_unavailable
+            - release_not_found
+            - release_not_healthy
+            - proxy_unavailable
+            - proxy_rejected
+            - unsupported_media_type
+            - manifest_signature_required
+            - invalid_manifest_signature
+            - manifest_signature_expired
+            - invalid_manifest
+            - provision_failed
+            - csrf_required
+            - forbidden
             - validation_error
-            - project_not_found
+            - method_not_allowed
+            - not_found
+            - conflict
             - project_busy
+            - build_not_running
+            - build_cancel_failed
+            - payload_too_large
+            - internal_error
+            - project_not_found
+            - build_not_found
+            - runner_not_found
+            - job_not_found
+            - job_forbidden
+            - artifact_not_found
             - artifact_unavailable
+            - artifact_unmanaged
+            - artifact_too_large
+            - snapshot_unavailable
+            - snapshot_unmanaged
+            - invalid_agent_completion
 
     StatusResponse:
       type: object
@@ -1113,6 +1893,487 @@ components:
         build_id:
           type: integer
           format: int64
+
+    ServiceTokenInput:
+      type: object
+      required: [name, scopes]
+      properties:
+        name:
+          type: string
+        scopes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [deployments:read, deployments:write, projects:write, 'hosting:admin']
+
+    ServiceToken:
+      allOf:
+        - $ref: "#/components/schemas/ServiceTokenInput"
+        - type: object
+          required: [id, created_at]
+          properties:
+            id:
+              type: integer
+              format: int64
+            token:
+              type: string
+              description: Returned only on creation or rotation.
+            created_at:
+              type: string
+              format: date-time
+            last_used_at:
+              type: string
+              format: date-time
+            revoked_at:
+              type: string
+              format: date-time
+
+    InternalProjectUpsertInput:
+      type: object
+      additionalProperties: false
+      required: [manifest]
+      properties:
+        manifest:
+          $ref: "#/components/schemas/HostingProjectManifest"
+
+    HostingProjectManifest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, repository, runtime, resource_profile]
+      properties:
+        schema_version:
+          type: string
+          const: v1
+        repository:
+          type: object
+          additionalProperties: false
+          required: [installation_id, repository_id, full_name]
+          properties:
+            installation_id:
+              type: integer
+              format: int64
+              minimum: 1
+            repository_id:
+              type: integer
+              format: int64
+              minimum: 1
+            full_name:
+              type: string
+              pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+        runtime:
+          type: object
+          additionalProperties: false
+          required: [kind, node_version, package_manager]
+          properties:
+            kind:
+              type: string
+              enum: [static, node]
+            node_version:
+              type: string
+              enum: ['20', '22']
+            package_manager:
+              type: string
+              enum: [npm, pnpm, yarn]
+            build_script:
+              type: string
+              pattern: '^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$'
+              description: package.json script name, never a shell command.
+            start_script:
+              type: string
+              pattern: '^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$'
+              description: Required for node; package.json script name, never a shell command.
+            output_directory:
+              type: string
+              description: Required for static and constrained to the repository tree.
+            port:
+              type: integer
+              minimum: 1024
+              maximum: 65535
+              description: Required for node.
+            health_path:
+              type: string
+              pattern: '^/[^?#]*$'
+              description: Required for node.
+        resource_profile:
+          type: string
+          enum: [starter, standard]
+
+    InternalProject:
+      type: object
+      required: [external_project_id, manifest_digest, manifest, created, replayed]
+      properties:
+        external_project_id:
+          type: string
+        manifest_digest:
+          type: string
+          pattern: '^sha256:[a-f0-9]{64}$'
+        manifest:
+          $ref: "#/components/schemas/HostingProjectManifest"
+        created:
+          type: boolean
+        replayed:
+          type: boolean
+
+    SHA256Digest:
+      type: string
+      pattern: '^sha256:[a-f0-9]{64}$'
+
+    HostingWorkloadLimits:
+      type: object
+      additionalProperties: false
+      required: [cpu_millis, ram_bytes, disk_bytes, pids]
+      properties:
+        cpu_millis: {type: integer, format: int64, minimum: 1}
+        ram_bytes: {type: integer, format: int64, minimum: 1}
+        disk_bytes: {type: integer, format: int64, minimum: 1}
+        pids: {type: integer, format: int64, minimum: 1}
+
+    HostingSecretReference:
+      type: object
+      additionalProperties: false
+      required: [provider, reference, expires_at]
+      description: Opaque short-lived workload identity reference; never plaintext secret material.
+      properties:
+        provider: {type: string, const: control-plane}
+        reference:
+          type: string
+          minLength: 8
+          maxLength: 256
+          pattern: '^[A-Za-z0-9._:/-]+$'
+        expires_at: {type: string, format: date-time}
+
+    HostingDeploymentInput:
+      type: object
+      additionalProperties: false
+      required: [external_deployment_id, commit_sha, manifest_digest, artifact_digest]
+      properties:
+        external_deployment_id:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+        commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
+        manifest_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        secret_references:
+          type: array
+          maxItems: 64
+          items: {$ref: "#/components/schemas/HostingSecretReference"}
+
+    HostingDeployment:
+      type: object
+      required:
+        - external_deployment_id
+        - external_project_id
+        - commit_sha
+        - manifest_digest
+        - artifact_digest
+        - status
+        - phase
+        - callback_state
+        - created_at
+        - updated_at
+        - log_reference
+        - event_reference
+      properties:
+        external_deployment_id: {type: string}
+        external_project_id: {type: string}
+        commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
+        manifest_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        status: {type: string, enum: [queued, running, active, failed, cancelled]}
+        phase:
+          type: string
+          enum: [queued, fetching_source, building, starting_candidate, health_checking, activating, active, failed, cancelling, cancelled, rolling_back]
+        failure_code:
+          type: string
+          enum: [artifact_digest_mismatch, build_failed, build_timeout, cancelled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, source_fetch_failed, workload_policy_violation]
+        failure_message: {type: string, description: Redacted operator context; clients must use failure_code for logic.}
+        release_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        previous_release_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        callback_state: {type: string, enum: [pending, delivered, dead_letter]}
+        cancel_requested_at: {type: string, format: date-time}
+        started_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        log_reference: {type: string}
+        event_reference: {type: string}
+
+    HostingRelease:
+      type: object
+      required: [digest, external_deployment_id, commit_sha, artifact_digest, status, created_at]
+      properties:
+        digest: {$ref: "#/components/schemas/SHA256Digest"}
+        external_deployment_id: {type: string}
+        commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
+        artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        status: {type: string, enum: [healthy, active, inactive, failed]}
+        health_evidence: {type: object}
+        route_revision: {type: string}
+        previous_release_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        created_at: {type: string, format: date-time}
+        activated_at: {type: string, format: date-time}
+        deactivated_at: {type: string, format: date-time}
+
+    HostingEvent:
+      type: object
+      required: [id, event_type, phase, metadata, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        event_type: {type: string}
+        phase: {type: string}
+        failure_code: {type: string}
+        metadata: {type: object, description: Redacted structured metadata.}
+        created_at: {type: string, format: date-time}
+
+    HostingLog:
+      type: object
+      required: [id, stream, message, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        stream: {type: string, enum: [build, runtime, system]}
+        message: {type: string, description: Redacted bounded log message.}
+        created_at: {type: string, format: date-time}
+
+    HostingLogInput:
+      type: object
+      additionalProperties: false
+      required: [stream, message]
+      properties:
+        stream: {type: string, enum: [build, runtime, system]}
+        message: {type: string, maxLength: 65536}
+
+    HostingDesiredState:
+      type: object
+      required: [external_project_id, desired_state]
+      properties:
+        external_project_id: {type: string}
+        desired_state: {type: string, enum: [active, suspended]}
+
+    KillSwitchInput:
+      type: object
+      additionalProperties: false
+      required: [enabled, reason]
+      properties:
+        enabled: {type: boolean}
+        reason: {type: string, minLength: 3, maxLength: 500, pattern: '^[^\r\n]+$'}
+
+    KillSwitchState:
+      type: object
+      required: [scope, enabled, reason, updated_at]
+      properties:
+        scope: {type: string, enum: [global, project]}
+        external_project_id: {type: string}
+        enabled: {type: boolean}
+        reason: {type: string, description: Redacted audit reason.}
+        updated_at: {type: string, format: date-time}
+
+    Capacity:
+      type: object
+      required: [cpu_millis, ram_bytes, disk_bytes, pids]
+      properties:
+        cpu_millis: {type: integer, format: int64, minimum: 0}
+        ram_bytes: {type: integer, format: int64, minimum: 0}
+        disk_bytes: {type: integer, format: int64, minimum: 0}
+        pids: {type: integer, format: int64, minimum: 0}
+
+    HostingRunnerState:
+      type: object
+      required: [id, name, labels, protocol_version, manifest_versions, runtime_versions, capacity, free, reserve, draining, status]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        labels: {type: array, items: {type: string}}
+        protocol_version: {type: string, const: v1}
+        manifest_versions: {type: array, items: {type: string}}
+        runtime_versions: {type: array, items: {type: string, enum: ['20', '22']}}
+        capacity: {$ref: "#/components/schemas/Capacity"}
+        free: {$ref: "#/components/schemas/Capacity"}
+        reserve: {$ref: "#/components/schemas/Capacity"}
+        draining: {type: boolean}
+        status: {type: string, enum: [online, offline]}
+        last_seen: {type: string, format: date-time}
+
+    HostingRunnerInput:
+      type: object
+      additionalProperties: false
+      required: [name, labels, protocol_version, manifest_versions, runtime_versions, capacity, reserve]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        labels: {type: array, items: {type: string}}
+        protocol_version: {type: string, const: v1}
+        manifest_versions: {type: array, items: {type: string, const: v1}}
+        runtime_versions: {type: array, items: {type: string, enum: ['20', '22']}}
+        capacity: {$ref: "#/components/schemas/Capacity"}
+        reserve: {$ref: "#/components/schemas/Capacity"}
+
+    HostingRunnerAdmin:
+      allOf:
+        - $ref: "#/components/schemas/HostingRunnerInput"
+        - type: object
+          required: [id, draining, status, created_at]
+          properties:
+            id: {type: integer, format: int64}
+            token: {type: string, readOnly: true, description: Returned only at creation.}
+            draining: {type: boolean}
+            status: {type: string, enum: [online, offline]}
+            last_seen: {type: string, format: date-time}
+            created_at: {type: string, format: date-time}
+
+    HostingCapabilities:
+      type: object
+      required: [api_version, manifest_versions, runner_protocol_versions, node_versions, runtime_kinds, resource_profiles, failure_codes]
+      properties:
+        api_version: {type: string, const: v1}
+        manifest_versions: {type: array, items: {type: string, const: v1}}
+        runner_protocol_versions: {type: array, items: {type: string, const: v1}}
+        node_versions: {type: array, items: {type: string, enum: ['20', '22']}}
+        runtime_kinds: {type: array, items: {type: string, enum: [static, node]}}
+        resource_profiles:
+          type: object
+          additionalProperties: {$ref: "#/components/schemas/HostingWorkloadLimits"}
+        failure_codes: {type: array, items: {type: string}}
+
+    HostingHeartbeat:
+      type: object
+      additionalProperties: false
+      required: [free, draining, protocol_version, manifest_versions, runtime_versions]
+      properties:
+        free: {$ref: "#/components/schemas/Capacity"}
+        draining: {type: boolean}
+        protocol_version: {type: string, const: v1}
+        manifest_versions: {type: array, items: {type: string, const: v1}}
+        runtime_versions: {type: array, items: {type: string, enum: ['20', '22']}}
+
+    HostingRetainedRelease:
+      type: object
+      additionalProperties: false
+      required: [release_digest, external_project_id, external_deployment_id, status]
+      properties:
+        release_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        external_project_id: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'}
+        external_deployment_id: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'}
+        status: {type: string, enum: [healthy, active, inactive]}
+
+    HostingJobRecipe:
+      type: object
+      additionalProperties: false
+      required: [schema_version, external_project_id, external_deployment_id, repository, commit_sha, manifest_digest, artifact_digest, runtime, limits, release_root, source_artifact_url]
+      description: Platform-generated static/Node recipe. No customer Dockerfile, shell, Compose, privilege, mount, or host-port field exists.
+      properties:
+        schema_version: {type: string, const: v1}
+        external_project_id: {type: string}
+        external_deployment_id: {type: string}
+        repository: {type: object}
+        commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
+        manifest_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        runtime: {type: object}
+        limits: {$ref: "#/components/schemas/HostingWorkloadLimits"}
+        release_root: {type: string}
+        source_artifact_url: {type: string}
+
+    HostingClaimedJob:
+      type: object
+      required: [job_id, lease_generation, lease_token, lease_expires_at, recipe, secret_references]
+      properties:
+        job_id: {type: integer, format: int64}
+        lease_generation: {type: integer, format: int64}
+        lease_token: {type: string, readOnly: true, description: Returned only in a successful claim response.}
+        lease_expires_at: {type: string, format: date-time}
+        recipe: {$ref: "#/components/schemas/HostingJobRecipe"}
+        secret_references:
+          type: array
+          items: {$ref: "#/components/schemas/HostingSecretReference"}
+
+    HostingCompletion:
+      type: object
+      additionalProperties: false
+      required: [status]
+      oneOf:
+        - required: [status, release_digest, release_artifact_digest, runtime_endpoint, health_evidence]
+          properties:
+            status: {type: string, const: success}
+        - required: [status, failure_code]
+          properties:
+            status: {type: string, const: failed}
+        - required: [status]
+          properties:
+            status: {type: string, const: cancelled}
+      properties:
+        status: {type: string, enum: [success, failed, cancelled]}
+        failure_code:
+          type: string
+          enum: [artifact_digest_mismatch, build_failed, build_timeout, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, source_fetch_failed, workload_policy_violation]
+        failure_message: {type: string}
+        release_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        release_artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        runtime_endpoint:
+          type: string
+          format: uri
+          description: Private or loopback HTTP(S) endpoint only.
+        health_evidence:
+          type: object
+          properties:
+            healthy: {type: boolean}
+            attempts: {type: number, minimum: 1, maximum: 100}
+            status_code: {type: number}
+
+    HostingCallback:
+      type: object
+      required: [event_id, timestamp, external_project_id, external_deployment_id, phase, status, failure_code, artifact_digest, release_digest]
+      properties:
+        event_id: {type: string, pattern: '^evt_[a-f0-9]{32}$'}
+        timestamp: {type: string, format: date-time}
+        external_project_id: {type: string}
+        external_deployment_id: {type: string}
+        phase: {type: string}
+        status: {type: string, enum: [active, failed, cancelled]}
+        failure_code: {type: string}
+        artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        release_digest:
+          oneOf:
+            - {$ref: "#/components/schemas/SHA256Digest"}
+            - {type: string, const: ''}
+
+    HostingMetrics:
+      type: object
+      required: [observed_at, window, queue, deployments, runners, callbacks]
+      properties:
+        observed_at: {type: string, format: date-time}
+        window: {type: string, const: 24h}
+        queue:
+          type: object
+          required: [queued_jobs, oldest_age_seconds]
+          properties:
+            queued_jobs: {type: integer}
+            oldest_age_seconds: {type: number}
+        deployments:
+          type: object
+          required: [terminal, successful, failed, cancelled, success_rate, average_duration_seconds]
+          properties:
+            terminal: {type: integer}
+            successful: {type: integer}
+            failed: {type: integer}
+            cancelled: {type: integer}
+            success_rate: {type: number, minimum: 0, maximum: 1}
+            average_duration_seconds: {type: number}
+        runners:
+          type: object
+          required: [online, offline, capacity, free, reserve]
+          properties:
+            online: {type: integer}
+            offline: {type: integer}
+            capacity: {$ref: "#/components/schemas/Capacity"}
+            free: {$ref: "#/components/schemas/Capacity"}
+            reserve: {$ref: "#/components/schemas/Capacity"}
+        callbacks:
+          type: object
+          required: [pending, dead_letter, oldest_lag_seconds]
+          properties:
+            pending: {type: integer}
+            dead_letter: {type: integer}
+            oldest_lag_seconds: {type: number}
 
     Capabilities:
       type: object
@@ -1378,6 +2639,8 @@ components:
         project_id:
           type: integer
           format: int64
+        idempotency_key:
+          type: string
         project_name:
           type: string
         deploy_mode:
@@ -1514,7 +2777,7 @@ components:
           enum: [artifact_failed, cancelled, command_failed, health_check_failed, panic, runner_offline, server_restarted, validation_failed]
         triggered_by:
           type: string
-          enum: [manual, snapshot]
+          enum: [manual, snapshot, control-plane]
 
     BuildHistory:
       type: object
@@ -1702,6 +2965,8 @@ components:
         project_id:
           type: integer
           format: int64
+        idempotency_key:
+          type: string
         status:
           type: string
           enum: [running, success, failed, cancelled]
