@@ -116,7 +116,8 @@ func handleInternalDeploymentCreate(w http.ResponseWriter, r *http.Request, exte
 	w.Header().Set("Location", "/api/internal/v1/deployments/"+result.Deployment.ExternalDeploymentID)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(result.StatusCode)
-	jsonResponse(w, result.Deployment)
+	_, err = w.Write(result.ResponseBody)
+	logOperationalError("write hosting deployment response", err)
 }
 
 func handleInternalDeployment(w http.ResponseWriter, r *http.Request) {

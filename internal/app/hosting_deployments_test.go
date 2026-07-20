@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -91,6 +93,8 @@ func TestInternalDeploymentCreationIsHostingOnlyAndPayloadIdempotent(t *testing.
 	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("create deployment = %d body=%s", recorder.Code, recorder.Body.String())
 	}
+	firstBody := recorder.Body.String()
+	firstLocation := recorder.Header().Get("Location")
 	var created HostingDeployment
 	if err := json.NewDecoder(recorder.Body).Decode(&created); err != nil {
 		t.Fatalf("decode deployment: %v", err)
@@ -107,6 +111,19 @@ func TestInternalDeploymentCreationIsHostingOnlyAndPayloadIdempotent(t *testing.
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusAccepted || recorder.Header().Get("Idempotency-Replayed") != "true" {
 		t.Fatalf("replay deployment = %d replay=%q body=%s", recorder.Code, recorder.Header().Get("Idempotency-Replayed"), recorder.Body.String())
+	}
+	if recorder.Body.String() != firstBody || recorder.Header().Get("Location") != firstLocation {
+		t.Fatalf("replay changed original response: first_location=%q replay_location=%q first_body=%q replay_body=%q",
+			firstLocation, recorder.Header().Get("Location"), firstBody, recorder.Body.String())
+	}
+	var storedResponse string
+	if err := db.QueryRow(`SELECT response_body FROM hosting_idempotency
+		WHERE issuer_token_id=? AND operation='hosting.deployment.create' AND idempotency_key=?`,
+		token.ID, "idem_01JDEPLOY").Scan(&storedResponse); err != nil {
+		t.Fatal(err)
+	}
+	if storedResponse != firstBody {
+		t.Fatalf("stored response differs from first wire response: stored=%q first=%q", storedResponse, firstBody)
 	}
 
 	changed := payload
@@ -181,6 +198,318 @@ func TestHostingDeploymentConcurrentDuplicateCreatesOneAtomicGraph(t *testing.T)
 		if count != expected {
 			t.Fatalf("%s count = %d, want %d", table, count, expected)
 		}
+	}
+}
+
+func TestHostingDeploymentConcurrentIdempotencyConflictDoesNoDuplicateWork(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JHASHRACE")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "hosting-hash-race", limits)
+	var sourceCalls atomic.Int64
+	oldPreparer := prepareHostingSource
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+		sourceCalls.Add(1)
+		return "/managed/hash-race.tar", "sha256:" + strings.Repeat("c", 64), nil
+	}
+	t.Cleanup(func() { prepareHostingSource = oldPreparer })
+
+	requests := []hostingDeploymentCreateRequest{
+		validHostingDeploymentRequest("deployment_01JHASHR1"),
+		validHostingDeploymentRequest("deployment_01JHASHR2"),
+	}
+	for index := range requests {
+		requests[index].ManifestDigest = project.ManifestDigest
+	}
+	results := make(chan error, len(requests))
+	var wait sync.WaitGroup
+	for index := range requests {
+		request := requests[index]
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			_, err := createHostingDeployment(context.Background(), token, project.ExternalProjectID, "idem_01JHASHRACE", request)
+			results <- err
+		}()
+	}
+	wait.Wait()
+	close(results)
+	accepted, conflicts := 0, 0
+	for err := range results {
+		if err == nil {
+			accepted++
+			continue
+		}
+		var apiErr *hostingAPIError
+		if errors.As(err, &apiErr) && apiErr.Code == errCodeIdempotencyConflict {
+			conflicts++
+			continue
+		}
+		t.Fatalf("unexpected concurrent result: %v", err)
+	}
+	if accepted != 1 || conflicts != 1 || sourceCalls.Load() != 1 {
+		t.Fatalf("accepted=%d conflicts=%d source_calls=%d", accepted, conflicts, sourceCalls.Load())
+	}
+	for table, expected := range map[string]int{"hosting_deployments": 1, "hosting_jobs": 1, "hosting_idempotency": 1} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil || count != expected {
+			t.Fatalf("%s count=%d want=%d err=%v", table, count, expected, err)
+		}
+	}
+}
+
+func TestHostingDeploymentSerializesDifferentKeysPerProject(t *testing.T) {
+	for _, separateIssuers := range []bool{false, true} {
+		name := "same issuer"
+		if separateIssuers {
+			name = "separate issuers"
+		}
+		t.Run(name, func(t *testing.T) {
+			withTempDB(t)
+			project, firstToken := provisionDeploymentTestProject(t, "project_01JPROJECTRACE")
+			secondToken := firstToken
+			if separateIssuers {
+				var err error
+				secondToken, err = createServiceToken("deployment-writer-project-race-second", []string{serviceScopeDeploymentsWrite})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+			insertHostingRunnerForTest(t, "hosting-project-race", limits)
+			var sourceCalls atomic.Int64
+			oldPreparer := prepareHostingSource
+			prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+				sourceCalls.Add(1)
+				return "/managed/project-race.tar", "sha256:" + strings.Repeat("c", 64), nil
+			}
+			t.Cleanup(func() { prepareHostingSource = oldPreparer })
+			requests := []hostingDeploymentCreateRequest{
+				validHostingDeploymentRequest("deployment_01JPROJECTR1"),
+				validHostingDeploymentRequest("deployment_01JPROJECTR2"),
+			}
+			for index := range requests {
+				requests[index].ManifestDigest = project.ManifestDigest
+			}
+			tokens := []*ServiceToken{firstToken, secondToken}
+			results := make(chan error, 2)
+			var wait sync.WaitGroup
+			for index := range requests {
+				request, token := requests[index], tokens[index]
+				wait.Add(1)
+				go func(index int) {
+					defer wait.Done()
+					key := fmt.Sprintf("idem_01JPROJECTRACE_%d", index)
+					if separateIssuers {
+						key = "idem_01JPROJECTRACE"
+					}
+					_, err := createHostingDeployment(context.Background(), token, project.ExternalProjectID, key, request)
+					results <- err
+				}(index)
+			}
+			wait.Wait()
+			close(results)
+			accepted, conflicts := 0, 0
+			for err := range results {
+				if err == nil {
+					accepted++
+					continue
+				}
+				var apiErr *hostingAPIError
+				if errors.As(err, &apiErr) && apiErr.Code == errCodeExternalDeploymentConflict {
+					conflicts++
+					continue
+				}
+				t.Fatalf("unexpected concurrent result: %v", err)
+			}
+			if accepted != 1 || conflicts != 1 || sourceCalls.Load() != 1 {
+				t.Fatalf("accepted=%d conflicts=%d source_calls=%d", accepted, conflicts, sourceCalls.Load())
+			}
+		})
+	}
+}
+
+func TestHostingDeploymentReplaySurvivesRotationExpiryAndRestart(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JREPLAYDB")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "hosting-replay-db", limits)
+	var sourceCalls atomic.Int64
+	oldPreparer := prepareHostingSource
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+		sourceCalls.Add(1)
+		return "/managed/replay-db.tar", "sha256:" + strings.Repeat("c", 64), nil
+	}
+	t.Cleanup(func() { prepareHostingSource = oldPreparer })
+	request := validHostingDeploymentRequest("deployment_01JREPLAYDB")
+	request.ManifestDigest = project.ManifestDigest
+	request.SourceReference.ExpiresAt = time.Now().UTC().Add(150 * time.Millisecond)
+	first, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "idem_01JREPLAYDB", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := rotateServiceToken(token.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.ID != token.ID {
+		t.Fatalf("rotation changed issuer identity: before=%d after=%d", token.ID, rotated.ID)
+	}
+	if _, err := db.Exec(`UPDATE hosting_deployments SET status='running', phase='building' WHERE id=?`, first.Deployment.ID); err != nil {
+		t.Fatal(err)
+	}
+	var databaseSequence int
+	var databaseName, databasePath string
+	if err := db.QueryRow(`PRAGMA database_list`).Scan(&databaseSequence, &databaseName, &databasePath); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Until(request.SourceReference.ExpiresAt.Add(10 * time.Millisecond)))
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := createHostingDeployment(t.Context(), rotated, project.ExternalProjectID, "idem_01JREPLAYDB", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replayed.Replayed || replayed.StatusCode != http.StatusAccepted || replayed.Deployment.Status != hostingStatusQueued {
+		t.Fatalf("replay=%+v", replayed)
+	}
+	if sourceCalls.Load() != 1 {
+		t.Fatalf("source redemptions=%d, want 1", sourceCalls.Load())
+	}
+	var issuerID int64
+	var operation, requestHash, responseBody string
+	var responseStatus int
+	if err := db.QueryRow(`SELECT issuer_token_id, operation, request_hash, response_status, response_body
+		FROM hosting_idempotency WHERE idempotency_key='idem_01JREPLAYDB'`).Scan(
+		&issuerID, &operation, &requestHash, &responseStatus, &responseBody); err != nil {
+		t.Fatal(err)
+	}
+	if issuerID != token.ID || operation != "hosting.deployment.create" || !validSHA256Digest(requestHash) || responseStatus != http.StatusAccepted {
+		t.Fatalf("stored idempotency issuer=%d operation=%q hash=%q status=%d", issuerID, operation, requestHash, responseStatus)
+	}
+	var stored HostingDeployment
+	if err := json.Unmarshal([]byte(responseBody), &stored); err != nil || stored.Status != hostingStatusQueued ||
+		stored.ExternalDeploymentID != first.Deployment.ExternalDeploymentID {
+		t.Fatalf("stored original response=%+v err=%v", stored, err)
+	}
+}
+
+func TestHostingDeploymentCanonicalizesSecretDefaultsAndReferenceTimes(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JCANONICAL")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "hosting-canonical", limits)
+	appConfig.HostingWorkloadIdentitySecret = strings.Repeat("canonical-identity-key-", 2)
+	var sourceCalls atomic.Int64
+	oldPreparer := prepareHostingSource
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+		sourceCalls.Add(1)
+		return "/managed/canonical.tar", "sha256:" + strings.Repeat("c", 64), nil
+	}
+	t.Cleanup(func() { prepareHostingSource = oldPreparer })
+
+	request := validHostingDeploymentRequest("deployment_01JCANONICAL")
+	request.ManifestDigest = project.ManifestDigest
+	zone := time.FixedZone("request-offset", 2*60*60)
+	request.SourceReference.ExpiresAt = request.SourceReference.ExpiresAt.In(zone)
+	request.SecretReferences = []HostingSecretReference{{
+		Provider: "control-plane", Reference: "reference-canonical-secret",
+		ExpiresAt: time.Now().UTC().Add(20 * time.Minute).In(zone),
+	}}
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "idem_01JCANONICAL", request); err != nil {
+		t.Fatal(err)
+	}
+	equivalent := request
+	equivalent.SourceReference.ExpiresAt = equivalent.SourceReference.ExpiresAt.UTC()
+	equivalent.SecretReferences = append([]HostingSecretReference(nil), request.SecretReferences...)
+	equivalent.SecretReferences[0].Name = "SECRET_1"
+	equivalent.SecretReferences[0].ExpiresAt = equivalent.SecretReferences[0].ExpiresAt.UTC()
+	result, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "idem_01JCANONICAL", equivalent)
+	if err != nil || !result.Replayed {
+		t.Fatalf("canonical replay=%+v err=%v", result, err)
+	}
+	if sourceCalls.Load() != 1 {
+		t.Fatalf("source redemptions=%d, want 1", sourceCalls.Load())
+	}
+}
+
+func TestHostingDeploymentReplaysPreCanonicalizationRowsAcrossUpgrade(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JLEGACYIDEM")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "hosting-legacy-idem", limits)
+	appConfig.HostingWorkloadIdentitySecret = strings.Repeat("legacy-idempotency-key-", 2)
+	var sourceCalls atomic.Int64
+	oldPreparer := prepareHostingSource
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+		sourceCalls.Add(1)
+		return "/managed/legacy-idem.tar", "sha256:" + strings.Repeat("c", 64), nil
+	}
+	t.Cleanup(func() { prepareHostingSource = oldPreparer })
+
+	request := validHostingDeploymentRequest("deployment_01JLEGACYIDEM")
+	request.ManifestDigest = project.ManifestDigest
+	zone := time.FixedZone("legacy-request-offset", -5*60*60)
+	request.SourceReference.ExpiresAt = request.SourceReference.ExpiresAt.In(zone)
+	request.SecretReferences = []HostingSecretReference{{
+		Provider: "control-plane", Reference: "reference-legacy-secret",
+		ExpiresAt: time.Now().UTC().Add(20 * time.Minute).In(zone),
+	}}
+	legacyHash, err := hashHostingDeploymentRequest(project.ExternalProjectID, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "idem_01JLEGACYIDEM", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyBody := strings.TrimSuffix(string(first.ResponseBody), "\n")
+	if _, err := db.Exec(`UPDATE hosting_idempotency SET request_hash=?, response_body=?
+		WHERE issuer_token_id=? AND operation='hosting.deployment.create' AND idempotency_key=?`,
+		legacyHash, legacyBody, token.ID, "idem_01JLEGACYIDEM"); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "idem_01JLEGACYIDEM", request)
+	if err != nil || !replayed.Replayed || string(replayed.ResponseBody) != string(first.ResponseBody) {
+		t.Fatalf("legacy rolling-upgrade replay=%+v err=%v", replayed, err)
+	}
+	if sourceCalls.Load() != 1 {
+		t.Fatalf("source redemptions=%d, want 1", sourceCalls.Load())
+	}
+}
+
+func TestHostingIdempotencyExpiryAllowsKeyReuse(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JIDEMEXP")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "hosting-idem-expiry", limits)
+	first := validHostingDeploymentRequest("deployment_01JIDEMEXP1")
+	first.ManifestDigest = project.ManifestDigest
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "idem_01JIDEMEXP", first); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cancelHostingDeployment(t.Context(), token, first.ExternalDeploymentID, "idem_01JIDEMEXP"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_idempotency SET expires_at=?
+		WHERE issuer_token_id=? AND operation='hosting.deployment.create' AND idempotency_key=?`,
+		formatSQLiteTime(time.Now().UTC().Add(-time.Second)), token.ID, "idem_01JIDEMEXP"); err != nil {
+		t.Fatal(err)
+	}
+	second := validHostingDeploymentRequest("deployment_01JIDEMEXP2")
+	second.ManifestDigest = project.ManifestDigest
+	result, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "idem_01JIDEMEXP", second)
+	if err != nil || result.Replayed || result.Deployment.ExternalDeploymentID != second.ExternalDeploymentID {
+		t.Fatalf("expired key reuse result=%+v err=%v", result, err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_idempotency
+		WHERE issuer_token_id=? AND operation='hosting.deployment.create' AND idempotency_key=?`, token.ID, "idem_01JIDEMEXP").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("replacement idempotency rows=%d err=%v", count, err)
 	}
 }
 

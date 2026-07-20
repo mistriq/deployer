@@ -14,7 +14,7 @@ The primary agent owns this checklist and updates it only after implementation a
 
 - [x] Verify hashed service tokens, scopes, rotation and revocation against the current WIP and full test gate.
 - [x] Verify private versioned API and CSRF separation against the current WIP and full test gate.
-- [ ] Replace simple deployment-key persistence with issuer + operation + key + request hash + original response.
+- [x] Replace simple deployment-key persistence with issuer + operation + key + request hash + original response.
 - [x] Add service-token audit events and overlapping no-downtime rotation.
 - [ ] Add `external_project_id` and `external_deployment_id` with unique constraints.
 - [ ] Define and document all internal schemas, scopes and stable error codes in OpenAPI.
@@ -28,7 +28,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [ ] Idempotent hosting project provision/upsert endpoint.
 - [ ] Separate hosting projects/jobs/runners from trusted admin projects.
 - [x] Exact commit SHA and immutable artifact digest on every hosting deployment.
-- [ ] Atomic idempotency and one-active-deployment guard under concurrency.
+- [x] Atomic idempotency and one-active-deployment guard under concurrency.
 - [ ] Stable deployment phases and transition validation.
 - [x] Fence conflicting runner completion payloads before proxy activation.
 - [x] Compare-and-swap immutable release artifact attachment under concurrent uploads.
@@ -76,7 +76,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Fresh DB and legacy migration tests.
 - [x] Auth, scope, rotation, revocation and audit tests.
 - [ ] Idempotency replay and concurrent duplicate tests.
-- [ ] Per-project deployment serialization tests.
+- [x] Per-project deployment serialization tests.
 - [x] Exact commit/artifact mismatch rejection tests.
 - [ ] Callback signing, retry, replay and polling reconciliation tests.
 - [ ] Health failure preserves active release test.

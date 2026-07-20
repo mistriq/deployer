@@ -78,9 +78,10 @@ type hostingJobRecipe struct {
 }
 
 type hostingCreateResult struct {
-	Deployment *HostingDeployment
-	StatusCode int
-	Replayed   bool
+	Deployment   *HostingDeployment
+	ResponseBody []byte
+	StatusCode   int
+	Replayed     bool
 }
 
 type hostingAPIError struct {
@@ -244,15 +245,27 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 	if !externalIDPattern.MatchString(externalProjectID) {
 		return nil, &hostingAPIError{Code: errCodeProjectNotFound, Message: "project not found", StatusCode: 404}
 	}
+	request.SecretReferences = append([]HostingSecretReference(nil), request.SecretReferences...)
 	if err := validateHostingDeploymentRequestShape(&request); err != nil {
 		return nil, &hostingAPIError{Code: errCodeInvalidDeployment, Message: err.Error(), StatusCode: 400}
 	}
-	requestBody, err := json.Marshal(request)
+	legacyRequest := request
+	legacyRequest.SecretReferences = append([]HostingSecretReference(nil), request.SecretReferences...)
+	legacyHashText, err := hashHostingDeploymentRequest(externalProjectID, legacyRequest)
 	if err != nil {
 		return nil, err
 	}
-	requestHash := sha256.Sum256(append([]byte(externalProjectID+"\n"), requestBody...))
-	requestHashText := "sha256:" + hex.EncodeToString(requestHash[:])
+	if err := normalizeHostingSecretReferences(request.SecretReferences); err != nil {
+		return nil, &hostingAPIError{Code: errCodeInvalidDeployment, Message: err.Error(), StatusCode: 400}
+	}
+	request.SourceReference.ExpiresAt = request.SourceReference.ExpiresAt.UTC()
+	for index := range request.SecretReferences {
+		request.SecretReferences[index].ExpiresAt = request.SecretReferences[index].ExpiresAt.UTC()
+	}
+	requestHashText, err := hashHostingDeploymentRequest(externalProjectID, request)
+	if err != nil {
+		return nil, err
+	}
 	operation := "hosting.deployment.create"
 	idempotencyLockHash := sha256.Sum256([]byte(fmt.Sprintf("%d\n%s\n%s", token.ID, operation, idempotencyKey)))
 	admissionLock := &hostingDeploymentAdmissionLocks[int(idempotencyLockHash[0])%len(hostingDeploymentAdmissionLocks)]
@@ -262,18 +275,15 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 	projectLock := &hostingProjectAdmissionLocks[int(projectLockHash[0])%len(hostingProjectAdmissionLocks)]
 	projectLock.Lock()
 	defer projectLock.Unlock()
-	if replay, err := loadIdempotentResponse(ctx, token.ID, operation, idempotencyKey, requestHashText); err != nil || replay != nil {
+	if replay, err := loadIdempotentResponse(ctx, token.ID, operation, idempotencyKey, requestHashText, legacyHashText); err != nil || replay != nil {
 		if err != nil {
 			return nil, err
 		}
 		var deployment HostingDeployment
-		if err := json.Unmarshal(replay, &deployment); err != nil {
+		if err := json.Unmarshal(replay.Body, &deployment); err != nil {
 			return nil, err
 		}
-		return &hostingCreateResult{Deployment: &deployment, StatusCode: http.StatusAccepted, Replayed: true}, nil
-	}
-	if err := normalizeHostingSecretReferences(request.SecretReferences); err != nil {
-		return nil, &hostingAPIError{Code: errCodeInvalidDeployment, Message: err.Error(), StatusCode: 400}
+		return &hostingCreateResult{Deployment: &deployment, ResponseBody: hostingDeploymentWireResponse(replay.Body), StatusCode: replay.StatusCode, Replayed: true}, nil
 	}
 	if err := validateHostingDeploymentReferenceExpiry(&request, time.Now()); err != nil {
 		return nil, &hostingAPIError{Code: errCodeInvalidDeployment, Message: err.Error(), StatusCode: 400}
@@ -328,7 +338,7 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 		}
 	}()
 
-	if replay, err := findHostingIdempotencyReplay(ctx, conn, token.ID, operation, idempotencyKey, requestHashText); err != nil || replay != nil {
+	if replay, err := findHostingIdempotencyReplay(ctx, conn, token.ID, operation, idempotencyKey, requestHashText, legacyHashText); err != nil || replay != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -468,6 +478,7 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 	if err != nil {
 		return nil, err
 	}
+	responseBody = hostingDeploymentWireResponse(responseBody)
 	if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_idempotency
 		(issuer_token_id, operation, idempotency_key, request_hash, response_status, response_body, created_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, token.ID, operation, idempotencyKey, requestHashText, 202,
@@ -478,7 +489,16 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 		return nil, err
 	}
 	committed = true
-	return &hostingCreateResult{Deployment: deployment, StatusCode: 202}, nil
+	return &hostingCreateResult{Deployment: deployment, ResponseBody: responseBody, StatusCode: 202}, nil
+}
+
+func hashHostingDeploymentRequest(externalProjectID string, request hostingDeploymentCreateRequest) (string, error) {
+	requestBody, err := json.Marshal(request)
+	if err != nil {
+		return "", err
+	}
+	requestHash := sha256.Sum256(append([]byte(externalProjectID+"\n"), requestBody...))
+	return "sha256:" + hex.EncodeToString(requestHash[:]), nil
 }
 
 func preflightHostingDeploymentAdmission(ctx context.Context, project *HostingProject, externalDeploymentID string, requireSecrets bool) error {
@@ -545,30 +565,25 @@ func getHostingProjectOnConn(ctx context.Context, conn *sql.Conn, externalID str
 	return &project, nil
 }
 
-func findHostingIdempotencyReplay(ctx context.Context, conn *sql.Conn, issuerID int64, operation, key, requestHash string) (*hostingCreateResult, error) {
-	var storedHash string
-	var status sql.NullInt64
-	var responseBody sql.NullString
-	err := conn.QueryRowContext(ctx, `SELECT request_hash, response_status, response_body
-		FROM hosting_idempotency WHERE issuer_token_id=? AND operation=? AND idempotency_key=?`,
-		issuerID, operation, key).Scan(&storedHash, &status, &responseBody)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
+func findHostingIdempotencyReplay(ctx context.Context, conn *sql.Conn, issuerID int64, operation, key string, requestHashes ...string) (*hostingCreateResult, error) {
+	replay, err := findGenericIdempotencyReplay(ctx, conn, issuerID, operation, key, requestHashes...)
+	if err != nil || replay == nil {
 		return nil, err
 	}
-	if storedHash != requestHash {
-		return nil, &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "Idempotency-Key was already used with a different request", StatusCode: 409}
-	}
-	if !status.Valid || !responseBody.Valid {
-		return nil, &hostingAPIError{Code: errCodeIdempotencyInProgress, Message: "the original request is still being processed", StatusCode: 409}
-	}
 	var deployment HostingDeployment
-	if err := json.Unmarshal([]byte(responseBody.String), &deployment); err != nil {
+	if err := json.Unmarshal(replay.Body, &deployment); err != nil {
 		return nil, fmt.Errorf("decode idempotent response: %w", err)
 	}
-	return &hostingCreateResult{Deployment: &deployment, StatusCode: int(status.Int64), Replayed: true}, nil
+	return &hostingCreateResult{Deployment: &deployment, ResponseBody: hostingDeploymentWireResponse(replay.Body), StatusCode: replay.StatusCode, Replayed: true}, nil
+}
+
+func hostingDeploymentWireResponse(body []byte) []byte {
+	if len(body) > 0 && body[len(body)-1] == '\n' {
+		return body
+	}
+	result := make([]byte, len(body), len(body)+1)
+	copy(result, body)
+	return append(result, '\n')
 }
 
 type hostingRunnerQuerier interface {

@@ -146,8 +146,11 @@ be rejected.
    a `control-plane` source reference expiring within one hour. The reference
    is redeemed before any deployment state or runner capacity is committed and
    is not stored by Deployer after the source artifact is acquired. An exact
-   replay of an already accepted idempotency key returns the stored response
-   even after reference expiry and does not call the broker.
+   replay during the 24-hour idempotency window returns the stored response,
+   even after reference expiry, and does not call the broker. The namespace is
+   the stable service-token identity plus operation, so current and overlapping
+   credentials created by rotation share it. After 24 hours the key may execute
+   a new request.
 3. Poll the returned `Location`. Structured `status`, `phase`, and
    `failure_code` are authoritative. Do not parse log or error text.
 4. Treat the terminal callback as at-least-once. Verify the HMAC over

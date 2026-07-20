@@ -340,9 +340,13 @@ callers from successfully rotating the same observed credential. Before
 installing a returned secret, compare its generation with an uncached
 `GET /api/service-tokens/:id`; a revoked token returns `404`. Hold a single-writer
 administrative lock from the initial read through install and authenticated
-verification, and discard a response that has already been superseded. Mutating hosting lifecycle
-calls use `Idempotency-Key`; a key is
-scoped to issuer and operation and conflicts if reused for a different payload.
+verification, and discard a response that has already been superseded. Mutating
+hosting lifecycle calls use `Idempotency-Key`; a key is scoped to the stable
+service-token identity and operation, so current and overlapping credentials
+created by rotation share one namespace. Completed status and body are retained
+for 24 hours. An identical request during that window returns the original
+response with `Idempotency-Replayed: true`; a different payload conflicts.
+After expiry, the key may execute a new request.
 Suspend/resume responses acknowledge durable desired state; adapter
 convergence is asynchronous and generation-fenced during an adapter outage.
 

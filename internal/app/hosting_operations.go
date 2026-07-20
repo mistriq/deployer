@@ -91,7 +91,10 @@ func setHostingExecutionKillSwitch(ctx context.Context, token *ServiceToken, ext
 			return nil, false, err
 		}
 		var response hostingKillSwitchResponse
-		if err := json.Unmarshal(replay, &response); err != nil {
+		if replay.StatusCode != http.StatusOK {
+			return nil, false, fmt.Errorf("invalid kill-switch idempotency response status %d", replay.StatusCode)
+		}
+		if err := json.Unmarshal(replay.Body, &response); err != nil {
 			return nil, false, err
 		}
 		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {

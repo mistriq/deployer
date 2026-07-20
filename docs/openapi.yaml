@@ -1152,6 +1152,8 @@ paths:
       responses:
         "202":
           description: Deployment accepted; an identical replay returns the original response and Idempotency-Replayed true.
+          headers:
+            Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDeployment"}
@@ -1216,6 +1218,8 @@ paths:
       responses:
         "200":
           description: Selected release is active; replays return the original response.
+          headers:
+            Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingRelease"}
@@ -1243,6 +1247,8 @@ paths:
       responses:
         "200":
           description: Durable project desired state accepted; an identical replay returns the original acceptance.
+          headers:
+            Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDesiredState"}
@@ -1266,6 +1272,8 @@ paths:
       responses:
         "200":
           description: Durable project desired state accepted; an identical replay returns the original acceptance.
+          headers:
+            Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDesiredState"}
@@ -1294,6 +1302,8 @@ paths:
       responses:
         "200":
           description: Audited kill-switch state.
+          headers:
+            Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
             application/json:
               schema: {$ref: "#/components/schemas/KillSwitchState"}
@@ -1340,6 +1350,8 @@ paths:
       responses:
         "200":
           description: Current deployment, including durable cancellation intent.
+          headers:
+            Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDeployment"}
@@ -1466,6 +1478,8 @@ paths:
       responses:
         "200":
           description: Audited global kill-switch state.
+          headers:
+            Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
             application/json:
               schema: {$ref: "#/components/schemas/KillSwitchState"}
@@ -2082,6 +2096,13 @@ components:
       scheme: bearer
       description: Dedicated hashed hosting-runner credential; never interchangeable with a legacy runner or service token.
 
+  headers:
+    IdempotencyReplayed:
+      description: Present with value `true` only when this response replays a previously completed operation.
+      schema:
+        type: string
+        enum: ["true"]
+
   parameters:
     CSRFHeader:
       name: X-Deployer-CSRF
@@ -2156,7 +2177,13 @@ components:
       name: Idempotency-Key
       in: header
       required: true
-      description: Scoped to issuer and operation. Reuse with a different canonical request hash returns idempotency_conflict.
+      description: >
+        Scoped to the stable service-token identity and operation; current and
+        overlapping credentials created by rotation share the same issuer
+        namespace. The completed status and body are retained for 24 hours.
+        During that window an identical request replays them and reuse with a
+        different canonical request hash returns idempotency_conflict. After
+        expiry, the key may execute a new request.
       schema:
         type: string
         minLength: 8
@@ -2512,7 +2539,8 @@ components:
             File name created below /run/secrets/deployer; unique within the
             request. New callers should always supply it. For compatibility
             with earlier v1 requests, an omitted value is normalized to
-            SECRET_<one-based array index> after idempotency replay lookup.
+            SECRET_<one-based array index> before the canonical idempotency hash
+            is computed.
           pattern: '^[A-Z][A-Z0-9_]{0,63}$'
         expires_at: {type: string, format: date-time}
 
@@ -2540,6 +2568,12 @@ components:
     HostingDeploymentInput:
       type: object
       additionalProperties: false
+      description: >
+        Before computing the canonical idempotency hash, Deployer normalizes
+        secret-reference default names and all source/secret reference
+        timestamps to UTC. During rolling upgrades it also recognizes the
+        prior v1 hash for an otherwise exact request throughout the live
+        24-hour idempotency window.
       required: [external_deployment_id, commit_sha, manifest_digest, artifact_digest, source_reference]
       properties:
         external_deployment_id:

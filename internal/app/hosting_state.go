@@ -251,7 +251,10 @@ func cancelHostingDeployment(ctx context.Context, token *ServiceToken, externalI
 		}
 		committed = true
 		var deployment HostingDeployment
-		if err := json.Unmarshal(replay, &deployment); err != nil {
+		if replay.StatusCode != http.StatusOK {
+			return nil, false, fmt.Errorf("invalid cancel idempotency response status %d", replay.StatusCode)
+		}
+		if err := json.Unmarshal(replay.Body, &deployment); err != nil {
 			return nil, false, err
 		}
 		return &deployment, true, nil
@@ -416,27 +419,47 @@ func hashHostingOperation(parts ...string) string {
 	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
-func findGenericIdempotencyReplay(ctx context.Context, conn *sql.Conn, tokenID int64, operation, key, hash string) ([]byte, error) {
+type hostingIdempotencyResponse struct {
+	StatusCode int
+	Body       []byte
+}
+
+func findGenericIdempotencyReplay(ctx context.Context, conn *sql.Conn, tokenID int64, operation, key string, hashes ...string) (*hostingIdempotencyResponse, error) {
 	var storedHash string
+	var status sql.NullInt64
 	var response sql.NullString
-	err := conn.QueryRowContext(ctx, `SELECT request_hash, response_body FROM hosting_idempotency
-		WHERE issuer_token_id=? AND operation=? AND idempotency_key=?`, tokenID, operation, key).Scan(&storedHash, &response)
+	var expiresAt string
+	err := conn.QueryRowContext(ctx, `SELECT request_hash, response_status, response_body, expires_at FROM hosting_idempotency
+		WHERE issuer_token_id=? AND operation=? AND idempotency_key=?`, tokenID, operation, key).Scan(&storedHash, &status, &response, &expiresAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if storedHash != hash {
+	now := time.Now().UTC()
+	if !parseSQLiteTime(expiresAt).After(now) {
+		_, err := conn.ExecContext(ctx, `DELETE FROM hosting_idempotency
+			WHERE issuer_token_id=? AND operation=? AND idempotency_key=? AND expires_at<=?`,
+			tokenID, operation, key, formatSQLiteTime(now))
+		return nil, err
+	}
+	if !hostingIdempotencyHashMatches(storedHash, hashes) {
 		return nil, &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "Idempotency-Key was already used with a different request", StatusCode: 409}
 	}
-	if !response.Valid {
+	if !status.Valid || !response.Valid {
 		return nil, &hostingAPIError{Code: errCodeIdempotencyInProgress, Message: "the original request is still being processed", StatusCode: 409}
 	}
-	return []byte(response.String), nil
+	if status.Int64 < 100 || status.Int64 > 599 {
+		return nil, fmt.Errorf("invalid stored idempotency response status %d", status.Int64)
+	}
+	return &hostingIdempotencyResponse{StatusCode: int(status.Int64), Body: []byte(response.String)}, nil
 }
 
 func storeGenericIdempotency(ctx context.Context, conn *sql.Conn, tokenID int64, operation, key, hash string, status int, response []byte, now time.Time) error {
+	if status < 100 || status > 599 || len(response) == 0 {
+		return fmt.Errorf("invalid idempotency response status or body")
+	}
 	_, err := conn.ExecContext(ctx, `INSERT INTO hosting_idempotency
 		(issuer_token_id, operation, idempotency_key, request_hash, response_status, response_body, created_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, tokenID, operation, key, hash, status, string(response),
@@ -494,7 +517,10 @@ func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, ext
 			return nil, false, err
 		}
 		var response map[string]string
-		if err := json.Unmarshal(replay, &response); err != nil {
+		if replay.StatusCode != http.StatusOK {
+			return nil, false, fmt.Errorf("invalid desired-state idempotency response status %d", replay.StatusCode)
+		}
+		if err := json.Unmarshal(replay.Body, &response); err != nil {
 			return nil, false, err
 		}
 		return response, true, nil
@@ -522,7 +548,10 @@ func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, ext
 			return nil, false, err
 		}
 		var stored map[string]string
-		if err := json.Unmarshal(replay, &stored); err != nil {
+		if replay.StatusCode != http.StatusOK {
+			return nil, false, fmt.Errorf("invalid desired-state idempotency response status %d", replay.StatusCode)
+		}
+		if err := json.Unmarshal(replay.Body, &stored); err != nil {
 			return nil, false, err
 		}
 		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
@@ -580,7 +609,8 @@ func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, ext
 	if desired == "active" {
 		available, err := hostingProjectRuntimeAvailable(ctx, projectID)
 		if err != nil {
-			return nil, false, err
+			logOperationalError("inspect hosting runtime after durable resume acceptance", err)
+			return response, false, nil
 		}
 		if !available {
 			// Keep the durable resume intent pending. Recovery activation (or a
@@ -607,33 +637,35 @@ func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, ext
 	if desired == "active" {
 		resumeState, commitErr := commitHostingResumeOperation(ctx, projectID, operationID)
 		if commitErr != nil {
-			return nil, false, commitErr
+			logOperationalError("commit proxy resume after durable acceptance", commitErr)
+			return response, false, nil
 		}
 		if resumeState == hostingResumeUnavailable {
 			if err := fenceUnavailableHostingResume(ctx, proxy, projectID, externalID, operationID); err != nil {
-				return nil, false, err
+				logOperationalError("fence unavailable proxy resume after durable acceptance", err)
 			}
 			return response, false, nil
 		}
 		if resumeState == hostingResumeSuperseded {
 			if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
-				return nil, false, err
+				logOperationalError("mark superseded proxy resume after durable acceptance", err)
 			}
 		}
 		return response, false, nil
 	}
 	current, err := hostingProxyOperationIsCurrent(ctx, operationID)
 	if err != nil {
-		return nil, false, err
+		logOperationalError("inspect proxy suspension after durable acceptance", err)
+		return response, false, nil
 	}
 	if !current {
 		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
-			return nil, false, err
+			logOperationalError("mark superseded proxy suspension after durable acceptance", err)
 		}
 		return response, false, nil
 	}
 	if err := markHostingProxyOperationCommitted(ctx, operationID); err != nil {
-		return nil, false, err
+		logOperationalError("commit proxy suspension after durable acceptance", err)
 	}
 	return response, false, nil
 }
@@ -897,23 +929,38 @@ func hostingProjectRuntimeAvailableOn(ctx context.Context, querier hostingRouteG
 	return true, nil
 }
 
-func loadIdempotentResponse(ctx context.Context, tokenID int64, operation, key, hash string) ([]byte, error) {
+func loadIdempotentResponse(ctx context.Context, tokenID int64, operation, key string, hashes ...string) (*hostingIdempotencyResponse, error) {
 	var storedHash string
+	var status sql.NullInt64
 	var response sql.NullString
-	err := db.QueryRowContext(ctx, `SELECT request_hash, response_body FROM hosting_idempotency WHERE issuer_token_id=? AND operation=? AND idempotency_key=?`, tokenID, operation, key).Scan(&storedHash, &response)
+	err := db.QueryRowContext(ctx, `SELECT request_hash, response_status, response_body FROM hosting_idempotency
+		WHERE issuer_token_id=? AND operation=? AND idempotency_key=? AND expires_at>?`,
+		tokenID, operation, key, formatSQLiteTime(time.Now().UTC())).Scan(&storedHash, &status, &response)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if storedHash != hash {
+	if !hostingIdempotencyHashMatches(storedHash, hashes) {
 		return nil, &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "Idempotency-Key was already used with a different request", StatusCode: 409}
 	}
-	if !response.Valid {
+	if !status.Valid || !response.Valid {
 		return nil, &hostingAPIError{Code: errCodeIdempotencyInProgress, Message: "the original request is still being processed", StatusCode: 409}
 	}
-	return []byte(response.String), nil
+	if status.Int64 < 100 || status.Int64 > 599 {
+		return nil, fmt.Errorf("invalid stored idempotency response status %d", status.Int64)
+	}
+	return &hostingIdempotencyResponse{StatusCode: int(status.Int64), Body: []byte(response.String)}, nil
+}
+
+func hostingIdempotencyHashMatches(stored string, accepted []string) bool {
+	for _, candidate := range accepted {
+		if candidate != "" && stored == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 type rollbackRequest struct {
@@ -968,7 +1015,10 @@ func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID
 			return nil, false, err
 		}
 		var release HostingRelease
-		if err := json.Unmarshal(replay, &release); err != nil {
+		if replay.StatusCode != http.StatusOK {
+			return nil, false, fmt.Errorf("invalid rollback idempotency response status %d", replay.StatusCode)
+		}
+		if err := json.Unmarshal(replay.Body, &release); err != nil {
 			return nil, false, err
 		}
 		return &release, true, nil
@@ -1152,7 +1202,10 @@ func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID
 			return nil, false, err
 		}
 		var stored HostingRelease
-		if err := json.Unmarshal(replay, &stored); err != nil {
+		if replay.StatusCode != http.StatusOK {
+			return nil, false, fmt.Errorf("invalid rollback idempotency response status %d", replay.StatusCode)
+		}
+		if err := json.Unmarshal(replay.Body, &stored); err != nil {
 			return nil, false, err
 		}
 		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
