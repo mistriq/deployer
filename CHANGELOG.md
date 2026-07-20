@@ -20,6 +20,8 @@
   when cancellation races activation.
 - Persist an immutable runtime-manifest snapshot per release and use it for
   rollback health gates and retained-image recovery after later manifest edits.
+- Make rollback select a release by exact external deployment identity plus
+  content digest, avoiding ambiguity between content-identical deployments.
 - Add a transactional signed callback outbox with retries, dead-letter state,
   polling reconciliation, runner-loss recovery/reassignment, and deterministic
   retry exhaustion.

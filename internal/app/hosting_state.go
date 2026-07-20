@@ -613,7 +613,8 @@ func loadIdempotentResponse(ctx context.Context, tokenID int64, operation, key, 
 }
 
 type rollbackRequest struct {
-	ReleaseDigest string `json:"release_digest"`
+	ExternalDeploymentID string `json:"external_deployment_id"`
+	ReleaseDigest        string `json:"release_digest"`
 }
 
 func handleInternalRollback(w http.ResponseWriter, r *http.Request, externalProjectID string) {
@@ -637,8 +638,14 @@ func handleInternalRollback(w http.ResponseWriter, r *http.Request, externalProj
 		jsonErrorCode(w, errCodeValidation, "release_digest must be a sha256 digest", http.StatusBadRequest)
 		return
 	}
+	request.ExternalDeploymentID = strings.TrimSpace(request.ExternalDeploymentID)
+	if !externalIDPattern.MatchString(request.ExternalDeploymentID) {
+		jsonErrorCode(w, errCodeValidation, "external_deployment_id is invalid", http.StatusBadRequest)
+		return
+	}
 	token, _ := r.Context().Value(serviceTokenContextKey{}).(*ServiceToken)
-	release, replayed, err := rollbackHostingRelease(r.Context(), token, externalProjectID, request.ReleaseDigest, key)
+	release, replayed, err := rollbackHostingRelease(r.Context(), token, externalProjectID,
+		request.ExternalDeploymentID, request.ReleaseDigest, key)
 	if err != nil {
 		writeHostingAPIError(w, err)
 		return
@@ -649,9 +656,9 @@ func handleInternalRollback(w http.ResponseWriter, r *http.Request, externalProj
 	jsonResponse(w, release)
 }
 
-func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID, digest, key string) (*HostingRelease, bool, error) {
+func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID, externalDeploymentID, digest, key string) (*HostingRelease, bool, error) {
 	operation := "hosting.project.rollback"
-	hash := hashHostingOperation(operation, externalID, digest)
+	hash := hashHostingOperation(operation, externalID, externalDeploymentID, digest)
 	if replay, err := loadIdempotentResponse(ctx, token.ID, operation, key, hash); err != nil || replay != nil {
 		if err != nil {
 			return nil, false, err
@@ -677,16 +684,18 @@ func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID
 		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution is disabled or suspended", StatusCode: http.StatusConflict}
 	}
 	var release HostingRelease
+	var releaseID, deploymentID int64
 	var createdAt string
 	var runnerStatus, runtimeJSON string
 	var runnerLastSeen sql.NullString
-	err = db.QueryRowContext(ctx, `SELECT r.release_digest, d.external_deployment_id, r.commit_sha,
+	err = db.QueryRowContext(ctx, `SELECT r.id, d.id, r.release_digest, d.external_deployment_id, r.commit_sha,
 		r.artifact_digest, r.status, r.route_revision, r.previous_release_digest, r.runtime_endpoint,
 		r.created_at, hr.status, hr.last_seen, r.runtime_manifest_json FROM hosting_releases r
 		JOIN hosting_deployments d ON d.id=r.hosting_deployment_id
 		JOIN hosting_runners hr ON hr.id=r.runtime_runner_id
-		WHERE r.hosting_project_id=? AND r.release_digest=?`, project.ID, digest).Scan(
-		&release.Digest, &release.ExternalDeploymentID, &release.CommitSHA, &release.ArtifactDigest,
+		WHERE r.hosting_project_id=? AND d.external_deployment_id=? AND r.release_digest=?`,
+		project.ID, externalDeploymentID, digest).Scan(
+		&releaseID, &deploymentID, &release.Digest, &release.ExternalDeploymentID, &release.CommitSHA, &release.ArtifactDigest,
 		&release.Status, &release.RouteRevision, &release.PreviousRelease, &release.RuntimeEndpoint,
 		&createdAt, &runnerStatus, &runnerLastSeen, &runtimeJSON)
 	if err == sql.ErrNoRows {
@@ -745,10 +754,11 @@ func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID
 		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution is disabled or suspended", StatusCode: http.StatusConflict}
 	}
 	intentResult, err := intentConn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
-		(operation_id, hosting_project_id, operation_type, release_digest, runtime_endpoint,
-		 expected_previous_release_digest, status, created_at, updated_at)
-		VALUES (?, ?, 'rollback', ?, ?, ?, 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`,
-		operationID, project.ID, digest, release.RuntimeEndpoint, previous, formatSQLiteTime(now), formatSQLiteTime(now))
+		(operation_id, hosting_project_id, hosting_deployment_id, operation_type, release_digest, runtime_endpoint,
+		 expected_previous_release_digest, expected_previous_runtime_endpoint, status, created_at, updated_at)
+		VALUES (?, ?, ?, 'rollback', ?, ?, ?, ?, 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`,
+		operationID, project.ID, deploymentID, digest, release.RuntimeEndpoint, previous, previousEndpoint,
+		formatSQLiteTime(now), formatSQLiteTime(now))
 	if err != nil {
 		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
 		intentConn.Close()
@@ -827,11 +837,20 @@ func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID
 		_ = markHostingProxyOperationCommitted(ctx, operationID)
 		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution was disabled during rollback", StatusCode: http.StatusConflict}
 	}
-	if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='inactive', deactivated_at=? WHERE hosting_project_id=? AND status='active' AND release_digest<>?`, formatSQLiteTime(now), project.ID, digest); err != nil {
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='inactive', deactivated_at=?
+		WHERE hosting_project_id=? AND status='active' AND id<>?`, formatSQLiteTime(now), project.ID, releaseID); err != nil {
 		return nil, false, err
 	}
-	if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?, previous_release_digest=?, activated_at=?, deactivated_at=NULL WHERE hosting_project_id=? AND release_digest=?`, activation.RouteRevision, previous, formatSQLiteTime(now), project.ID, digest); err != nil {
+	result, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?,
+		previous_release_digest=?, activated_at=?, deactivated_at=NULL
+		WHERE id=? AND hosting_project_id=? AND hosting_deployment_id=? AND release_digest=?
+		AND status IN ('healthy','inactive','active')`, activation.RouteRevision, previous,
+		formatSQLiteTime(now), releaseID, project.ID, deploymentID, digest)
+	if err != nil {
 		return nil, false, err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release changed before rollback activation committed", StatusCode: http.StatusConflict}
 	}
 	if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_events (hosting_project_id, event_type, phase, metadata_json, created_at) VALUES (?, 'release_rolled_back', 'rolling_back', ?, ?)`, project.ID, fmt.Sprintf(`{"release_digest":%q}`, digest), formatSQLiteTime(now)); err != nil {
 		return nil, false, err

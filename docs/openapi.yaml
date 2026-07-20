@@ -1092,8 +1092,11 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [release_digest]
+              required: [external_deployment_id, release_digest]
               properties:
+                external_deployment_id:
+                  type: string
+                  description: Exact deployment instance that produced the selected retained release.
                 release_digest: {$ref: "#/components/schemas/SHA256Digest"}
       responses:
         "200":

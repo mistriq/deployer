@@ -309,6 +309,11 @@ Private control-plane API:
 - `GET /api/internal/v1/runners`
 - `GET /api/internal/v1/metrics`
 
+Rollback selects an immutable release instance with both its
+`external_deployment_id` and `release_digest`; a digest alone is intentionally
+insufficient because content-identical deployments can have distinct runtime
+instances.
+
 Scopes are `projects:write`, `deployments:read`, `deployments:write`, and
 `hosting:admin`. Service credentials are hashed, rotation keeps the configured
 overlap window, revocation invalidates every credential, and authentication,

@@ -35,6 +35,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [ ] Cancellation intent and recovery remain durable after process restart.
 - [ ] Immutable release persistence and selected-release rollback.
 - [x] Bind rollback and runtime recovery to each release's immutable runtime manifest.
+- [x] Make rollback identity unambiguous for content-identical release instances.
 - [ ] Candidate health gate before activation.
 - [ ] Failed candidate leaves previous healthy release untouched.
 - [ ] Suspend/resume without deleting releases.

@@ -482,6 +482,12 @@ func applyHostingMigrations() error {
 				), '{}')`,
 			},
 		},
+		{
+			id: "034_hosting_proxy_previous_runtime",
+			statements: []string{
+				`ALTER TABLE hosting_proxy_operations ADD COLUMN expected_previous_runtime_endpoint TEXT NOT NULL DEFAULT ''`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {

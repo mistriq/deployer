@@ -180,29 +180,28 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 func reconcileHostingRollbackOperations(ctx context.Context) error {
 	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.status, op.release_digest,
 		op.runtime_endpoint, op.expected_previous_release_digest, op.route_revision,
-		op.hosting_project_id, p.external_project_id, d.external_deployment_id, target.runtime_manifest_json,
-		COALESCE(previous.runtime_endpoint, '')
+		op.hosting_project_id, op.hosting_deployment_id, p.external_project_id,
+		d.external_deployment_id, target.runtime_manifest_json, op.expected_previous_runtime_endpoint
 		FROM hosting_proxy_operations op
 		JOIN hosting_projects p ON p.id=op.hosting_project_id
 		JOIN hosting_releases target ON target.hosting_project_id=op.hosting_project_id
+			AND target.hosting_deployment_id=op.hosting_deployment_id
 			AND target.release_digest=op.release_digest
 		JOIN hosting_deployments d ON d.id=target.hosting_deployment_id
-		LEFT JOIN hosting_releases previous ON previous.hosting_project_id=op.hosting_project_id
-			AND previous.release_digest=op.expected_previous_release_digest
 		WHERE op.operation_type='rollback' AND op.status IN ('pending','applied') ORDER BY op.id`)
 	if err != nil {
 		return err
 	}
 	type rollbackOperation struct {
 		operationID, status, digest, endpoint, previous, routeRevision          string
-		projectID                                                               int64
+		projectID, deploymentID                                                 int64
 		externalProjectID, externalDeploymentID, manifestJSON, previousEndpoint string
 	}
 	var operations []rollbackOperation
 	for rows.Next() {
 		var operation rollbackOperation
 		if err := rows.Scan(&operation.operationID, &operation.status, &operation.digest,
-			&operation.endpoint, &operation.previous, &operation.routeRevision, &operation.projectID,
+			&operation.endpoint, &operation.previous, &operation.routeRevision, &operation.projectID, &operation.deploymentID,
 			&operation.externalProjectID, &operation.externalDeploymentID, &operation.manifestJSON,
 			&operation.previousEndpoint); err != nil {
 			rows.Close()
@@ -281,13 +280,21 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 			FROM hosting_projects p JOIN hosting_settings s ON s.id=1 WHERE p.id=?`, operation.projectID).Scan(&desired, &kill, &global)
 		if err == nil && desired == "active" && kill == "" && global == 0 {
 			_, err = conn.ExecContext(ctx, `UPDATE hosting_releases SET status='inactive', deactivated_at=?
-				WHERE hosting_project_id=? AND status='active' AND release_digest<>?`, formatSQLiteTime(time.Now().UTC()), operation.projectID, operation.digest)
+				WHERE hosting_project_id=? AND status='active' AND hosting_deployment_id<>?`,
+				formatSQLiteTime(time.Now().UTC()), operation.projectID, operation.deploymentID)
 		}
 		if err == nil && desired == "active" && kill == "" && global == 0 {
-			_, err = conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?,
+			result, updateErr := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?,
 				previous_release_digest=?, activated_at=?, deactivated_at=NULL
-				WHERE hosting_project_id=? AND release_digest=?`, operation.routeRevision, operation.previous,
-				formatSQLiteTime(time.Now().UTC()), operation.projectID, operation.digest)
+				WHERE hosting_project_id=? AND hosting_deployment_id=? AND release_digest=?
+				AND status IN ('healthy','inactive','active')`, operation.routeRevision, operation.previous,
+				formatSQLiteTime(time.Now().UTC()), operation.projectID, operation.deploymentID, operation.digest)
+			err = updateErr
+			if err == nil {
+				if affected, _ := result.RowsAffected(); affected != 1 {
+					err = errHostingStateConflict
+				}
+			}
 		}
 		if err == nil && desired == "active" && kill == "" && global == 0 {
 			_, err = conn.ExecContext(ctx, `UPDATE hosting_proxy_operations SET status='committed', updated_at=?

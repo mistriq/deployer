@@ -82,7 +82,9 @@ be rejected.
 An active release has passed the candidate health gate and has an adapter route
 revision. A failed build, health check, or activation leaves the prior active
 release unchanged. Rollback accepts any retained `healthy`, `inactive`, or
-already `active` release with a verified private runtime endpoint. Each release
+already `active` release with a verified private runtime endpoint. Select it by
+the exact `external_deployment_id` plus `release_digest`; content digests are not
+unique release-instance identifiers. Each release
 stores the runtime/health contract from its original deployment recipe;
 subsequent project-manifest updates do not change rollback or restore behavior.
 

@@ -949,12 +949,14 @@ func TestHostingReleaseArtifactUploadIsLeaseFencedAndDigestVerified(t *testing.T
 func TestContentIdenticalRedeploymentCreatesDistinctReleaseInstances(t *testing.T) {
 	withTempDB(t)
 	withFakeProxy(t)
+	healthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	t.Cleanup(healthServer.Close)
 	project, token, runnerID, firstJob := createAndClaimHostingJob(t, "project_01JSAMEIM", "deployment_01JSAME01")
 	digest := "sha256:" + strings.Repeat("8", 64)
 	firstArtifact := attachTestReleaseArtifact(t, firstJob.JobID, digest)
 	if err := completeHostingJob(t.Context(), runnerID, firstJob.JobID, firstJob.LeaseGeneration, firstJob.LeaseToken, hostingCompletionRequest{
 		Status: "success", ReleaseDigest: digest, ReleaseArtifactDigest: firstArtifact,
-		RuntimeEndpoint: "http://10.60.0.1:3000", HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
+		RuntimeEndpoint: healthServer.URL, HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -973,7 +975,7 @@ func TestContentIdenticalRedeploymentCreatesDistinctReleaseInstances(t *testing.
 	}
 	if err := completeHostingJob(t.Context(), runnerID, secondJob.JobID, secondJob.LeaseGeneration, secondJob.LeaseToken, hostingCompletionRequest{
 		Status: "success", ReleaseDigest: digest, ReleaseArtifactDigest: secondArtifact,
-		RuntimeEndpoint: "http://10.60.0.2:3000", HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
+		RuntimeEndpoint: healthServer.URL, HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -984,6 +986,19 @@ func TestContentIdenticalRedeploymentCreatesDistinctReleaseInstances(t *testing.
 	}
 	if releases != 2 || active != 1 {
 		t.Fatalf("content-identical release instances=%d active=%d", releases, active)
+	}
+	if _, _, err := rollbackHostingRelease(t.Context(), token, project.ExternalProjectID,
+		"deployment_01JSAME01", digest, "rollback_01JSAME"); err != nil {
+		t.Fatalf("rollback exact content-identical release: %v", err)
+	}
+	var activeDeployment string
+	if err := db.QueryRow(`SELECT deployment.external_deployment_id FROM hosting_releases release
+		JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+		WHERE release.hosting_project_id=? AND release.status='active'`, project.ID).Scan(&activeDeployment); err != nil {
+		t.Fatal(err)
+	}
+	if activeDeployment != "deployment_01JSAME01" {
+		t.Fatalf("active content-identical release deployment=%q", activeDeployment)
 	}
 }
 
@@ -1335,11 +1350,21 @@ func TestRollbackSelectedReleaseIsIdempotent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	release, replayed, err := rollbackHostingRelease(t.Context(), token, project.ExternalProjectID, firstDigest, "rollback_01JROLLBK")
+	legacyBody, _ := json.Marshal(map[string]string{"release_digest": firstDigest})
+	legacyRequest := httptest.NewRequest(http.MethodPost, "/api/internal/v1/projects/"+project.ExternalProjectID+"/rollback", bytes.NewReader(legacyBody))
+	legacyRequest.Header.Set("Content-Type", "application/json")
+	legacyRequest.Header.Set(idempotencyKeyHeader, "rollback_legacy_digest_only")
+	legacyRequest = legacyRequest.WithContext(context.WithValue(legacyRequest.Context(), serviceTokenContextKey{}, token))
+	legacyRecorder := httptest.NewRecorder()
+	handleInternalRollback(legacyRecorder, legacyRequest, project.ExternalProjectID)
+	assertAPIErrorCode(t, legacyRecorder, http.StatusBadRequest, errCodeValidation)
+	release, replayed, err := rollbackHostingRelease(t.Context(), token, project.ExternalProjectID,
+		"deployment_01JROLLB1", firstDigest, "rollback_01JROLLBK")
 	if err != nil || replayed || release.Status != "active" || release.PreviousRelease != secondDigest {
 		t.Fatalf("rollback release=%+v replayed=%v err=%v", release, replayed, err)
 	}
-	if _, replayed, err := rollbackHostingRelease(t.Context(), token, project.ExternalProjectID, firstDigest, "rollback_01JROLLBK"); err != nil || !replayed {
+	if _, replayed, err := rollbackHostingRelease(t.Context(), token, project.ExternalProjectID,
+		"deployment_01JROLLB1", firstDigest, "rollback_01JROLLBK"); err != nil || !replayed {
 		t.Fatalf("rollback replayed=%v err=%v", replayed, err)
 	}
 	if len(fake.activations) != 3 || fake.activations[2].ExpectedPreviousReleaseDigest != secondDigest {
