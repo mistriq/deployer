@@ -375,8 +375,9 @@ requires the broker response to echo that identity, rejects redirects,
 oversize bodies, malformed/unsafe tar entries, and digest mismatches, hashes
 the stream, and durably commits it to managed content-addressed storage before
 deployment state is created. Deployer never persists the broker credential or
-source reference. Completed idempotent replays remain valid after the reference
-expires because they perform no new redemption. The exact broker request,
+source reference. Completed idempotent replays within the retained 24-hour
+window remain valid after the reference expires because they perform no new
+redemption. The exact broker request,
 response, authentication, and retry contract is in
 [`docs/source-broker-openapi.yaml`](docs/source-broker-openapi.yaml).
 

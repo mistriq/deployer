@@ -1358,6 +1358,11 @@ func extractHostingSource(archivePath, destination string) error {
 }
 
 func writeGeneratedHostingRecipe(sourceDir string, recipe hostingJobRecipe) error {
+	runtime := recipe.Runtime
+	if err := validateHostingRuntimeManifest(&runtime); err != nil {
+		return fmt.Errorf("invalid hosting runtime recipe: %w", err)
+	}
+	recipe.Runtime = runtime
 	directory := filepath.Join(sourceDir, ".deployer")
 	if err := os.Mkdir(directory, 0750); err != nil {
 		return err

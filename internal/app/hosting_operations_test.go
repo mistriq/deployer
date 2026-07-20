@@ -2,12 +2,67 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestRollbackAndKillSwitchRejectBadRequestEnvelopes(t *testing.T) {
+	withTempDB(t)
+	projectToken := &ServiceToken{ID: 1, Scopes: []string{serviceScopeDeploymentsWrite, serviceScopeProjectsWrite, serviceScopeHostingAdmin}}
+	type endpointCase struct {
+		serve       func(http.ResponseWriter, *http.Request)
+		validBody   []byte
+		unknownBody []byte
+	}
+	endpoints := map[string]endpointCase{
+		"rollback": {
+			serve:       func(w http.ResponseWriter, r *http.Request) { handleInternalRollback(w, r, "project_01JBOUNDARY") },
+			validBody:   []byte(`{"external_deployment_id":"deployment_01JBOUNDARY","release_digest":"sha256:` + strings.Repeat("a", 64) + `"}`),
+			unknownBody: []byte(`{"external_deployment_id":"deployment_01JBOUNDARY","release_digest":"sha256:` + strings.Repeat("a", 64) + `","command":"touch /owned"}`),
+		},
+		"kill switch": {
+			serve:       handleInternalGlobalKillSwitch,
+			validBody:   []byte(`{"enabled":true,"reason":"security response"}`),
+			unknownBody: []byte(`{"enabled":true,"reason":"security response","privileged":true}`),
+		},
+	}
+	for endpointName, endpoint := range endpoints {
+		for envelopeName, testCase := range map[string]struct {
+			contentType string
+			body        []byte
+			status      int
+			code        string
+		}{
+			"missing content type": {body: endpoint.validBody, status: http.StatusUnsupportedMediaType, code: errCodeUnsupportedMediaType},
+			"oversized":            {contentType: "application/json", body: bytes.Repeat([]byte(" "), (8<<10)+1), status: http.StatusRequestEntityTooLarge, code: errCodePayloadTooLarge},
+			"malformed":            {contentType: "application/json", body: []byte(`{"broken":`), status: http.StatusBadRequest, code: errCodeValidation},
+			"multiple values":      {contentType: "application/json", body: append(append([]byte(nil), endpoint.validBody...), []byte(` {}`)...), status: http.StatusBadRequest, code: errCodeValidation},
+			"unknown field":        {contentType: "application/json", body: endpoint.unknownBody, status: http.StatusBadRequest, code: errCodeValidation},
+		} {
+			t.Run(endpointName+"/"+envelopeName, func(t *testing.T) {
+				request := httptest.NewRequest(http.MethodPost, "/boundary", bytes.NewReader(testCase.body))
+				request = request.WithContext(context.WithValue(request.Context(), serviceTokenContextKey{}, projectToken))
+				request.Header.Set(idempotencyKeyHeader, "boundary_01JTEST")
+				if endpointName == "kill switch" {
+					request.Method = http.MethodPut
+				}
+				if testCase.contentType != "" {
+					request.Header.Set("Content-Type", testCase.contentType)
+				}
+				recorder := httptest.NewRecorder()
+				endpoint.serve(recorder, request)
+				assertAPIErrorCode(t, recorder, testCase.status, testCase.code)
+				if recorder.Header().Get("Content-Type") != "application/json" {
+					t.Fatalf("error content type=%q", recorder.Header().Get("Content-Type"))
+				}
+			})
+		}
+	}
+}
 
 func TestProjectKillSwitchCancelsQueuedWorkAndIsIdempotent(t *testing.T) {
 	withTempDB(t)

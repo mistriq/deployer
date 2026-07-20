@@ -155,6 +155,92 @@ func TestInternalDeploymentCreationIsHostingOnlyAndPayloadIdempotent(t *testing.
 	}
 }
 
+func TestInternalDeploymentRejectsExecutionEscapeFieldsAndBadRequestEnvelopes(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JINPUTBOUND")
+	handler := serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI))
+	base := validHostingDeploymentRequest("deployment_01JINPUTBOUND")
+	base.ManifestDigest = project.ManifestDigest
+	encoded, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		t.Fatal(err)
+	}
+	for field, value := range map[string]any{
+		"command":      "curl attacker.invalid",
+		"dockerfile":   "FROM malicious",
+		"compose":      map[string]any{"services": map[string]any{}},
+		"host_path":    "/etc",
+		"host_mounts":  []string{"/:/host"},
+		"host_port":    443,
+		"privileged":   true,
+		"capabilities": []string{"SYS_ADMIN"},
+		"build_args":   map[string]string{"TOKEN": "plaintext"},
+		"environment":  map[string]string{"TOKEN": "plaintext"},
+		"post_deploy":  "touch /owned",
+	} {
+		t.Run(field, func(t *testing.T) {
+			payload := make(map[string]any, len(document)+1)
+			for key, existing := range document {
+				payload[key] = existing
+			}
+			payload[field] = value
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/api/internal/v1/projects/"+project.ExternalProjectID+"/deployments", bytes.NewReader(body))
+			request.Header.Set("Authorization", "Bearer "+token.Token)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set(idempotencyKeyHeader, "idem_01JINPUTBOUND")
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			assertAPIErrorCode(t, recorder, http.StatusBadRequest, errCodeValidation)
+		})
+	}
+
+	for name, testCase := range map[string]struct {
+		contentType string
+		body        []byte
+		status      int
+		code        string
+	}{
+		"missing content type": {body: encoded, status: http.StatusUnsupportedMediaType, code: errCodeUnsupportedMediaType},
+		"oversized":            {contentType: "application/json", body: bytes.Repeat([]byte(" "), (32<<10)+1), status: http.StatusRequestEntityTooLarge, code: errCodePayloadTooLarge},
+		"malformed":            {contentType: "application/json", body: []byte(`{"external_deployment_id":`), status: http.StatusBadRequest, code: errCodeValidation},
+		"multiple values":      {contentType: "application/json", body: append(append([]byte(nil), encoded...), []byte(` {}`)...), status: http.StatusBadRequest, code: errCodeValidation},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/api/internal/v1/projects/"+project.ExternalProjectID+"/deployments", bytes.NewReader(testCase.body))
+			request.Header.Set("Authorization", "Bearer "+token.Token)
+			if testCase.contentType != "" {
+				request.Header.Set("Content-Type", testCase.contentType)
+			}
+			request.Header.Set(idempotencyKeyHeader, "idem_01JINPUTBOUND")
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			assertAPIErrorCode(t, recorder, testCase.status, testCase.code)
+			if recorder.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("error content type=%q", recorder.Header().Get("Content-Type"))
+			}
+		})
+	}
+
+	var deployments, idempotency int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_deployments`).Scan(&deployments); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_idempotency`).Scan(&idempotency); err != nil {
+		t.Fatal(err)
+	}
+	if deployments != 0 || idempotency != 0 {
+		t.Fatalf("rejected requests persisted deployments=%d idempotency=%d", deployments, idempotency)
+	}
+}
+
 func TestHostingDeploymentConcurrentDuplicateCreatesOneAtomicGraph(t *testing.T) {
 	withTempDB(t)
 	project, token := provisionDeploymentTestProject(t, "project_01JCONCURR")
@@ -255,6 +341,76 @@ func TestHostingDeploymentConcurrentIdempotencyConflictDoesNoDuplicateWork(t *te
 		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil || count != expected {
 			t.Fatalf("%s count=%d want=%d err=%v", table, count, expected, err)
 		}
+	}
+}
+
+func TestHostingDeploymentRejectsManifestChangedDuringSourcePreparation(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	project, _, _, err := upsertHostingProject(t.Context(), "project_01JMANIFESTRACE", validHostingManifest("node"))
+	if err != nil {
+		t.Fatalf("provision hosting project: %v", err)
+	}
+	token, err := createServiceToken("deployment-writer-manifest-race", []string{serviceScopeDeploymentsWrite})
+	if err != nil {
+		t.Fatalf("create service token: %v", err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	runnerID := insertHostingRunnerForTest(t, "hosting-manifest-race", limits)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSource := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseSource()
+	oldPreparer := prepareHostingSource
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+		close(started)
+		<-release
+		return "/managed/manifest-race.tar", "sha256:" + strings.Repeat("c", 64), nil
+	}
+	t.Cleanup(func() { prepareHostingSource = oldPreparer })
+
+	request := validHostingDeploymentRequest("deployment_01JMANIFESTRACE")
+	request.ManifestDigest = project.ManifestDigest
+	result := make(chan error, 1)
+	go func() {
+		_, err := createHostingDeployment(context.Background(), token, project.ExternalProjectID, "idem_01JMANIFESTRACE", request)
+		result <- err
+	}()
+	<-started
+
+	updatedManifest := validHostingManifest("node")
+	updatedManifest.ResourceProfile = "standard"
+	updated, created, replayed, err := upsertHostingProject(t.Context(), project.ExternalProjectID, updatedManifest)
+	if err != nil {
+		t.Fatalf("update project while source is in flight: %v", err)
+	}
+	if created || replayed || updated.ManifestDigest == project.ManifestDigest {
+		t.Fatalf("project update did not commit a distinct manifest: created=%v replayed=%v project=%+v", created, replayed, updated)
+	}
+	releaseSource()
+
+	err = <-result
+	var apiErr *hostingAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeManifestDigestMismatch || apiErr.StatusCode != http.StatusConflict {
+		t.Fatalf("stale deployment error=%v", err)
+	}
+	for _, table := range []string{"hosting_deployments", "hosting_jobs", "hosting_idempotency", "hosting_events"} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if count != 0 {
+			t.Fatalf("stale deployment created %d rows in %s", count, table)
+		}
+	}
+	var freeCPU int64
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, runnerID).Scan(&freeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if freeCPU != limits.CPUMillis {
+		t.Fatalf("stale deployment reserved runner capacity: free_cpu_millis=%d want=%d", freeCPU, limits.CPUMillis)
 	}
 }
 
@@ -788,6 +944,9 @@ func TestHostingDeploymentRedeemsBoundSourceBeforeCreatingState(t *testing.T) {
 		if strings.Contains(persisted, request.SourceReference.Reference) {
 			t.Fatalf("source reference leaked into %s", name)
 		}
+	}
+	if strings.Contains(recipeJSON, project.DeployPath) || strings.Contains(recipeJSON, `"release_root"`) {
+		t.Fatalf("hosting recipe leaked Deployer host path: %s", recipeJSON)
 	}
 	if _, err := db.Exec(`UPDATE hosting_deployments SET status='failed', phase='failed' WHERE external_deployment_id=?`, request.ExternalDeploymentID); err != nil {
 		t.Fatal(err)

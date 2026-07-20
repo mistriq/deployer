@@ -16,17 +16,17 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Verify private versioned API and CSRF separation against the current WIP and full test gate.
 - [x] Replace simple deployment-key persistence with issuer + operation + key + request hash + original response.
 - [x] Add service-token audit events and overlapping no-downtime rotation.
-- [ ] Add `external_project_id` and `external_deployment_id` with unique constraints.
-- [ ] Define and document all internal schemas, scopes and stable error codes in OpenAPI.
-- [ ] Add strict manifest schema/version/hash validation.
-- [ ] Ensure hosting APIs accept no arbitrary shell, host path, Compose or privileged runtime fields.
-- [ ] Automatic path uses platform-generated static/Node recipes and never executes customer Dockerfiles.
-- [ ] Add request size limits, content-type validation and consistent JSON errors.
+- [x] Add `external_project_id` and `external_deployment_id` with unique constraints.
+- [x] Define and document all internal schemas, scopes and stable error codes in OpenAPI.
+- [x] Add strict manifest schema/version/hash validation.
+- [x] Ensure hosting APIs accept no arbitrary shell, host path, Compose or privileged runtime fields.
+- [x] Automatic path uses platform-generated static/Node recipes and never executes customer Dockerfiles.
+- [x] Add request size limits, content-type validation and consistent JSON errors.
 
 ## P0 — project and deployment lifecycle
 
-- [ ] Idempotent hosting project provision/upsert endpoint.
-- [ ] Separate hosting projects/jobs/runners from trusted admin projects.
+- [x] Idempotent hosting project provision/upsert endpoint.
+- [x] Separate hosting projects/jobs/runners from trusted admin projects.
 - [x] Exact commit SHA and immutable artifact digest on every hosting deployment.
 - [x] Atomic idempotency and one-active-deployment guard under concurrency.
 - [ ] Stable deployment phases and transition validation.

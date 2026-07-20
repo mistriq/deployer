@@ -162,8 +162,16 @@ func handleInternalDeploymentEvents(w http.ResponseWriter, r *http.Request, exte
 		event.CreatedAt = parseSQLiteTime(createdAt)
 		events = append(events, event)
 	}
+	if err := rows.Err(); err != nil {
+		jsonErrorCode(w, errCodeInternal, "read deployment events failed", http.StatusInternalServerError)
+		return
+	}
 	if len(events) == 0 {
-		if _, err := getHostingDeploymentByExternalID(r.Context(), externalDeploymentID); errors.Is(err, sql.ErrNoRows) {
+		if _, err := getHostingDeploymentByExternalID(r.Context(), externalDeploymentID); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				jsonErrorCode(w, errCodeInternal, "read deployment state failed", http.StatusInternalServerError)
+				return
+			}
 			jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
 			return
 		}
@@ -195,8 +203,16 @@ func handleInternalDeploymentLogs(w http.ResponseWriter, r *http.Request, extern
 		entry.CreatedAt = parseSQLiteTime(createdAt)
 		logs = append(logs, entry)
 	}
+	if err := rows.Err(); err != nil {
+		jsonErrorCode(w, errCodeInternal, "read deployment logs failed", http.StatusInternalServerError)
+		return
+	}
 	if len(logs) == 0 {
-		if _, err := getHostingDeploymentByExternalID(r.Context(), externalDeploymentID); errors.Is(err, sql.ErrNoRows) {
+		if _, err := getHostingDeploymentByExternalID(r.Context(), externalDeploymentID); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				jsonErrorCode(w, errCodeInternal, "read deployment state failed", http.StatusInternalServerError)
+				return
+			}
 			jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
 			return
 		}

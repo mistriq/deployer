@@ -893,7 +893,7 @@ func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) 
 		t.Fatal(err)
 	}
 	for _, buildOnlyField := range []string{`"repository"`, `"commit_sha"`, `"manifest_digest"`,
-		`"artifact_digest"`, `"release_root"`, `"source_artifact_url"`} {
+		`"artifact_digest"`, `"source_artifact_url"`} {
 		if bytes.Contains(encodedRecipe, []byte(buildOnlyField)) {
 			t.Fatalf("restore recipe contains build-only field %s: %s", buildOnlyField, encodedRecipe)
 		}
@@ -2731,5 +2731,87 @@ func TestHostingRunnerCredentialsAreSeparateHashedAndAudited(t *testing.T) {
 	var audits int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_audit_events WHERE event_type IN ('hosting_runner_created','hosting_runner_credential_rotated')`).Scan(&audits); err != nil || audits != 2 {
 		t.Fatalf("runner audits=%d err=%v", audits, err)
+	}
+}
+
+func TestHostingServiceAndLegacyCredentialsCannotCrossExecutionBoundaries(t *testing.T) {
+	withTempDB(t)
+	hostingRunner, err := createHostingRunner(t.Context(), hostingRunnerInput{
+		Name: "credential-boundary-hosting", ProtocolVersion: hostingRunnerProtocolVersion,
+		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"22"},
+		Capacity: capacityDTO{CPUMillis: 2000, RAMBytes: 2 << 30, DiskBytes: 10 << 30, PIDs: 512},
+		Reserve:  capacityDTO{CPUMillis: 250, RAMBytes: 256 << 20, DiskBytes: 1 << 30, PIDs: 32},
+	}, "credential-boundary-hosting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRunner := &Runner{Name: "credential-boundary-legacy", Labels: "linux"}
+	if err := createRunner(legacyRunner); err != nil {
+		t.Fatal(err)
+	}
+	serviceToken, err := createServiceToken("credential-boundary-service", []string{serviceScopeDeploymentsRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	credentials := map[string]string{
+		"hosting": hostingRunner.Token,
+		"legacy":  legacyRunner.Token,
+		"service": serviceToken.Token,
+	}
+	for name, credential := range credentials {
+		t.Run(name, func(t *testing.T) {
+			hostingPassed := false
+			hostingHandler := hostingRunnerAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hostingPassed = true
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			req := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/poll", nil)
+			req.Header.Set("Authorization", "Bearer "+credential)
+			rec := httptest.NewRecorder()
+			hostingHandler.ServeHTTP(rec, req)
+			if name == "hosting" {
+				if rec.Code != http.StatusNoContent || !hostingPassed {
+					t.Fatalf("hosting auth rejected hosting credential: status=%d body=%s", rec.Code, rec.Body.String())
+				}
+			} else if rec.Code != http.StatusUnauthorized || hostingPassed {
+				t.Fatalf("hosting auth accepted %s credential: status=%d", name, rec.Code)
+			}
+
+			servicePassed := false
+			serviceHandler := serviceTokenAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				servicePassed = true
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			req = httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/example", nil)
+			req.Header.Set("Authorization", "Bearer "+credential)
+			rec = httptest.NewRecorder()
+			serviceHandler.ServeHTTP(rec, req)
+			if name == "service" {
+				if rec.Code != http.StatusNoContent || !servicePassed {
+					t.Fatalf("service auth rejected service credential: status=%d body=%s", rec.Code, rec.Body.String())
+				}
+			} else if rec.Code != http.StatusUnauthorized || servicePassed {
+				t.Fatalf("service auth accepted %s credential: status=%d", name, rec.Code)
+			}
+
+			req = httptest.NewRequest(http.MethodGet, "/api/agent/poll", nil)
+			req.Header.Set("Authorization", "Bearer "+credential)
+			authenticatedLegacy, authErr := authenticateAgent(req)
+			if name == "legacy" {
+				if authErr != nil || authenticatedLegacy.ID != legacyRunner.ID {
+					t.Fatalf("legacy auth rejected legacy credential: runner=%+v err=%v", authenticatedLegacy, authErr)
+				}
+			} else if authErr == nil {
+				t.Fatalf("legacy auth accepted %s credential as runner %+v", name, authenticatedLegacy)
+			}
+		})
+	}
+
+	for table, want := range map[string]int{"hosting_runners": 1, "runners": 1, "service_tokens": 1} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil || count != want {
+			t.Fatalf("%s count=%d want=%d err=%v", table, count, want, err)
+		}
 	}
 }

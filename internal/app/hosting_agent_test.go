@@ -118,7 +118,7 @@ func TestDownloadHostingSourceRejectsDeclaredOversize(t *testing.T) {
 func TestGeneratedHostingRecipesIgnoreCustomerDockerfile(t *testing.T) {
 	tests := []HostingRuntimeManifest{
 		{Kind: "static", NodeVersion: "22", PackageManager: "npm", BuildScript: "build", OutputDirectory: "dist"},
-		{Kind: "node", NodeVersion: "20", PackageManager: "pnpm", BuildScript: "compile", StartScript: "start", Port: 3000},
+		{Kind: "node", NodeVersion: "20", PackageManager: "pnpm", BuildScript: "compile", StartScript: "start", Port: 3000, HealthPath: "/healthz"},
 	}
 	for _, runtime := range tests {
 		t.Run(runtime.Kind, func(t *testing.T) {
@@ -143,6 +143,29 @@ func TestGeneratedHostingRecipesIgnoreCustomerDockerfile(t *testing.T) {
 			unchanged, err := os.ReadFile(filepath.Join(directory, "Dockerfile"))
 			if err != nil || !bytes.Equal(unchanged, customerDockerfile) {
 				t.Fatalf("customer Dockerfile was changed: %q, %v", unchanged, err)
+			}
+		})
+	}
+}
+
+func TestGeneratedHostingRecipeRejectsOutputDirectoryInjection(t *testing.T) {
+	for _, output := range []string{
+		"dist\nRUN touch /owned",
+		"dist # comment",
+		"dist /tmp/other",
+		`dist\escape`,
+		"dist/../public",
+		"dist//public",
+	} {
+		t.Run(strings.ReplaceAll(output, "/", "_"), func(t *testing.T) {
+			directory := t.TempDir()
+			runtime := HostingRuntimeManifest{Kind: "static", NodeVersion: "22", PackageManager: "npm",
+				BuildScript: "build", OutputDirectory: output}
+			if err := writeGeneratedHostingRecipe(directory, hostingJobRecipe{Runtime: runtime}); err == nil {
+				t.Fatalf("unsafe output directory %q was accepted", output)
+			}
+			if _, err := os.Stat(filepath.Join(directory, ".deployer")); !os.IsNotExist(err) {
+				t.Fatalf("generated recipe directory exists after rejected output %q: %v", output, err)
 			}
 		})
 	}

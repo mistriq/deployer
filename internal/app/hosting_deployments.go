@@ -70,7 +70,6 @@ type hostingJobRecipe struct {
 	ArtifactDigest        string                     `json:"artifact_digest,omitempty"`
 	Runtime               HostingRuntimeManifest     `json:"runtime"`
 	Limits                hostingWorkloadLimits      `json:"limits"`
-	ReleaseRoot           string                     `json:"release_root,omitempty"`
 	SourceArtifactURL     string                     `json:"source_artifact_url,omitempty"`
 	ReleaseDigest         string                     `json:"release_digest,omitempty"`
 	ReleaseArtifactDigest string                     `json:"release_artifact_digest,omitempty"`
@@ -412,7 +411,6 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 		ArtifactDigest:       request.ArtifactDigest,
 		Runtime:              project.Manifest.Runtime,
 		Limits:               limits,
-		ReleaseRoot:          project.DeployPath,
 	}
 	recipeJSON, err := json.Marshal(recipe)
 	if err != nil {

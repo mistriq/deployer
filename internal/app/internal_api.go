@@ -53,7 +53,7 @@ func handleInternalProjectUpsert(w http.ResponseWriter, r *http.Request, externa
 	response := internalProjectResponse{
 		ExternalProjectID: project.ExternalProjectID,
 		ManifestDigest:    project.ManifestDigest,
-		Manifest:          payload.Manifest,
+		Manifest:          project.Manifest,
 		Created:           created,
 		Replayed:          replayed,
 	}

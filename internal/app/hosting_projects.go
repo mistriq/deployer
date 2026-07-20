@@ -32,9 +32,11 @@ const (
 )
 
 var (
-	externalIDPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$`)
-	repositoryNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
-	packageScriptPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$`)
+	externalIDPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$`)
+	repositoryNamePattern  = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	packageScriptPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$`)
+	outputDirectoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$`)
+	healthPathPattern      = regexp.MustCompile(`^/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[A-Fa-f0-9]{2})*$`)
 )
 
 type HostingProjectManifest struct {
@@ -204,41 +206,55 @@ func validateHostingProjectRequest(payload *hostingProjectUpsertRequest) error {
 	if manifest.ResourceProfile != "starter" && manifest.ResourceProfile != "standard" {
 		return fmt.Errorf("resource_profile must be starter or standard")
 	}
-	if manifest.Runtime.Kind != "static" && manifest.Runtime.Kind != "node" {
+	return validateHostingRuntimeManifest(&manifest.Runtime)
+}
+
+func validateHostingRuntimeManifest(runtime *HostingRuntimeManifest) error {
+	if runtime == nil {
+		return fmt.Errorf("runtime is required")
+	}
+	runtime.Kind = strings.TrimSpace(runtime.Kind)
+	runtime.NodeVersion = strings.TrimSpace(runtime.NodeVersion)
+	runtime.PackageManager = strings.TrimSpace(runtime.PackageManager)
+	runtime.BuildScript = strings.TrimSpace(runtime.BuildScript)
+	runtime.StartScript = strings.TrimSpace(runtime.StartScript)
+	runtime.OutputDirectory = strings.TrimSpace(runtime.OutputDirectory)
+	runtime.HealthPath = strings.TrimSpace(runtime.HealthPath)
+	if runtime.Kind != "static" && runtime.Kind != "node" {
 		return fmt.Errorf("runtime kind must be static or node")
 	}
-	if manifest.Runtime.NodeVersion != "20" && manifest.Runtime.NodeVersion != "22" {
+	if runtime.NodeVersion != "20" && runtime.NodeVersion != "22" {
 		return fmt.Errorf("node_version must be 20 or 22")
 	}
-	if manifest.Runtime.PackageManager != "npm" && manifest.Runtime.PackageManager != "pnpm" && manifest.Runtime.PackageManager != "yarn" {
+	if runtime.PackageManager != "npm" && runtime.PackageManager != "pnpm" && runtime.PackageManager != "yarn" {
 		return fmt.Errorf("package_manager must be npm, pnpm, or yarn")
 	}
-	if manifest.Runtime.BuildScript != "" && !packageScriptPattern.MatchString(manifest.Runtime.BuildScript) {
+	if runtime.BuildScript != "" && !packageScriptPattern.MatchString(runtime.BuildScript) {
 		return fmt.Errorf("build_script must be a package.json script name, not a shell command")
 	}
 
-	switch manifest.Runtime.Kind {
+	switch runtime.Kind {
 	case "static":
-		if manifest.Runtime.BuildScript == "" {
+		if runtime.BuildScript == "" {
 			return fmt.Errorf("static runtime requires build_script")
 		}
-		if err := validateHostingOutputDirectory(manifest.Runtime.OutputDirectory); err != nil {
+		if err := validateHostingOutputDirectory(runtime.OutputDirectory); err != nil {
 			return err
 		}
-		if manifest.Runtime.StartScript != "" || manifest.Runtime.Port != 0 || manifest.Runtime.HealthPath != "" {
+		if runtime.StartScript != "" || runtime.Port != 0 || runtime.HealthPath != "" {
 			return fmt.Errorf("static runtime must not define start_script, port, or health_path")
 		}
 	case "node":
-		if !packageScriptPattern.MatchString(manifest.Runtime.StartScript) {
+		if !packageScriptPattern.MatchString(runtime.StartScript) {
 			return fmt.Errorf("node runtime requires a package.json start_script name")
 		}
-		if manifest.Runtime.OutputDirectory != "" {
+		if runtime.OutputDirectory != "" {
 			return fmt.Errorf("node runtime must not define output_directory")
 		}
-		if manifest.Runtime.Port < 1024 || manifest.Runtime.Port > 65535 {
+		if runtime.Port < 1024 || runtime.Port > 65535 {
 			return fmt.Errorf("node runtime port must be between 1024 and 65535")
 		}
-		if err := validateHealthPath(manifest.Runtime.HealthPath); err != nil {
+		if err := validateHealthPath(runtime.HealthPath); err != nil {
 			return err
 		}
 	}
@@ -246,14 +262,21 @@ func validateHostingProjectRequest(payload *hostingProjectUpsertRequest) error {
 }
 
 func validateHostingOutputDirectory(value string) error {
-	if _, err := cleanRelativeDeployPath(value); err != nil {
+	if len(value) > 256 || !outputDirectoryPattern.MatchString(value) {
+		return fmt.Errorf("output_directory must contain only safe relative path segments")
+	}
+	clean, err := cleanRelativeDeployPath(value)
+	if err != nil {
 		return fmt.Errorf("output_directory is unsafe: %w", err)
+	}
+	if clean != value {
+		return fmt.Errorf("output_directory must be a canonical relative path")
 	}
 	return nil
 }
 
 func validateHealthPath(value string) error {
-	if value == "" || !strings.HasPrefix(value, "/") || strings.HasPrefix(value, "//") {
+	if value == "" || strings.HasPrefix(value, "//") || !healthPathPattern.MatchString(value) {
 		return fmt.Errorf("health_path must be an absolute HTTP path")
 	}
 	parsed, err := url.ParseRequestURI(value)
@@ -388,12 +411,15 @@ func upsertHostingProjectAudited(ctx context.Context, externalProjectID string, 
 			return nil, false, false, err
 		}
 	}
+	stored, err := getHostingProjectByIDOn(ctx, conn, project.ID)
+	if err != nil {
+		return nil, false, false, err
+	}
 	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
 		return nil, false, false, err
 	}
 	committed = true
-	stored, err := getHostingProjectByID(project.ID)
-	return stored, created, replayed, err
+	return stored, created, replayed, nil
 }
 
 func getHostingProjectByExternalID(externalProjectID string) (*HostingProject, error) {
@@ -405,9 +431,17 @@ func getHostingProjectByExternalID(externalProjectID string) (*HostingProject, e
 }
 
 func getHostingProjectByID(id int64) (*HostingProject, error) {
+	return getHostingProjectByIDOn(context.Background(), db, id)
+}
+
+type hostingProjectQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func getHostingProjectByIDOn(ctx context.Context, querier hostingProjectQuerier, id int64) (*HostingProject, error) {
 	var project HostingProject
 	var manifestJSON, createdAt, updatedAt string
-	err := db.QueryRow(`SELECT id, external_project_id, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, desired_state, kill_switch_reason, created_at, updated_at FROM hosting_projects WHERE id=?`, id).Scan(
+	err := querier.QueryRowContext(ctx, `SELECT id, external_project_id, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, desired_state, kill_switch_reason, created_at, updated_at FROM hosting_projects WHERE id=?`, id).Scan(
 		&project.ID, &project.ExternalProjectID, &project.ManifestVersion, &manifestJSON, &project.ManifestDigest, &project.RepositoryInstallationID, &project.RepositoryID, &project.RepositoryFullName, &project.RuntimeKind, &project.ResourceProfile, &project.RepoPath, &project.DeployPath, &project.RunnerID, &project.DesiredState, &project.KillSwitchReason, &createdAt, &updatedAt,
 	)
 	if err != nil {

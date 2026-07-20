@@ -1088,6 +1088,7 @@ paths:
         X-Deployer-Signature is HMAC-SHA256 over
         "<X-Deployer-Timestamp>.<raw request body>" using the bearer token as
         the HMAC key.
+        The raw JSON request body is limited to 64 KiB.
       operationId: upsertInternalProject
       security:
         - serviceBearerAuth: []
@@ -1120,6 +1121,10 @@ paths:
           $ref: "#/components/responses/Error"
         "403":
           $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "405":
+          $ref: "#/components/responses/Error"
         "413":
           $ref: "#/components/responses/Error"
         "415":
@@ -1139,6 +1144,7 @@ paths:
         Placement, capacity reservation, deployment, job, event, and
         idempotency response are committed atomically. This endpoint accepts no
         shell, Dockerfile, Compose, host path, privileged option, or plaintext secret.
+        The JSON request body is limited to 32 KiB.
       operationId: createInternalDeployment
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1162,6 +1168,7 @@ paths:
         "403": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "413": {$ref: "#/components/responses/Error"}
         "415": {$ref: "#/components/responses/Error"}
         "422": {$ref: "#/components/responses/Error"}
@@ -1196,7 +1203,7 @@ paths:
     post:
       tags: [internal]
       summary: Activate a selected retained healthy release
-      description: Requires deployments:write.
+      description: Requires deployments:write. The JSON request body is limited to 8 KiB.
       operationId: rollbackInternalRelease
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1212,8 +1219,7 @@ paths:
               required: [external_deployment_id, release_digest]
               properties:
                 external_deployment_id:
-                  type: string
-                  description: Exact deployment instance that produced the selected retained release.
+                  $ref: "#/components/schemas/ExternalDeploymentId"
                 release_digest: {$ref: "#/components/schemas/SHA256Digest"}
       responses:
         "200":
@@ -1227,6 +1233,7 @@ paths:
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
         "413": {$ref: "#/components/responses/Error"}
         "415": {$ref: "#/components/responses/Error"}
@@ -1256,6 +1263,7 @@ paths:
         "403": {$ref: "#/components/responses/Error"}
         "400": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
@@ -1281,6 +1289,7 @@ paths:
         "403": {$ref: "#/components/responses/Error"}
         "400": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
@@ -1288,7 +1297,7 @@ paths:
     put:
       tags: [internal]
       summary: Change a project's execution kill switch
-      description: Requires projects:write. Enabling cancels queued work and durably requests cancellation of leased work.
+      description: Requires projects:write. Enabling cancels queued work and durably requests cancellation of leased work. The JSON request body is limited to 8 KiB.
       operationId: setInternalProjectKillSwitch
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1311,6 +1320,7 @@ paths:
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
         "413": {$ref: "#/components/responses/Error"}
         "415": {$ref: "#/components/responses/Error"}
@@ -1359,6 +1369,7 @@ paths:
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "400": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
@@ -1382,6 +1393,7 @@ paths:
         "404": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/deployments/{externalDeploymentId}/logs:
@@ -1404,6 +1416,7 @@ paths:
         "404": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/capabilities:
@@ -1459,13 +1472,14 @@ paths:
               schema: {$ref: "#/components/schemas/HostingMetrics"}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/settings/kill-switch:
     put:
       tags: [internal]
       summary: Change the global hosting execution kill switch
-      description: Requires hosting:admin. Enabling cancels queued work and durably requests cancellation of leased work.
+      description: Requires hosting:admin. Enabling cancels queued work and durably requests cancellation of leased work. The JSON request body is limited to 8 KiB.
       operationId: setInternalGlobalKillSwitch
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -2450,49 +2464,58 @@ components:
               type: string
               pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
         runtime:
-          type: object
-          additionalProperties: false
-          required: [kind, node_version, package_manager]
-          properties:
-            kind:
-              type: string
-              enum: [static, node]
-            node_version:
-              type: string
-              enum: ['20', '22']
-            package_manager:
-              type: string
-              enum: [npm, pnpm, yarn]
-            build_script:
-              type: string
-              pattern: '^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$'
-              description: package.json script name, never a shell command.
-            start_script:
-              type: string
-              pattern: '^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$'
-              description: Required for node; package.json script name, never a shell command.
-            output_directory:
-              type: string
-              description: Required for static and constrained to the repository tree.
-            port:
-              type: integer
-              minimum: 1024
-              maximum: 65535
-              description: Required for node.
-            health_path:
-              type: string
-              pattern: '^/[^?#]*$'
-              description: Required for node.
+          oneOf:
+            - $ref: "#/components/schemas/HostingStaticRuntime"
+            - $ref: "#/components/schemas/HostingNodeRuntime"
         resource_profile:
           type: string
           enum: [starter, standard]
+
+    HostingStaticRuntime:
+      type: object
+      additionalProperties: false
+      required: [kind, node_version, package_manager, build_script, output_directory]
+      properties:
+        kind: {type: string, const: static}
+        node_version: {type: string, enum: ['20', '22']}
+        package_manager: {type: string, enum: [npm, pnpm, yarn]}
+        build_script:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$'
+          description: package.json script name, never a shell command.
+        output_directory:
+          type: string
+          maxLength: 256
+          pattern: '^(?!\.{1,2}(?:/|$))[A-Za-z0-9_.-]+(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9_.-]+)*$'
+          description: Canonical relative path segments inside the repository; no whitespace, control characters, backslashes, or traversal.
+
+    HostingNodeRuntime:
+      type: object
+      additionalProperties: false
+      required: [kind, node_version, package_manager, start_script, port, health_path]
+      properties:
+        kind: {type: string, const: node}
+        node_version: {type: string, enum: ['20', '22']}
+        package_manager: {type: string, enum: [npm, pnpm, yarn]}
+        build_script:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$'
+          description: Optional package.json build script name, never a shell command.
+        start_script:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$'
+          description: Required package.json start script name, never a shell command.
+        port: {type: integer, minimum: 1024, maximum: 65535}
+        health_path:
+          type: string
+          pattern: "^/(?!/)(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[A-Fa-f0-9]{2})*$"
+          description: Absolute HTTP path without a query, fragment, whitespace, or authority prefix.
 
     InternalProject:
       type: object
       required: [external_project_id, manifest_digest, manifest, created, replayed]
       properties:
-        external_project_id:
-          type: string
+        external_project_id: {$ref: "#/components/schemas/ExternalProjectId"}
         manifest_digest:
           type: string
           pattern: '^sha256:[a-f0-9]{64}$'
@@ -2506,6 +2529,23 @@ components:
     SHA256Digest:
       type: string
       pattern: '^sha256:[a-f0-9]{64}$'
+
+    HostingFailureCode:
+      type: string
+      description: Stable machine-readable hosting execution or recovery failure code.
+      enum: [artifact_digest_mismatch, artifact_unavailable, build_failed, build_timeout, cancelled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, runtime_instance_lost, secret_reference_unavailable, source_fetch_failed, workload_policy_violation]
+
+    ExternalProjectId:
+      type: string
+      minLength: 8
+      maxLength: 128
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+
+    ExternalDeploymentId:
+      type: string
+      minLength: 8
+      maxLength: 128
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
 
     HostingWorkloadLimits:
       type: object
@@ -2542,7 +2582,10 @@ components:
             SECRET_<one-based array index> before the canonical idempotency hash
             is computed.
           pattern: '^[A-Z][A-Z0-9_]{0,63}$'
-        expires_at: {type: string, format: date-time}
+        expires_at:
+          type: string
+          format: date-time
+          description: Admission reference expiry; must be in the future and no more than one hour from the request.
 
     HostingSourceReference:
       type: object
@@ -2576,9 +2619,7 @@ components:
         24-hour idempotency window.
       required: [external_deployment_id, commit_sha, manifest_digest, artifact_digest, source_reference]
       properties:
-        external_deployment_id:
-          type: string
-          pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+        external_deployment_id: {$ref: "#/components/schemas/ExternalDeploymentId"}
         commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
         manifest_digest: {$ref: "#/components/schemas/SHA256Digest"}
         artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
@@ -2605,8 +2646,8 @@ components:
         - log_reference
         - event_reference
       properties:
-        external_deployment_id: {type: string}
-        external_project_id: {type: string}
+        external_deployment_id: {$ref: "#/components/schemas/ExternalDeploymentId"}
+        external_project_id: {$ref: "#/components/schemas/ExternalProjectId"}
         commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
         manifest_digest: {$ref: "#/components/schemas/SHA256Digest"}
         artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
@@ -2651,7 +2692,7 @@ components:
       required: [digest, external_deployment_id, commit_sha, artifact_digest, status, created_at]
       properties:
         digest: {$ref: "#/components/schemas/SHA256Digest"}
-        external_deployment_id: {type: string}
+        external_deployment_id: {$ref: "#/components/schemas/ExternalDeploymentId"}
         commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
         artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
         status: {type: string, enum: [healthy, active, inactive, failed]}
@@ -2675,8 +2716,8 @@ components:
             runtime_recovery_queued, runtime_reappeared_before_recovery,
             runtime_recovered, inactive_runtime_runner_lost, and terminal
             runtime_recovery_failed/runtime_recovery_cancelled variants.
-        phase: {type: string}
-        failure_code: {type: string}
+        phase: {type: string, enum: [queued, fetching_source, building, starting_candidate, health_checking, activating, active, failed, cancelling, cancelled, rolling_back]}
+        failure_code: {$ref: "#/components/schemas/HostingFailureCode"}
         metadata: {type: object, description: Redacted structured metadata.}
         created_at: {type: string, format: date-time}
 
@@ -2701,7 +2742,7 @@ components:
       type: object
       required: [external_project_id, desired_state]
       properties:
-        external_project_id: {type: string}
+        external_project_id: {$ref: "#/components/schemas/ExternalProjectId"}
         desired_state: {type: string, enum: [active, suspended]}
 
     KillSwitchInput:
@@ -2710,14 +2751,14 @@ components:
       required: [enabled, reason]
       properties:
         enabled: {type: boolean}
-        reason: {type: string, minLength: 3, maxLength: 500, pattern: '^[^\r\n]+$'}
+        reason: {type: string, minLength: 3, maxLength: 500, pattern: '^[^\u0000\r\n]+$'}
 
     KillSwitchState:
       type: object
       required: [scope, enabled, reason, updated_at]
       properties:
         scope: {type: string, enum: [global, project]}
-        external_project_id: {type: string}
+        external_project_id: {$ref: "#/components/schemas/ExternalProjectId"}
         enabled: {type: boolean}
         reason: {type: string, description: Redacted audit reason.}
         updated_at: {type: string, format: date-time}
@@ -2792,7 +2833,9 @@ components:
         resource_profiles:
           type: object
           additionalProperties: {$ref: "#/components/schemas/HostingWorkloadLimits"}
-        failure_codes: {type: array, items: {type: string}}
+        failure_codes:
+          type: array
+          items: {$ref: "#/components/schemas/HostingFailureCode"}
 
     HostingHeartbeat:
       type: object
@@ -2908,21 +2951,20 @@ components:
     HostingBuildJobRecipe:
       type: object
       additionalProperties: false
-      required: [operation, schema_version, external_project_id, external_deployment_id, repository, commit_sha, manifest_digest, artifact_digest, runtime, limits, release_root, source_artifact_url]
+      required: [operation, schema_version, external_project_id, external_deployment_id, repository, commit_sha, manifest_digest, artifact_digest, runtime, limits, source_artifact_url]
       description: Platform-generated static/Node recipe. No customer Dockerfile, shell, Compose, privilege, mount, or host-port field exists.
       properties:
         operation: {type: string, const: build}
         schema_version: {type: string, const: v1}
-        external_project_id: {type: string}
-        external_deployment_id: {type: string}
+        external_project_id: {$ref: "#/components/schemas/ExternalProjectId"}
+        external_deployment_id: {$ref: "#/components/schemas/ExternalDeploymentId"}
         repository: {$ref: "#/components/schemas/HostingProjectManifest/properties/repository"}
         commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
         manifest_digest: {$ref: "#/components/schemas/SHA256Digest"}
         artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
         runtime: {$ref: "#/components/schemas/HostingProjectManifest/properties/runtime"}
         limits: {$ref: "#/components/schemas/HostingWorkloadLimits"}
-        release_root: {type: string}
-        source_artifact_url: {type: string}
+        source_artifact_url: {type: string, pattern: '^/api/hosting-agent/v1/jobs/[1-9][0-9]*/source$'}
 
     HostingRestoreJobRecipe:
       type: object
@@ -2932,13 +2974,13 @@ components:
       properties:
         operation: {type: string, const: restore}
         schema_version: {type: string, const: v1}
-        external_project_id: {type: string}
-        external_deployment_id: {type: string}
+        external_project_id: {$ref: "#/components/schemas/ExternalProjectId"}
+        external_deployment_id: {$ref: "#/components/schemas/ExternalDeploymentId"}
         runtime: {$ref: "#/components/schemas/HostingProjectManifest/properties/runtime"}
         limits: {$ref: "#/components/schemas/HostingWorkloadLimits"}
         release_digest: {$ref: "#/components/schemas/SHA256Digest"}
         release_artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
-        release_artifact_url: {type: string}
+        release_artifact_url: {type: string, pattern: '^/api/hosting-agent/v1/recoveries/[1-9][0-9]*/artifact$'}
 
     HostingClaimedJob:
       type: object
@@ -3045,11 +3087,14 @@ components:
       properties:
         event_id: {type: string, pattern: '^evt_[a-f0-9]{32}$'}
         timestamp: {type: string, format: date-time}
-        external_project_id: {type: string}
-        external_deployment_id: {type: string}
+        external_project_id: {$ref: "#/components/schemas/ExternalProjectId"}
+        external_deployment_id: {$ref: "#/components/schemas/ExternalDeploymentId"}
         phase: {type: string}
         status: {type: string, enum: [active, failed, cancelled]}
-        failure_code: {type: string}
+        failure_code:
+          oneOf:
+            - {$ref: "#/components/schemas/HostingFailureCode"}
+            - {type: string, const: ''}
         artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
         release_digest:
           oneOf:
