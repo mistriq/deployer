@@ -41,3 +41,18 @@ until that edit settles, followed by a fresh baseline.
 Files initially unmodified are not inherited WIP. They still require review when
 they form part of a hosting boundary (notably runner/agent execution, logging,
 redaction, `SECURITY.md`, and `CHANGELOG.md`).
+
+## Current-goal re-audit — 2026-07-20
+
+The new goal began at commit `f623d34`. All tracked work from the earlier
+inventory had been integrated into four local commits and the tracked worktree
+was clean. The only untracked path was
+`deployer.db.bak-20260717-afterround-move`; it is unrelated, protected user data
+and was not opened, modified, staged or committed. Its inventory metadata was
+size 1,204,224 bytes and modification time 2026-07-17 05:57:13 +0200.
+
+The fresh baseline passed `go test ./...`, `go test -race ./...`, `go vet ./...`
+and `git diff --check`. The race suite completed in 113.021 seconds. The legacy
+trusted-admin tests remained green alongside the separate hosting tests.
+`govulncheck` was not installed; that verification gap is recorded in
+`BLOCKERS.md`.

@@ -4,11 +4,11 @@ The primary agent owns this checklist and updates it only after implementation a
 
 ## P0 — current WIP stabilization
 
-- [ ] Inventory every current modified/untracked file and classify complete/partial/failing/unrelated without discarding anything.
+- [x] Inventory every current modified/untracked file and classify complete/partial/failing/unrelated without discarding anything.
 - [x] Repair fresh DB and legacy migration expectations.
-- [ ] Establish green `test`, `race` and `vet` baseline before trusting inherited hosting changes.
-- [ ] Preserve legacy trusted-admin deployment behavior and tests.
-- [ ] Keep `deployer.db.bak-*` untracked and untouched unless the user explicitly decides otherwise.
+- [x] Establish green `test`, `race` and `vet` baseline before trusting inherited hosting changes.
+- [x] Preserve legacy trusted-admin deployment behavior and tests.
+- [x] Keep `deployer.db.bak-*` untracked and untouched unless the user explicitly decides otherwise.
 
 ## P0 — contract and security
 
@@ -77,7 +77,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [ ] Health failure preserves active release test.
 - [ ] Cancel, rollback, suspend/resume and restart recovery tests.
 - [ ] Forbidden workload and secret-redaction security tests.
-- [ ] Full `go test ./...`, `go test -race ./...`, `go vet ./...` and `git diff --check` pass.
+- [x] Full `go test ./...`, `go test -race ./...`, `go vet ./...` and `git diff --check` pass.
 - [ ] `govulncheck ./...` passes when available or blocker is documented.
 - [ ] No open P0/P1 issue and no demo/placeholder production path remains.
 - [ ] Real staging static + Node deployment, proxy activation and rollback pass; test fake alone is insufficient.
