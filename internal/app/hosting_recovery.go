@@ -66,14 +66,14 @@ func claimHostingRuntimeRecovery(ctx context.Context, runnerID int64) (*hostingC
 		}
 	}()
 	var state hostingRuntimeRecoveryState
-	var manifestJSON, secretsJSON string
+	var runtimeJSON, secretsJSON string
 	err = conn.QueryRowContext(ctx, `SELECT recovery.id, recovery.hosting_release_id,
 		release.hosting_deployment_id, release.hosting_project_id, release.runtime_runner_id,
 		recovery.lease_generation,
 		project.external_project_id, deployment.external_deployment_id, release.release_digest,
 		release.release_artifact_digest, artifact.artifact_path, artifact.size_bytes,
 		release.runtime_endpoint, recovery.required_cpu_millis, recovery.required_ram_bytes,
-		recovery.required_disk_bytes, recovery.required_pids, project.manifest_json, job.secret_refs_json,
+		recovery.required_disk_bytes, recovery.required_pids, release.runtime_manifest_json, job.secret_refs_json,
 		recovery.attempts
 		FROM hosting_runtime_recoveries recovery
 		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
@@ -94,15 +94,14 @@ func claimHostingRuntimeRecovery(ctx context.Context, runnerID int64) (*hostingC
 		&state.ExternalProjectID, &state.ExternalDeploymentID, &state.ReleaseDigest,
 		&state.ReleaseArtifactDigest, &state.ReleaseArtifactPath, &state.ReleaseArtifactSize,
 		&state.PreviousRuntimeEndpoint, &state.Limits.CPUMillis, &state.Limits.RAMBytes,
-		&state.Limits.DiskBytes, &state.Limits.PIDs, &manifestJSON, &secretsJSON, &state.Attempts)
+		&state.Limits.DiskBytes, &state.Limits.PIDs, &runtimeJSON, &secretsJSON, &state.Attempts)
 	if err == sql.ErrNoRows {
 		return nil, errNoHostingJob
 	}
 	if err != nil {
 		return nil, err
 	}
-	var manifest HostingProjectManifest
-	if err := json.Unmarshal([]byte(manifestJSON), &manifest); err != nil {
+	if err := json.Unmarshal([]byte(runtimeJSON), &state.Runtime); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(secretsJSON), &state.SecretRefs); err != nil {
@@ -141,7 +140,7 @@ func claimHostingRuntimeRecovery(ctx context.Context, runnerID int64) (*hostingC
 		SchemaVersion:         hostingRunnerProtocolVersion,
 		ExternalProjectID:     state.ExternalProjectID,
 		ExternalDeploymentID:  state.ExternalDeploymentID,
-		Runtime:               manifest.Runtime,
+		Runtime:               state.Runtime,
 		Limits:                state.Limits,
 		ReleaseDigest:         state.ReleaseDigest,
 		ReleaseArtifactDigest: state.ReleaseArtifactDigest,
@@ -173,7 +172,7 @@ func handleHostingAgentRecovery(w http.ResponseWriter, r *http.Request) {
 
 func authenticateHostingRecoveryLease(ctx context.Context, runnerID, recoveryID, generation int64, leaseToken string) (*hostingRuntimeRecoveryState, error) {
 	var state hostingRuntimeRecoveryState
-	var manifestJSON, secretsJSON string
+	var runtimeJSON, secretsJSON string
 	err := db.QueryRowContext(ctx, `SELECT recovery.id, recovery.hosting_release_id,
 		release.hosting_deployment_id, release.hosting_project_id, recovery.hosting_runner_id,
 		release.runtime_runner_id,
@@ -183,7 +182,7 @@ func authenticateHostingRecoveryLease(ctx context.Context, runnerID, recoveryID,
 		project.external_project_id, deployment.external_deployment_id, release.release_digest,
 		release.release_artifact_digest, artifact.artifact_path, artifact.size_bytes,
 		release.runtime_endpoint, recovery.required_cpu_millis, recovery.required_ram_bytes,
-		recovery.required_disk_bytes, recovery.required_pids, project.manifest_json, job.secret_refs_json
+		recovery.required_disk_bytes, recovery.required_pids, release.runtime_manifest_json, job.secret_refs_json
 		FROM hosting_runtime_recoveries recovery
 		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
 		JOIN hosting_release_artifacts artifact ON artifact.artifact_digest=release.release_artifact_digest
@@ -199,15 +198,13 @@ func authenticateHostingRecoveryLease(ctx context.Context, runnerID, recoveryID,
 		&state.ExternalProjectID, &state.ExternalDeploymentID,
 		&state.ReleaseDigest, &state.ReleaseArtifactDigest, &state.ReleaseArtifactPath,
 		&state.ReleaseArtifactSize, &state.PreviousRuntimeEndpoint, &state.Limits.CPUMillis,
-		&state.Limits.RAMBytes, &state.Limits.DiskBytes, &state.Limits.PIDs, &manifestJSON, &secretsJSON)
+		&state.Limits.RAMBytes, &state.Limits.DiskBytes, &state.Limits.PIDs, &runtimeJSON, &secretsJSON)
 	if err != nil {
 		return nil, err
 	}
-	var manifest HostingProjectManifest
-	if err := json.Unmarshal([]byte(manifestJSON), &manifest); err != nil {
+	if err := json.Unmarshal([]byte(runtimeJSON), &state.Runtime); err != nil {
 		return nil, err
 	}
-	state.Runtime = manifest.Runtime
 	if err := json.Unmarshal([]byte(secretsJSON), &state.SecretRefs); err != nil {
 		return nil, err
 	}

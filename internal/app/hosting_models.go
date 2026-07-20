@@ -472,6 +472,16 @@ func applyHostingMigrations() error {
 				`ALTER TABLE hosting_jobs ADD COLUMN completion_fingerprint TEXT NOT NULL DEFAULT ''`,
 			},
 		},
+		{
+			id: "033_hosting_release_runtime_snapshot",
+			statements: []string{
+				`ALTER TABLE hosting_releases ADD COLUMN runtime_manifest_json TEXT NOT NULL DEFAULT '{}'`,
+				`UPDATE hosting_releases SET runtime_manifest_json=COALESCE((
+					SELECT json_extract(job.recipe_json, '$.runtime') FROM hosting_jobs job
+					WHERE job.hosting_deployment_id=hosting_releases.hosting_deployment_id
+				), '{}')`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {

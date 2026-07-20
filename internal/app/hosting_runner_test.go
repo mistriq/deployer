@@ -273,13 +273,23 @@ func TestHostingHeartbeatCannotEraseOutstandingReservations(t *testing.T) {
 func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
-	_, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRESTORX", "deployment_01JRESTORX")
+	project, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRESTORX", "deployment_01JRESTORX")
 	releaseDigest := "sha256:" + strings.Repeat("6", 64)
 	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
 	completion := hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
 		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.70.0.1:3000",
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1), "status_code": float64(200)}}
 	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err != nil {
+		t.Fatal(err)
+	}
+	updatedManifest := project.Manifest
+	updatedManifest.Runtime.HealthPath = "/new-health-contract"
+	manifestJSON, manifestDigest, err := manifestJSONAndDigest(updatedManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_projects SET manifest_json=?, manifest_digest=? WHERE id=?`,
+		manifestJSON, manifestDigest, project.ID); err != nil {
 		t.Fatal(err)
 	}
 	limits, _ := hostingLimitsForProfile("starter")
@@ -366,7 +376,7 @@ func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) 
 		t.Fatalf("claim runtime recovery: %v", err)
 	}
 	if recovery.Recipe.Operation != "restore" || recovery.Recipe.ReleaseDigest != releaseDigest ||
-		recovery.Recipe.ReleaseArtifactDigest != artifactDigest {
+		recovery.Recipe.ReleaseArtifactDigest != artifactDigest || recovery.Recipe.Runtime.HealthPath != "/healthz" {
 		t.Fatalf("recovery recipe = %+v", recovery.Recipe)
 	}
 	encodedRecipe, err := json.Marshal(recovery.Recipe)

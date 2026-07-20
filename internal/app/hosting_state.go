@@ -678,18 +678,17 @@ func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID
 	}
 	var release HostingRelease
 	var createdAt string
-	var runnerStatus string
+	var runnerStatus, runtimeJSON string
 	var runnerLastSeen sql.NullString
 	err = db.QueryRowContext(ctx, `SELECT r.release_digest, d.external_deployment_id, r.commit_sha,
 		r.artifact_digest, r.status, r.route_revision, r.previous_release_digest, r.runtime_endpoint,
-		r.created_at, hr.status, hr.last_seen FROM hosting_releases r
+		r.created_at, hr.status, hr.last_seen, r.runtime_manifest_json FROM hosting_releases r
 		JOIN hosting_deployments d ON d.id=r.hosting_deployment_id
-		JOIN hosting_jobs j ON j.hosting_deployment_id=d.id
-		JOIN hosting_runners hr ON hr.id=j.hosting_runner_id
+		JOIN hosting_runners hr ON hr.id=r.runtime_runner_id
 		WHERE r.hosting_project_id=? AND r.release_digest=?`, project.ID, digest).Scan(
 		&release.Digest, &release.ExternalDeploymentID, &release.CommitSHA, &release.ArtifactDigest,
 		&release.Status, &release.RouteRevision, &release.PreviousRelease, &release.RuntimeEndpoint,
-		&createdAt, &runnerStatus, &runnerLastSeen)
+		&createdAt, &runnerStatus, &runnerLastSeen, &runtimeJSON)
 	if err == sql.ErrNoRows {
 		return nil, false, &hostingAPIError{Code: errCodeReleaseNotFound, Message: "release not found", StatusCode: 404}
 	}
@@ -705,7 +704,11 @@ func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID
 	if runnerStatus != "online" || !runnerLastSeen.Valid || parseSQLiteTime(runnerLastSeen.String).Before(time.Now().UTC().Add(-hostingRunnerStaleAfter)) {
 		return nil, false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "release runner is not live", StatusCode: http.StatusConflict}
 	}
-	healthPath := project.Manifest.Runtime.HealthPath
+	var releaseRuntime HostingRuntimeManifest
+	if err := json.Unmarshal([]byte(runtimeJSON), &releaseRuntime); err != nil {
+		return nil, false, fmt.Errorf("decode immutable release runtime: %w", err)
+	}
+	healthPath := releaseRuntime.HealthPath
 	if healthPath == "" {
 		healthPath = "/"
 	}

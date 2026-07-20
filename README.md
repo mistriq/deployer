@@ -379,7 +379,8 @@ storage. Heartbeats reconcile exact project/deployment release instances. If
 an active runner is lost, a generation-fenced recovery lease downloads that
 retained image, verifies both archive and image identity, starts and health
 checks it without rebuilding customer source, and switches the private adapter
-through a durable idempotent operation.
+through a durable idempotent operation. Restore and rollback use the immutable
+runtime/health snapshot stored with the release, not a later project manifest.
 
 Restore is explicitly negotiated through the runner `operations` capability.
 Legacy v1 agents that omit it are treated as build-only and never receive a

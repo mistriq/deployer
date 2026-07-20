@@ -273,11 +273,11 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
 		}
 	}()
-	var status string
+	var status, recipeJSON string
 	var cancelRequested sql.NullString
-	err = conn.QueryRowContext(ctx, `SELECT status, cancel_requested_at FROM hosting_jobs
+	err = conn.QueryRowContext(ctx, `SELECT status, cancel_requested_at, recipe_json FROM hosting_jobs
 		WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=? AND lease_expires_at>?`,
-		state.JobID, state.RunnerID, state.LeaseGeneration, state.LeaseTokenHash, formatSQLiteTime(now)).Scan(&status, &cancelRequested)
+		state.JobID, state.RunnerID, state.LeaseGeneration, state.LeaseTokenHash, formatSQLiteTime(now)).Scan(&status, &cancelRequested, &recipeJSON)
 	if err != nil {
 		return err
 	}
@@ -286,6 +286,14 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 	}
 	if status != "leased" && status != "running" {
 		return &hostingAPIError{Code: errCodeConflict, Message: "hosting job is no longer running", StatusCode: http.StatusConflict}
+	}
+	var recipe hostingJobRecipe
+	if err := json.Unmarshal([]byte(recipeJSON), &recipe); err != nil {
+		return fmt.Errorf("decode immutable hosting recipe: %w", err)
+	}
+	runtimeJSON, err := json.Marshal(recipe.Runtime)
+	if err != nil {
+		return fmt.Errorf("encode immutable runtime manifest: %w", err)
 	}
 	artifactInfo, err := currentArtifactStorage().Stat(state.ReleaseUploadPath)
 	if err != nil || artifactInfo.Size() != state.ReleaseUploadSize {
@@ -315,10 +323,10 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 	if err == sql.ErrNoRows {
 		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_releases
 			(hosting_project_id, hosting_deployment_id, release_digest, release_artifact_digest, commit_sha, artifact_digest,
-			 status, health_evidence_json, previous_release_digest, runtime_endpoint, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, 'healthy', ?, ?, ?, ?)`, state.ProjectID, state.DeploymentID,
+			 status, health_evidence_json, previous_release_digest, runtime_endpoint, runtime_manifest_json, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, 'healthy', ?, ?, ?, ?, ?)`, state.ProjectID, state.DeploymentID,
 			input.ReleaseDigest, input.ReleaseArtifactDigest, state.CommitSHA, state.ArtifactDigest, string(healthJSON),
-			state.PreviousReleaseDigest, input.RuntimeEndpoint, formatSQLiteTime(now)); err != nil {
+			state.PreviousReleaseDigest, input.RuntimeEndpoint, string(runtimeJSON), formatSQLiteTime(now)); err != nil {
 			return err
 		}
 	}

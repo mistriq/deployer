@@ -18,6 +18,8 @@
 - Add immutable health-gated activation through the private versioned proxy
   adapter client, selected-release rollback, suspend/resume, and compensation
   when cancellation races activation.
+- Persist an immutable runtime-manifest snapshot per release and use it for
+  rollback health gates and retained-image recovery after later manifest edits.
 - Add a transactional signed callback outbox with retries, dead-letter state,
   polling reconciliation, runner-loss recovery/reassignment, and deterministic
   retry exhaustion.

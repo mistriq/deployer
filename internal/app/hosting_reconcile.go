@@ -180,7 +180,7 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 func reconcileHostingRollbackOperations(ctx context.Context) error {
 	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.status, op.release_digest,
 		op.runtime_endpoint, op.expected_previous_release_digest, op.route_revision,
-		op.hosting_project_id, p.external_project_id, d.external_deployment_id, p.manifest_json,
+		op.hosting_project_id, p.external_project_id, d.external_deployment_id, target.runtime_manifest_json,
 		COALESCE(previous.runtime_endpoint, '')
 		FROM hosting_proxy_operations op
 		JOIN hosting_projects p ON p.id=op.hosting_project_id
@@ -238,11 +238,11 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 			continue
 		}
 		if operation.status == "pending" {
-			var manifest HostingProjectManifest
-			if err := json.Unmarshal([]byte(operation.manifestJSON), &manifest); err != nil {
+			var runtime HostingRuntimeManifest
+			if err := json.Unmarshal([]byte(operation.manifestJSON), &runtime); err != nil {
 				return err
 			}
-			healthPath := manifest.Runtime.HealthPath
+			healthPath := runtime.HealthPath
 			if healthPath == "" {
 				healthPath = "/"
 			}

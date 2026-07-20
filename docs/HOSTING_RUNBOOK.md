@@ -82,7 +82,9 @@ be rejected.
 An active release has passed the candidate health gate and has an adapter route
 revision. A failed build, health check, or activation leaves the prior active
 release unchanged. Rollback accepts any retained `healthy`, `inactive`, or
-already `active` release with a verified private runtime endpoint.
+already `active` release with a verified private runtime endpoint. Each release
+stores the runtime/health contract from its original deployment recipe;
+subsequent project-manifest updates do not change rollback or restore behavior.
 
 ## Queue, capacity, and runner loss
 
@@ -111,7 +113,8 @@ is durable, but the late adapter-response ordering gap below remains open.
 For an already active release, runner loss creates a separate durable recovery
 record. A compatible runner downloads the retained Docker image archive through
 the recovery lease, verifies the archive digest and loaded image ID, starts the
-runtime with the original limits and private bind policy, and reports health
+runtime with the release's immutable runtime snapshot, original limits and
+private bind policy, and reports health
 evidence. Adapter activation is persisted before the external call and is
 reconciled after a Deployer restart. A stale recovery generation is fenced; a
 project suspension or kill switch records durable cancellation intent for
