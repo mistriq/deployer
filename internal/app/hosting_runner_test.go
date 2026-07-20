@@ -946,6 +946,59 @@ func TestHostingReleaseArtifactUploadIsLeaseFencedAndDigestVerified(t *testing.T
 	}
 }
 
+func TestHostingReleaseArtifactAttachmentIsCASUnderConcurrency(t *testing.T) {
+	withTempDB(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JARTCAS", "deployment_01JARTCAS")
+	type candidate struct {
+		release, artifact, path string
+		size                    int64
+	}
+	candidates := []candidate{
+		{release: "sha256:" + strings.Repeat("a", 64), artifact: "sha256:" + strings.Repeat("b", 64), path: managedArtifactPath("hosting-release-" + strings.Repeat("b", 64) + ".tar"), size: 101},
+		{release: "sha256:" + strings.Repeat("c", 64), artifact: "sha256:" + strings.Repeat("d", 64), path: managedArtifactPath("hosting-release-" + strings.Repeat("d", 64) + ".tar"), size: 202},
+	}
+	type outcome struct {
+		candidate candidate
+		err       error
+	}
+	const workers = 32
+	start := make(chan struct{})
+	results := make(chan outcome, workers)
+	var wait sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		input := candidates[i%len(candidates)]
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			err := attachHostingReleaseArtifact(context.Background(), runnerID, job.JobID,
+				job.LeaseGeneration, job.LeaseToken, input.release, input.artifact, input.path, input.size)
+			results <- outcome{candidate: input, err: err}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	var stored candidate
+	if err := db.QueryRow(`SELECT release_upload_release_digest, release_upload_digest,
+		release_upload_path, release_upload_size FROM hosting_jobs WHERE id=?`, job.JobID).Scan(
+		&stored.release, &stored.artifact, &stored.path, &stored.size); err != nil {
+		t.Fatal(err)
+	}
+	for result := range results {
+		if result.candidate == stored {
+			if result.err != nil {
+				t.Fatalf("identical CAS replay failed: %v", result.err)
+			}
+			continue
+		}
+		var apiErr *hostingAPIError
+		if !errors.As(result.err, &apiErr) || apiErr.Code != errCodeConflict {
+			t.Fatalf("losing CAS result=%+v err=%v", result.candidate, result.err)
+		}
+	}
+}
+
 func TestContentIdenticalRedeploymentCreatesDistinctReleaseInstances(t *testing.T) {
 	withTempDB(t)
 	withFakeProxy(t)

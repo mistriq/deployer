@@ -111,6 +111,8 @@ capacity is restored exactly once and uncancelled work is transactionally
 placed on another compatible runner. After three lost attempts, the deployment
 terminates with `runner_lost` and emits the usual callback. Cancellation intent
 is durable, but the late adapter-response ordering gap below remains open.
+Release artifact attachment is also generation-fenced and compare-and-swap;
+an identical upload is a safe replay and a different artifact conflicts.
 
 For an already active release, runner loss creates a separate durable recovery
 record. A compatible runner downloads the retained Docker image archive through

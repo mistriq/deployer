@@ -695,19 +695,47 @@ func handleHostingJobReleaseArtifact(w http.ResponseWriter, r *http.Request, job
 		return
 	}
 	committed = true
-	result, err := db.ExecContext(r.Context(), `UPDATE hosting_jobs SET release_upload_digest=?,
-		release_upload_release_digest=?, release_upload_path=?, release_upload_size=? WHERE id=? AND hosting_runner_id=?
-		AND lease_generation=? AND lease_token_hash=? AND status IN ('leased','running') AND lease_expires_at>?`,
-		artifactDigest, releaseDigest, path, written, jobID, runner.ID, generation, hashToken(token), formatSQLiteTime(time.Now().UTC()))
-	if err != nil {
-		jsonErrorCode(w, errCodeInternal, "attach release artifact failed", http.StatusInternalServerError)
-		return
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		jsonErrorCode(w, errCodeJobForbidden, "hosting job lease changed during upload", http.StatusForbidden)
+	if err := attachHostingReleaseArtifact(r.Context(), runner.ID, jobID, generation, token,
+		releaseDigest, artifactDigest, path, written); err != nil {
+		var apiErr *hostingAPIError
+		if errorsAsHosting(err, &apiErr) {
+			writeHostingAPIError(w, apiErr)
+		} else {
+			jsonErrorCode(w, errCodeInternal, "attach release artifact failed", http.StatusInternalServerError)
+		}
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func attachHostingReleaseArtifact(ctx context.Context, runnerID, jobID, generation int64, leaseToken,
+	releaseDigest, artifactDigest, path string, size int64) error {
+	now := formatSQLiteTime(time.Now().UTC())
+	result, err := db.ExecContext(ctx, `UPDATE hosting_jobs SET release_upload_digest=?,
+		release_upload_release_digest=?, release_upload_path=?, release_upload_size=?
+		WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?
+		AND status IN ('leased','running') AND lease_expires_at>? AND release_upload_digest=''`,
+		artifactDigest, releaseDigest, path, size, jobID, runnerID, generation, hashToken(leaseToken), now)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 1 {
+		return nil
+	}
+	var storedRelease, storedArtifact, storedPath, status, expires string
+	var storedSize int64
+	err = db.QueryRowContext(ctx, `SELECT release_upload_release_digest, release_upload_digest,
+		release_upload_path, release_upload_size, status, COALESCE(lease_expires_at, '')
+		FROM hosting_jobs WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?`,
+		jobID, runnerID, generation, hashToken(leaseToken)).Scan(&storedRelease, &storedArtifact,
+		&storedPath, &storedSize, &status, &expires)
+	if err != nil || (status != "leased" && status != "running") || expires == "" || !parseSQLiteTime(expires).After(time.Now().UTC()) {
+		return &hostingAPIError{Code: errCodeJobForbidden, Message: "hosting job lease changed during upload", StatusCode: http.StatusForbidden, Err: err}
+	}
+	if storedRelease == releaseDigest && storedArtifact == artifactDigest && storedPath == path && storedSize == size {
+		return nil
+	}
+	return &hostingAPIError{Code: errCodeConflict, Message: "a different release artifact is already attached to this lease", StatusCode: http.StatusConflict}
 }
 
 func authenticateHostingJobLease(ctx context.Context, runnerID, jobID, generation int64, leaseToken string) (int64, int64, error) {

@@ -277,12 +277,11 @@ func (s localArtifactStorage) PrepareUpload(path string) (string, io.WriteCloser
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return "", nil, err
 	}
-	tmpPath := filepath.Join(filepath.Dir(path), filepath.Base(path)+".uploading")
-	out, err := os.Create(tmpPath)
+	out, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".uploading-*")
 	if err != nil {
 		return "", nil, err
 	}
-	return tmpPath, out, nil
+	return out.Name(), out, nil
 }
 
 func commitManagedArtifactUpload(tmpPath, path string) error {

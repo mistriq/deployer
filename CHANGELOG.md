@@ -15,6 +15,8 @@
 - Fence normal hosting-job completion with a durable payload fingerprint so a
   conflicting terminal report cannot race candidate activation or replay as
   success.
+- Make release artifact uploads use unique temporary files and lease-fenced
+  compare-and-swap attachment with exact replay validation.
 - Add immutable health-gated activation through the private versioned proxy
   adapter client, selected-release rollback, suspend/resume, and compensation
   when cancellation races activation.
