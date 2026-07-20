@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -244,5 +246,110 @@ func TestHostingAgentCompletionPersistsAcrossControlPlaneFailure(t *testing.T) {
 	entries, err = os.ReadDir(hostingAgentCompletionDir(config))
 	if err != nil || len(entries) != 0 || delivered.FailureCode != "build_failed" {
 		t.Fatalf("completion retry entries=%d delivered=%+v err=%v", len(entries), delivered, err)
+	}
+}
+
+func TestHostingAgentRestoreUsesRecoveryContractAndRetainedArtifact(t *testing.T) {
+	oldArtifactClient := agentArtifactClient
+	oldControlClient := agentControlClient
+	t.Cleanup(func() {
+		agentArtifactClient = oldArtifactClient
+		agentControlClient = oldControlClient
+	})
+	artifact := []byte("retained docker image archive")
+	hash := sha256.Sum256(artifact)
+	artifactDigest := "sha256:" + hex.EncodeToString(hash[:])
+	releaseDigest := "sha256:" + strings.Repeat("d", 64)
+	var artifactRequests, logRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/hosting-agent/v1/recoveries/77/artifact":
+			artifactRequests++
+			if r.Header.Get("X-Deployer-Lease-Generation") != "4" || r.Header.Get("X-Deployer-Lease-Token") != "recovery-lease" {
+				t.Errorf("artifact request missing recovery lease fencing")
+			}
+			w.Write(artifact)
+		case r.URL.Path == "/api/hosting-agent/v1/recoveries/77/logs":
+			logRequests++
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	agentArtifactClient = server.Client()
+	agentControlClient = server.Client()
+	var healthPort int
+	if _, err := fmt.Sscanf(server.URL, "http://127.0.0.1:%d", &healthPort); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	commandLog := filepath.Join(directory, "docker.log")
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+if [ "$1" = "image" ] && [ "$2" = "load" ]; then
+  printf 'Loaded image ID: %s\n'
+elif [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  printf '%s\n'
+elif [ "$1" = "inspect" ]; then
+  printf 'Error: No such object\n' >&2
+  exit 1
+elif [ "$1" = "run" ]; then
+  printf 'container-id\n'
+elif [ "$1" = "port" ]; then
+  printf '127.0.0.1:%d\n'
+fi
+`, commandLog, releaseDigest, releaseDigest, healthPort)
+	if err := os.WriteFile(filepath.Join(directory, "docker"), []byte(script), 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	job := &hostingClaimedJob{JobID: 77, LeaseGeneration: 4, LeaseToken: "recovery-lease", Recipe: hostingJobRecipe{
+		Operation: "restore", ExternalProjectID: "project_01JRESTORE", ExternalDeploymentID: "deployment_01JRESTORE",
+		Runtime:       HostingRuntimeManifest{Kind: "node", Port: 3000, HealthPath: "/"},
+		Limits:        hostingWorkloadLimits{CPUMillis: 250, RAMBytes: 128 << 20, DiskBytes: 512 << 20, PIDs: 64},
+		ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
+		ReleaseArtifactURL: "/api/hosting-agent/v1/recoveries/77/artifact",
+	}}
+	completion := runHostingWorkload(t.Context(), hostingAgentConfig{ServerURL: server.URL, Token: "runner-token",
+		WorkRoot: t.TempDir(), RuntimeBindAddress: "127.0.0.1"}, job)
+	if completion.Status != "success" || completion.ReleaseDigest != releaseDigest || completion.ReleaseArtifactDigest != artifactDigest {
+		t.Fatalf("restore completion = %+v", completion)
+	}
+	commands, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(commands)
+	if !strings.Contains(text, "image load --input") || !strings.Contains(text, "run -d") ||
+		!strings.Contains(text, "--cap-drop=ALL") || !strings.Contains(text, "127.0.0.1::3000") ||
+		strings.Contains(text, " build ") {
+		t.Fatalf("unexpected restore docker commands:\n%s", text)
+	}
+	if artifactRequests != 1 || logRequests == 0 {
+		t.Fatalf("recovery requests artifact=%d logs=%d", artifactRequests, logRequests)
+	}
+}
+
+func TestHostingAgentRestoreCompletionUsesRecoveryEndpoint(t *testing.T) {
+	workRoot := t.TempDir()
+	var path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	config := hostingAgentConfig{ServerURL: server.URL, Token: "htr_test", WorkRoot: workRoot}
+	job := &hostingClaimedJob{JobID: 9, LeaseGeneration: 2, LeaseToken: "lease", Recipe: hostingJobRecipe{Operation: "restore"}}
+	if err := queueHostingAgentCompletion(config, job, hostingCompletionRequest{Status: "failed", FailureCode: "runner_lost"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := flushHostingAgentCompletions(t.Context(), config); err != nil {
+		t.Fatal(err)
+	}
+	if path != "/api/hosting-agent/v1/recoveries/9/complete" {
+		t.Fatalf("completion path = %q", path)
 	}
 }

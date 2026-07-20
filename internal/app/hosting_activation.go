@@ -12,6 +12,7 @@ import (
 
 var allowedHostingFailureCodes = map[string]struct{}{
 	"artifact_digest_mismatch":   {},
+	"artifact_unavailable":       {},
 	"build_failed":               {},
 	"build_timeout":              {},
 	"cancelled":                  {},
@@ -353,8 +354,9 @@ func activateHealthyHostingRelease(ctx context.Context, state *hostingCompletion
 		return false, err
 	}
 	result, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?, activated_at=?,
-		deactivated_at=NULL WHERE hosting_project_id=? AND hosting_deployment_id=? AND release_digest=? AND status='healthy'`,
-		routeRevision, formatSQLiteTime(now), state.ProjectID, state.DeploymentID, releaseDigest)
+		deactivated_at=NULL, runtime_runner_id=?, runtime_generation=runtime_generation+1
+		WHERE hosting_project_id=? AND hosting_deployment_id=? AND release_digest=? AND status='healthy'`,
+		routeRevision, formatSQLiteTime(now), state.RunnerID, state.ProjectID, state.DeploymentID, releaseDigest)
 	if err != nil {
 		return false, err
 	}

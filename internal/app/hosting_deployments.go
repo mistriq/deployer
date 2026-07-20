@@ -42,17 +42,21 @@ type hostingWorkloadLimits struct {
 }
 
 type hostingJobRecipe struct {
-	SchemaVersion        string                    `json:"schema_version"`
-	ExternalProjectID    string                    `json:"external_project_id"`
-	ExternalDeploymentID string                    `json:"external_deployment_id"`
-	Repository           HostingRepositoryManifest `json:"repository"`
-	CommitSHA            string                    `json:"commit_sha"`
-	ManifestDigest       string                    `json:"manifest_digest"`
-	ArtifactDigest       string                    `json:"artifact_digest"`
-	Runtime              HostingRuntimeManifest    `json:"runtime"`
-	Limits               hostingWorkloadLimits     `json:"limits"`
-	ReleaseRoot          string                    `json:"release_root"`
-	SourceArtifactURL    string                    `json:"source_artifact_url"`
+	Operation             string                    `json:"operation"`
+	SchemaVersion         string                    `json:"schema_version"`
+	ExternalProjectID     string                    `json:"external_project_id"`
+	ExternalDeploymentID  string                    `json:"external_deployment_id"`
+	Repository            HostingRepositoryManifest `json:"repository"`
+	CommitSHA             string                    `json:"commit_sha"`
+	ManifestDigest        string                    `json:"manifest_digest"`
+	ArtifactDigest        string                    `json:"artifact_digest"`
+	Runtime               HostingRuntimeManifest    `json:"runtime"`
+	Limits                hostingWorkloadLimits     `json:"limits"`
+	ReleaseRoot           string                    `json:"release_root"`
+	SourceArtifactURL     string                    `json:"source_artifact_url"`
+	ReleaseDigest         string                    `json:"release_digest,omitempty"`
+	ReleaseArtifactDigest string                    `json:"release_artifact_digest,omitempty"`
+	ReleaseArtifactURL    string                    `json:"release_artifact_url,omitempty"`
 }
 
 type hostingCreateResult struct {
@@ -277,6 +281,7 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 	}
 
 	recipe := hostingJobRecipe{
+		Operation:            "build",
 		SchemaVersion:        hostingRunnerProtocolVersion,
 		ExternalProjectID:    project.ExternalProjectID,
 		ExternalDeploymentID: request.ExternalDeploymentID,

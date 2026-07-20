@@ -259,7 +259,7 @@ func executeHostingAgentJob(config hostingAgentConfig, job *hostingClaimedJob) {
 				return
 			case <-ticker.C:
 				var state map[string]bool
-				if err := hostingAgentJSON(ctx, config, http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/heartbeat", job.JobID), nil, &state, headers); err != nil {
+				if err := hostingAgentJSON(ctx, config, http.MethodPost, hostingAgentWorkPath(job, "heartbeat"), nil, &state, headers); err != nil {
 					controlPlaneUnavailable.Store(true)
 					cancel()
 					return
@@ -293,6 +293,7 @@ func executeHostingAgentJob(config hostingAgentConfig, job *hostingClaimedJob) {
 }
 
 type hostingAgentCompletionEnvelope struct {
+	Operation       string                   `json:"operation,omitempty"`
 	JobID           int64                    `json:"job_id"`
 	LeaseGeneration int64                    `json:"lease_generation"`
 	LeaseToken      string                   `json:"lease_token"`
@@ -308,12 +309,13 @@ func queueHostingAgentCompletion(config hostingAgentConfig, job *hostingClaimedJ
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return err
 	}
-	envelope := hostingAgentCompletionEnvelope{JobID: job.JobID, LeaseGeneration: job.LeaseGeneration, LeaseToken: job.LeaseToken, Completion: completion}
+	envelope := hostingAgentCompletionEnvelope{Operation: job.Recipe.Operation, JobID: job.JobID, LeaseGeneration: job.LeaseGeneration, LeaseToken: job.LeaseToken, Completion: completion}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(directory, fmt.Sprintf("job-%d-%d.json", job.JobID, job.LeaseGeneration))
+	operation := hostingAgentOperation(job)
+	path := filepath.Join(directory, fmt.Sprintf("%s-%d-%d.json", operation, job.JobID, job.LeaseGeneration))
 	temporary := path + ".tmp"
 	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
@@ -359,10 +361,19 @@ func flushHostingAgentCompletions(ctx context.Context, config hostingAgentConfig
 			"X-Deployer-Lease-Generation": strconv.FormatInt(envelope.LeaseGeneration, 10),
 			"X-Deployer-Lease-Token":      envelope.LeaseToken,
 		}
-		status, deliveryErr := hostingAgentJSONStatus(ctx, config, http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/complete", envelope.JobID), envelope.Completion, nil, headers)
+		group := "jobs"
+		if envelope.Operation == "restore" {
+			group = "recoveries"
+		}
+		status, deliveryErr := hostingAgentJSONStatus(ctx, config, http.MethodPost,
+			fmt.Sprintf("/api/hosting-agent/v1/%s/%d/complete", group, envelope.JobID), envelope.Completion, nil, headers)
 		if deliveryErr != nil {
 			if status == http.StatusBadRequest || status == http.StatusForbidden || status == http.StatusNotFound {
-				return fmt.Errorf("persisted completion was permanently rejected with HTTP %d: %w", status, deliveryErr)
+				logOperationalError("discard permanently fenced hosting completion", deliveryErr)
+				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+				continue
 			}
 			return deliveryErr
 		}
@@ -373,6 +384,21 @@ func flushHostingAgentCompletions(ctx context.Context, config hostingAgentConfig
 	return nil
 }
 
+func hostingAgentOperation(job *hostingClaimedJob) string {
+	if job != nil && job.Recipe.Operation == "restore" {
+		return "restore"
+	}
+	return "build"
+}
+
+func hostingAgentWorkPath(job *hostingClaimedJob, suffix string) string {
+	group := "jobs"
+	if hostingAgentOperation(job) == "restore" {
+		group = "recoveries"
+	}
+	return fmt.Sprintf("/api/hosting-agent/v1/%s/%d/%s", group, job.JobID, suffix)
+}
+
 func hostingLeaseHeaders(job *hostingClaimedJob) map[string]string {
 	return map[string]string{
 		"X-Deployer-Lease-Generation": strconv.FormatInt(job.LeaseGeneration, 10),
@@ -381,6 +407,9 @@ func hostingLeaseHeaders(job *hostingClaimedJob) map[string]string {
 }
 
 func runHostingWorkload(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob) hostingCompletionRequest {
+	if hostingAgentOperation(job) == "restore" {
+		return runHostingRestoreWorkload(ctx, config, job)
+	}
 	fail := func(code string, err error) hostingCompletionRequest {
 		return hostingCompletionRequest{Status: "failed", FailureCode: code, FailureMessage: redactSecrets(err.Error())}
 	}
@@ -455,7 +484,51 @@ func runHostingWorkload(ctx context.Context, config hostingAgentConfig, job *hos
 	if err := reportHostingPhase(ctx, config, job, hostingPhaseStarting); err != nil {
 		return fail("runtime_start_failed", err)
 	}
+	return startHostingRuntime(ctx, config, job, imageTag, releaseDigest, releaseArtifactDigest, true)
+}
+
+func runHostingRestoreWorkload(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob) hostingCompletionRequest {
+	fail := func(code string, err error) hostingCompletionRequest {
+		return hostingCompletionRequest{Status: "failed", FailureCode: code, FailureMessage: redactSecrets(err.Error())}
+	}
+	if !validSHA256Digest(job.Recipe.ReleaseDigest) || !validSHA256Digest(job.Recipe.ReleaseArtifactDigest) || job.Recipe.ReleaseArtifactURL == "" {
+		return fail("artifact_digest_mismatch", fmt.Errorf("recovery artifact identity is invalid"))
+	}
+	workDir := filepath.Join(config.WorkRoot, fmt.Sprintf("restore-%d-%d", job.JobID, job.LeaseGeneration))
+	if err := os.RemoveAll(workDir); err != nil {
+		return fail("workload_policy_violation", err)
+	}
+	if err := os.Mkdir(workDir, 0750); err != nil {
+		return fail("workload_policy_violation", err)
+	}
+	defer os.RemoveAll(workDir)
+	artifactPath := filepath.Join(workDir, "release-image.tar")
+	if err := downloadHostingArtifact(ctx, config, job, job.Recipe.ReleaseArtifactURL, artifactPath, "release"); err != nil {
+		return fail("artifact_unavailable", err)
+	}
+	if err := verifyFileDigest(artifactPath, job.Recipe.ReleaseArtifactDigest); err != nil {
+		return fail("artifact_digest_mismatch", err)
+	}
+	if err := runHostingCommand(ctx, config, job, "", "docker", "image", "load", "--input", artifactPath); err != nil {
+		return fail("release_persistence_failed", err)
+	}
+	imageID, err := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", job.Recipe.ReleaseDigest).Output()
+	if err != nil || strings.TrimSpace(string(imageID)) != job.Recipe.ReleaseDigest {
+		return fail("artifact_digest_mismatch", fmt.Errorf("loaded image identity does not match retained release"))
+	}
+	return startHostingRuntime(ctx, config, job, job.Recipe.ReleaseDigest, job.Recipe.ReleaseDigest,
+		job.Recipe.ReleaseArtifactDigest, false)
+}
+
+func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, imageRef,
+	releaseDigest, releaseArtifactDigest string, reportPhases bool) hostingCompletionRequest {
+	fail := func(code string, err error) hostingCompletionRequest {
+		return hostingCompletionRequest{Status: "failed", FailureCode: code, FailureMessage: redactSecrets(err.Error())}
+	}
 	containerName := "deployer-hosting-" + safeFileName(job.Recipe.ExternalDeploymentID)
+	if err := removeStaleHostingContainer(ctx, containerName, job.Recipe.ExternalProjectID, job.Recipe.ExternalDeploymentID); err != nil {
+		return fail("workload_policy_violation", err)
+	}
 	containerPort := job.Recipe.Runtime.Port
 	if job.Recipe.Runtime.Kind == "static" {
 		containerPort = 8080
@@ -468,7 +541,7 @@ func runHostingWorkload(ctx context.Context, config hostingAgentConfig, job *hos
 	for index, reference := range job.SecretRefs {
 		runArgs = append(runArgs, "--env", fmt.Sprintf("DEPLOYER_SECRET_REF_%d=%s", index, reference.Reference), "--env", fmt.Sprintf("DEPLOYER_SECRET_PROVIDER_%d=%s", index, reference.Provider))
 	}
-	runArgs = append(runArgs, imageTag)
+	runArgs = append(runArgs, imageRef)
 	if err := runHostingCommand(ctx, config, job, "", "docker", runArgs...); err != nil {
 		return fail("runtime_start_failed", err)
 	}
@@ -491,8 +564,10 @@ func runHostingWorkload(ctx context.Context, config hostingAgentConfig, job *hos
 		healthPath = "/"
 	}
 	endpoint := fmt.Sprintf("http://%s:%d", config.RuntimeBindAddress, hostPort)
-	if err := reportHostingPhase(ctx, config, job, hostingPhaseHealth); err != nil {
-		return fail("health_check_failed", err)
+	if reportPhases {
+		if err := reportHostingPhase(ctx, config, job, hostingPhaseHealth); err != nil {
+			return fail("health_check_failed", err)
+		}
 	}
 	attempts, statusCode, err := checkHostingCandidateHealth(ctx, endpoint+healthPath)
 	if err != nil {
@@ -500,6 +575,27 @@ func runHostingWorkload(ctx context.Context, config hostingAgentConfig, job *hos
 	}
 	keepContainer = true
 	return hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: releaseArtifactDigest, RuntimeEndpoint: endpoint, HealthEvidence: map[string]any{"healthy": true, "attempts": attempts, "status_code": statusCode}}
+}
+
+func removeStaleHostingContainer(ctx context.Context, containerName, externalProjectID, externalDeploymentID string) error {
+	output, err := exec.CommandContext(ctx, "docker", "inspect", "--format",
+		`{{index .Config.Labels "light-apps.hosting.managed"}}\t{{index .Config.Labels "light-apps.hosting.project"}}\t{{index .Config.Labels "light-apps.hosting.deployment"}}`,
+		containerName).CombinedOutput()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && strings.Contains(strings.ToLower(string(output)), "no such") {
+			return nil
+		}
+		return fmt.Errorf("inspect existing hosting container: %w", err)
+	}
+	fields := strings.Split(strings.TrimSpace(string(output)), "\t")
+	if len(fields) != 3 || fields[0] != "true" || fields[1] != externalProjectID || fields[2] != externalDeploymentID {
+		return fmt.Errorf("refusing to replace container with mismatched ownership labels")
+	}
+	if err := exec.CommandContext(ctx, "docker", "rm", "-f", containerName).Run(); err != nil {
+		return fmt.Errorf("remove stale managed hosting container: %w", err)
+	}
+	return nil
 }
 
 func uploadHostingReleaseArtifact(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, releaseDigest, artifactDigest, path string) error {
@@ -575,7 +671,11 @@ func reconcileHostingAgentReleases(ctx context.Context, retained []hostingRetain
 }
 
 func downloadHostingSource(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, destination string) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, config.ServerURL+job.Recipe.SourceArtifactURL, nil)
+	return downloadHostingArtifact(ctx, config, job, job.Recipe.SourceArtifactURL, destination, "source")
+}
+
+func downloadHostingArtifact(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, artifactURL, destination, kind string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, config.ServerURL+artifactURL, nil)
 	if err != nil {
 		return err
 	}
@@ -589,10 +689,10 @@ func downloadHostingSource(ctx context.Context, config hostingAgentConfig, job *
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("source download returned HTTP %d", response.StatusCode)
+		return fmt.Errorf("%s download returned HTTP %d", kind, response.StatusCode)
 	}
 	if response.ContentLength > maxAgentArtifactDownloadBytes {
-		return fmt.Errorf("source artifact exceeds size limit")
+		return fmt.Errorf("%s artifact exceeds size limit", kind)
 	}
 	file, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -605,7 +705,7 @@ func downloadHostingSource(ctx context.Context, config hostingAgentConfig, job *
 	}
 	if written > maxAgentArtifactDownloadBytes {
 		_ = os.Remove(destination)
-		return fmt.Errorf("source artifact exceeds size limit")
+		return fmt.Errorf("%s artifact exceeds size limit", kind)
 	}
 	return closeErr
 }
@@ -732,7 +832,7 @@ func hostingPackageCommands(runtime HostingRuntimeManifest) (string, string, str
 }
 
 func reportHostingPhase(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, phase string) error {
-	return hostingAgentJSON(ctx, config, http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/phase", job.JobID), hostingPhaseRequest{Phase: phase}, nil, hostingLeaseHeaders(job))
+	return hostingAgentJSON(ctx, config, http.MethodPost, hostingAgentWorkPath(job, "phase"), hostingPhaseRequest{Phase: phase}, nil, hostingLeaseHeaders(job))
 }
 
 func runHostingCommand(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob, directory, name string, args ...string) error {
@@ -751,7 +851,11 @@ func runHostingCommand(ctx context.Context, config hostingAgentConfig, job *host
 	scanner.Buffer(buffer, 1<<20)
 	for scanner.Scan() {
 		message := redactSecrets(scanner.Text())
-		_ = hostingAgentJSON(ctx, config, http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/logs", job.JobID), hostingLogRequest{Stream: "build", Message: message}, nil, hostingLeaseHeaders(job))
+		stream := "build"
+		if hostingAgentOperation(job) == "restore" {
+			stream = "system"
+		}
+		_ = hostingAgentJSON(ctx, config, http.MethodPost, hostingAgentWorkPath(job, "logs"), hostingLogRequest{Stream: stream, Message: message}, nil, hostingLeaseHeaders(job))
 	}
 	if err := scanner.Err(); err != nil {
 		return err
