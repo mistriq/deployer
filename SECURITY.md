@@ -40,9 +40,17 @@ command execution.
   header, and identity headers from broker traces and request logs.
 - Grant the smallest service-token scopes possible. `hosting:admin` controls the
   global execution kill switch and should use a separate operational identity.
+  Creation and rotation responses contain a one-time plaintext credential and
+  must remain uncached. Credential lifecycle records are correlated to the
+  upstream authorization gateway by `X-Request-ID`; audit paths are redacted
+  before persistence. Serialize each rotation ceremony through installation and
+  authenticated verification, and confirm its dedicated credential generation
+  against the active-only metadata endpoint before installing it.
 - Treat short-lived secret references as sensitive metadata even though
   Deployer never stores their plaintext values. Do not place plaintext secrets
   in manifests, idempotency keys, external IDs, audit reasons, or log messages.
+  HTTP request logs omit query strings and redact bounded decoded paths so
+  percent-encoded credentials cannot bypass log redaction.
 - Configure `DEPLOYER_HOSTING_WORKLOAD_IDENTITY_SECRET` as an independent key of
   at least 32 random bytes. The secret broker validates issuer, audience,
   lifetime, reference digest, lease identity, and one-time token ID. Rotate with

@@ -97,14 +97,39 @@ needed scopes:
 The plaintext `dpl_` credential is returned only at creation or rotation and is
 stored only as a hash. Rotation creates a new credential while the previous one
 remains valid for `DEPLOYER_SERVICE_TOKEN_ROTATION_OVERLAP` (24 hours by
-default). Safe rotation sequence:
+default). Set the overlap to `0s` only when an immediate cutover is intended;
+the previous credential then stops authenticating as soon as rotation commits.
+Creation and rotation responses are marked `Cache-Control: no-store`, and their
+audit records include the Deployer request ID for correlation with the trusted
+authorization gateway. Safe rotation sequence:
 
-1. Create the new credential with `POST /api/service-tokens/{id}/rotate`.
-2. Install it in the control plane and verify an authenticated capabilities call.
-3. Observe `authenticated` audit events for the new credential.
-4. Allow the overlap to expire, or revoke the service token immediately if the
+1. Acquire the control plane's single-writer credential-ceremony lock. Keep it
+   through installation and authenticated verification. Read the token's current
+   `credential_generation`, then create the new credential with
+   `POST /api/service-tokens/{id}/rotate` and
+   `X-Deployer-If-Credential-Generation` containing that generation (for
+   example, `42`). A concurrent rotation returns `412` instead of producing a
+   second ambiguous secret. Emergency revocation is allowed to abort the lock.
+2. Immediately read `GET /api/service-tokens/{id}` with caching disabled and
+   require a `200`, and compare its `credential_generation` with the rotation
+   response. A revoked token returns `404`. Discard the plaintext and restart the
+   ceremony if confirmation fails or the generations differ; another action has
+   already superseded or revoked it.
+3. Install it in the control plane and verify an authenticated capabilities call.
+   A concurrent emergency revocation makes this fail and aborts the ceremony.
+4. Observe `authenticated` audit events for the new credential.
+5. Release the single-writer credential-ceremony lock.
+6. Allow the overlap to expire, or revoke the service token immediately if the
    old credential may be compromised. Revocation invalidates all overlapping
    credentials.
+
+These are trusted-admin credential ceremonies, not control-plane machine
+operations. If a creation response is lost, list the named token and rotate its
+current generation to obtain a new plaintext value; the unseen original becomes
+overlap-bounded. If a rotation response is lost, read the new current generation
+and rotate again. Plaintext is never retained for replay. A rotation response is
+safe to install only after the uncached metadata read confirms that its
+generation remains current.
 
 Hosting runner credentials use the `htr_` prefix and are never accepted as
 service or legacy runner credentials. Runner rotation is immediate: install the

@@ -43,13 +43,23 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		logStructured("info", "http_request", map[string]interface{}{
 			"request_id": requestIDFromContext(r.Context()),
 			"method":     r.Method,
-			"path":       r.URL.RequestURI(),
+			"path":       requestLogPath(r.URL.Path),
 			"status":     recorder.status,
 			"bytes":      recorder.bytes,
 			"duration":   time.Since(start).Round(time.Millisecond).String(),
 			"remote":     r.RemoteAddr,
 		})
 	})
+}
+
+func requestLogPath(path string) string {
+	const maxRunes = 1024
+	redacted := redactSecrets(path)
+	runes := []rune(redacted)
+	if len(runes) <= maxRunes {
+		return redacted
+	}
+	return string(runes[:maxRunes])
 }
 
 func panicRecoveryMiddleware(next http.Handler) http.Handler {
@@ -161,7 +171,7 @@ func requiresCSRF(r *http.Request) bool {
 	if strings.HasPrefix(r.URL.Path, "/api/agent/") {
 		return false
 	}
-	if strings.HasPrefix(r.URL.Path, "/api/internal/") {
+	if strings.HasPrefix(r.URL.Path, "/api/internal/v1/") {
 		return false
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/hosting-agent/") {

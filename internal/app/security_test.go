@@ -1,9 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -44,6 +47,28 @@ func TestCSRFMiddlewareRequiresHeaderForBrowserWrites(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("expected CSRF header to allow request, got %d", rec.Code)
+	}
+}
+
+func TestCSRFExemptionIsLimitedToVersionedPrivateAPI(t *testing.T) {
+	handler := wrapHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	for _, path := range []string{"/api/internal/v2/projects/example", "/api/internal-preview/projects/example"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("unversioned private-like path %q bypassed CSRF with status %d", path, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/internal/v1/projects/example", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("versioned private path did not receive its bearer-middleware exemption: %d", rec.Code)
 	}
 }
 
@@ -111,6 +136,38 @@ func TestLoggingResponseWriterPreservesFlusher(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("expected no content, got %d", rec.Code)
+	}
+}
+
+func TestRequestLoggingOmitsQueriesAndRedactsDecodedPaths(t *testing.T) {
+	var output bytes.Buffer
+	oldOutput := log.Writer()
+	oldFlags := log.Flags()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(oldOutput)
+		log.SetFlags(oldFlags)
+	})
+	secret := "dpl_" + strings.Repeat("a", 48)
+	rawEncodedSecret := "%64pl_" + strings.Repeat("a", 48)
+	handler := requestLoggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/v1/diagnostic/"+rawEncodedSecret+"?note="+secret, nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("request status = %d", rec.Code)
+	}
+	logLine := output.String()
+	for _, leaked := range []string{secret, rawEncodedSecret, "?note="} {
+		if strings.Contains(logLine, leaked) {
+			t.Fatalf("request log leaked %q: %s", leaked, logLine)
+		}
+	}
+	if !strings.Contains(logLine, "[REDACTED]") {
+		t.Fatalf("expected decoded path redaction in %s", logLine)
 	}
 }
 

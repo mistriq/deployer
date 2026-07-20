@@ -108,7 +108,7 @@ URL through your authorization gateway.
 | `DEPLOYER_HOSTING_CALLBACK_SECRET` | empty | HMAC callback key; use at least 32 random bytes. |
 | `DEPLOYER_HOSTING_CALLBACK_TIMEOUT` | `15s` | Per-attempt callback timeout. |
 | `DEPLOYER_HOSTING_CALLBACK_MAX_ATTEMPTS` | `12` | Attempts before a callback enters `dead_letter`. |
-| `DEPLOYER_SERVICE_TOKEN_ROTATION_OVERLAP` | `24h` | Validity overlap retained for the prior service-token credential during rotation. |
+| `DEPLOYER_SERVICE_TOKEN_ROTATION_OVERLAP` | `24h` | Validity overlap retained for the prior service-token credential during rotation; set `0s` for immediate expiry. |
 | `DEPLOYER_HOSTING_LOG_RETENTION_DAYS` | `30` | Hosting log retention; `0` disables deletion. |
 | `DEPLOYER_HOSTING_EVENT_RETENTION_DAYS` | `90` | Hosting event retention; `0` disables deletion. |
 | `DEPLOYER_HOSTING_RELEASE_RETENTION_DAYS` | `90` | Inactive/failed release retention; active releases are never aged out. |
@@ -300,6 +300,7 @@ Admin API:
 - `DELETE /api/runners/:id`
 - `GET /api/service-tokens`
 - `POST /api/service-tokens`
+- `GET /api/service-tokens/:id`
 - `POST /api/service-tokens/:id/rotate`
 - `DELETE /api/service-tokens/:id`
 
@@ -330,7 +331,17 @@ Scopes are `projects:write`, `deployments:read`, `deployments:write`, and
 `hosting:admin`. Service credentials are hashed, rotation keeps the configured
 overlap window, revocation invalidates every credential, and authentication,
 scope denial, rotation, revocation, runner credential changes, and kill-switch
-changes are audited. Mutating lifecycle calls use `Idempotency-Key`; a key is
+changes are audited. Creation and rotation return plaintext only once with
+`Cache-Control: no-store`; their lifecycle audits carry the request ID used to
+correlate the upstream authorization-gateway record. Rotation requires
+`X-Deployer-If-Credential-Generation` with the current
+`credential_generation`, preventing two
+callers from successfully rotating the same observed credential. Before
+installing a returned secret, compare its generation with an uncached
+`GET /api/service-tokens/:id`; a revoked token returns `404`. Hold a single-writer
+administrative lock from the initial read through install and authenticated
+verification, and discard a response that has already been superseded. Mutating hosting lifecycle
+calls use `Idempotency-Key`; a key is
 scoped to issuer and operation and conflicts if reused for a different payload.
 Suspend/resume responses acknowledge durable desired state; adapter
 convergence is asynchronous and generation-fenced during an adapter outage.

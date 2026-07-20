@@ -12,10 +12,10 @@ The primary agent owns this checklist and updates it only after implementation a
 
 ## P0 — contract and security
 
-- [ ] Verify hashed service tokens, scopes, rotation and revocation against the current WIP and full test gate.
-- [ ] Verify private versioned API and CSRF separation against the current WIP and full test gate.
+- [x] Verify hashed service tokens, scopes, rotation and revocation against the current WIP and full test gate.
+- [x] Verify private versioned API and CSRF separation against the current WIP and full test gate.
 - [ ] Replace simple deployment-key persistence with issuer + operation + key + request hash + original response.
-- [ ] Add service-token audit events and overlapping no-downtime rotation.
+- [x] Add service-token audit events and overlapping no-downtime rotation.
 - [ ] Add `external_project_id` and `external_deployment_id` with unique constraints.
 - [ ] Define and document all internal schemas, scopes and stable error codes in OpenAPI.
 - [ ] Add strict manifest schema/version/hash validation.
@@ -74,7 +74,7 @@ The primary agent owns this checklist and updates it only after implementation a
 ## Required verification
 
 - [x] Fresh DB and legacy migration tests.
-- [ ] Auth, scope, rotation, revocation and audit tests.
+- [x] Auth, scope, rotation, revocation and audit tests.
 - [ ] Idempotency replay and concurrent duplicate tests.
 - [ ] Per-project deployment serialization tests.
 - [x] Exact commit/artifact mismatch rejection tests.

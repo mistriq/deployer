@@ -5,6 +5,10 @@
 - Add a private `/api/internal/v1` Light Apps Hosting execution API with scoped,
   hashed, overlapping service credentials, strict signed manifests, canonical
   idempotency, stable errors, and audit records.
+- Serialize service-credential lifecycle changes, commit authentication usage
+  and audits atomically, honor zero-length rotation overlap, redact audit paths,
+  correlate trusted-admin lifecycle events, generation-fence rotations, and
+  prevent caching one-time tokens.
 - Separate hosting projects, deployments, jobs, runners, releases, events,
   logs, callbacks, and capacity from the legacy trusted-admin deployment path.
 - Redeem short-lived opaque source references through a fixed authenticated

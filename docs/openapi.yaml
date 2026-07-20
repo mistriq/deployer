@@ -892,12 +892,19 @@ paths:
       responses:
         "200":
           description: Service token metadata.
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+            Pragma:
+              schema: {type: string, const: no-cache}
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: "#/components/schemas/ServiceToken"
+                  $ref: "#/components/schemas/ServiceTokenMetadata"
+        "500":
+          $ref: "#/components/responses/Error"
     post:
       tags: [service-tokens]
       summary: Create a scoped service token
@@ -913,10 +920,30 @@ paths:
       responses:
         "201":
           description: Token metadata with the secret returned once.
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+            Pragma:
+              schema: {type: string, const: no-cache}
+            X-Deployer-Credential-Generation:
+              description: Current credential generation used by a later rotation precondition.
+              schema: {type: string, pattern: '^[1-9][0-9]*$'}
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ServiceToken"
+                $ref: "#/components/schemas/ServiceTokenSecret"
+        "400":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "415":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
 
   /api/service-tokens/{serviceTokenId}/rotate:
     post:
@@ -926,15 +953,59 @@ paths:
       parameters:
         - $ref: "#/components/parameters/ServiceTokenId"
         - $ref: "#/components/parameters/CSRFHeader"
+        - $ref: "#/components/parameters/ServiceTokenGenerationPrecondition"
       responses:
         "200":
           description: Rotated token metadata with the new secret.
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+            Pragma:
+              schema: {type: string, const: no-cache}
+            X-Deployer-Credential-Generation:
+              description: Generation of the newly issued current credential.
+              schema: {type: string, pattern: '^[1-9][0-9]*$'}
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ServiceToken"
+                $ref: "#/components/schemas/ServiceTokenSecret"
+        "400":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "412":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "428":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
 
   /api/service-tokens/{serviceTokenId}:
+    get:
+      tags: [service-tokens]
+      summary: Read authoritative active service-token metadata without its secret
+      description: Returns not found after revocation so a rotation ceremony cannot confirm an inactive credential.
+      operationId: getServiceToken
+      parameters:
+        - $ref: "#/components/parameters/ServiceTokenId"
+      responses:
+        "200":
+          description: Current metadata used to confirm a rotation response is still authoritative.
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+            Pragma:
+              schema: {type: string, const: no-cache}
+            X-Deployer-Credential-Generation:
+              description: Current credential generation.
+              schema: {type: string, pattern: '^[1-9][0-9]*$'}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ServiceTokenMetadata"}
+        "404": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
     delete:
       tags: [service-tokens]
       summary: Revoke a service token
@@ -945,6 +1016,12 @@ paths:
       responses:
         "204":
           description: Service token revoked.
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
 
   /api/hosting-runners:
     get:
@@ -1004,7 +1081,7 @@ paths:
       tags: [internal]
       summary: Idempotently provision or update a hosted project
       description: >
-        Accepts a signed, versioned, structured manifest. Repeating an identical
+        Requires projects:write. Accepts a signed, versioned, structured manifest. Repeating an identical
         external_project_id and manifest returns the existing project; a changed
         manifest updates the same project. Arbitrary shell, filesystem targets,
         SSH, Compose, build arguments, and environment secrets are not accepted.
@@ -1047,6 +1124,8 @@ paths:
           $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
 
   /api/internal/v1/projects/{externalProjectId}/deployments:
     post:
@@ -1080,6 +1159,9 @@ paths:
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
         "422": {$ref: "#/components/responses/Error"}
         "423": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/Error"}
@@ -1089,6 +1171,7 @@ paths:
     get:
       tags: [internal]
       summary: List immutable retained releases
+      description: Requires deployments:read.
       operationId: listInternalReleases
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1105,11 +1188,13 @@ paths:
         "403": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
         "405": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/projects/{externalProjectId}/rollback:
     post:
       tags: [internal]
       summary: Activate a selected retained healthy release
+      description: Requires deployments:write.
       operationId: rollbackInternalRelease
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1135,15 +1220,21 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/HostingRelease"}
         "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
         "502": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/projects/{externalProjectId}/suspend:
     post:
       tags: [internal]
       summary: Accept suspended desired state without deleting releases
-      description: The response acknowledges durable desired state. Proxy convergence is generation-fenced and may complete asynchronously after an adapter outage.
+      description: Requires projects:write. The response acknowledges durable desired state. Proxy convergence is generation-fenced and may complete asynchronously after an adapter outage.
       operationId: suspendInternalProject
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1155,12 +1246,18 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDesiredState"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "400": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/projects/{externalProjectId}/resume:
     post:
       tags: [internal]
       summary: Accept active desired state for the retained release
-      description: The response acknowledges durable desired state. Proxy convergence is generation-fenced and may complete asynchronously after an adapter outage.
+      description: Requires projects:write. The response acknowledges durable desired state. Proxy convergence is generation-fenced and may complete asynchronously after an adapter outage.
       operationId: resumeInternalProject
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1172,6 +1269,12 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDesiredState"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "400": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/projects/{externalProjectId}/kill-switch:
     put:
@@ -1195,12 +1298,19 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/KillSwitchState"}
         "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/deployments/{externalDeploymentId}:
     get:
       tags: [internal]
       summary: Poll authoritative deployment state
+      description: Requires deployments:read.
       operationId: getInternalDeployment
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1221,6 +1331,7 @@ paths:
     post:
       tags: [internal]
       summary: Idempotently cancel queued or running work
+      description: Requires deployments:write.
       operationId: cancelInternalDeployment
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1233,11 +1344,17 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDeployment"}
         "404": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "400": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/deployments/{externalDeploymentId}/events:
     get:
       tags: [internal]
       summary: Get the structured deployment event timeline
+      description: Requires deployments:read.
       operationId: getInternalDeploymentEvents
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1251,11 +1368,15 @@ paths:
                 type: array
                 items: {$ref: "#/components/schemas/HostingEvent"}
         "404": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/deployments/{externalDeploymentId}/logs:
     get:
       tags: [internal]
       summary: Get redacted structured deployment logs
+      description: Requires deployments:read.
       operationId: getInternalDeploymentLogs
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1269,11 +1390,15 @@ paths:
                 type: array
                 items: {$ref: "#/components/schemas/HostingLog"}
         "404": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/capabilities:
     get:
       tags: [internal]
       summary: Negotiate hosting manifest, runner, runtime, resource, and failure-code capabilities
+      description: Requires deployments:read.
       operationId: getInternalCapabilities
       security: [{serviceBearerAuth: []}]
       responses:
@@ -1285,11 +1410,13 @@ paths:
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "405": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/runners:
     get:
       tags: [internal]
       summary: List hosting-only runner capabilities and free capacity
+      description: Requires deployments:read.
       operationId: listInternalHostingRunners
       security: [{serviceBearerAuth: []}]
       responses:
@@ -1309,6 +1436,7 @@ paths:
     get:
       tags: [internal]
       summary: Get aggregate hosting operational metrics
+      description: Requires deployments:read.
       operationId: getInternalHostingMetrics
       security: [{serviceBearerAuth: []}]
       responses:
@@ -1317,6 +1445,9 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingMetrics"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/settings/kill-switch:
     put:
@@ -1339,8 +1470,12 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/KillSwitchState"}
         "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "405": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
   /api/hosting-agent/v1/heartbeat:
@@ -1709,7 +1844,8 @@ paths:
           application/json:
             schema: {$ref: "#/components/schemas/HostingRecoveryCompletion"}
       responses:
-        "204": {description: Recovery completion accepted; an identical same-lease replay, including a retryable failure, is idempotent.}
+        "204":
+          description: Recovery completion accepted; an identical same-lease replay, including a retryable failure, is idempotent.
         "400": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
@@ -1990,6 +2126,14 @@ components:
       schema:
         type: integer
         format: int64
+    ServiceTokenGenerationPrecondition:
+      name: X-Deployer-If-Credential-Generation
+      in: header
+      required: true
+      description: credential_generation from the latest create, rotate, or active-metadata response. A stale generation returns precondition_failed without issuing another credential.
+      schema:
+        type: string
+        pattern: '^[1-9][0-9]*$'
     ExternalProjectId:
       name: externalProjectId
       in: path
@@ -2091,6 +2235,8 @@ components:
             - invalid_service_token
             - service_token_not_found
             - insufficient_scope
+            - precondition_required
+            - precondition_failed
             - invalid_idempotency_key
             - idempotency_conflict
             - idempotency_in_progress
@@ -2164,10 +2310,15 @@ components:
 
     ServiceTokenInput:
       type: object
+      additionalProperties: false
       required: [name, scopes]
       properties:
         name:
           type: string
+          minLength: 1
+          maxLength: 100
+          pattern: '^(?!.*[\u0000-\u001F\u007F-\u009F])\S(?:.*\S)?$'
+          description: Canonical display name without leading/trailing whitespace or control characters.
         scopes:
           type: array
           minItems: 1
@@ -2175,27 +2326,69 @@ components:
             type: string
             enum: [deployments:read, deployments:write, projects:write, 'hosting:admin']
 
-    ServiceToken:
-      allOf:
-        - $ref: "#/components/schemas/ServiceTokenInput"
-        - type: object
-          required: [id, created_at]
-          properties:
-            id:
-              type: integer
-              format: int64
-            token:
-              type: string
-              description: Returned only on creation or rotation.
-            created_at:
-              type: string
-              format: date-time
-            last_used_at:
-              type: string
-              format: date-time
-            revoked_at:
-              type: string
-              format: date-time
+    ServiceTokenMetadata:
+      type: object
+      additionalProperties: false
+      required: [id, name, scopes, created_at, credential_generation]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          pattern: '^(?!.*[\u0000-\u001F\u007F-\u009F])\S(?:.*\S)?$'
+        scopes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [deployments:read, deployments:write, projects:write, 'hosting:admin']
+        credential_generation:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Current credential identity sent in X-Deployer-If-Credential-Generation for rotation.
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+
+    ServiceTokenSecret:
+      type: object
+      additionalProperties: false
+      required: [id, name, scopes, token, credential_generation, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          pattern: '^(?!.*[\u0000-\u001F\u007F-\u009F])\S(?:.*\S)?$'
+        scopes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [deployments:read, deployments:write, projects:write, 'hosting:admin']
+        token:
+          type: string
+          readOnly: true
+          pattern: '^dpl_[a-f0-9]{48}$'
+          description: One-time secret returned only on creation or rotation; the response is marked no-store.
+        credential_generation:
+          type: integer
+          format: int64
+          minimum: 1
+        created_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time}
+        revoked_at: {type: string, format: date-time}
 
     InternalProjectUpsertInput:
       type: object

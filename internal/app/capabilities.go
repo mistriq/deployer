@@ -59,6 +59,8 @@ func newCapabilitiesResponse(cfg AppConfig) capabilitiesResponse {
 			errCodeInvalidServiceToken,
 			errCodeServiceTokenNotFound,
 			errCodeInsufficientScope,
+			errCodePreconditionRequired,
+			errCodePreconditionFailed,
 			errCodeInvalidIdempotencyKey,
 			errCodeIdempotencyConflict,
 			errCodeIdempotencyInProgress,

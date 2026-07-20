@@ -14,6 +14,8 @@ const (
 	errCodeInvalidServiceToken        = "invalid_service_token"
 	errCodeServiceTokenNotFound       = "service_token_not_found"
 	errCodeInsufficientScope          = "insufficient_scope"
+	errCodePreconditionRequired       = "precondition_required"
+	errCodePreconditionFailed         = "precondition_failed"
 	errCodeInvalidIdempotencyKey      = "invalid_idempotency_key"
 	errCodeIdempotencyConflict        = "idempotency_conflict"
 	errCodeIdempotencyInProgress      = "idempotency_in_progress"
