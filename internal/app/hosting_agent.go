@@ -21,22 +21,43 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type hostingAgentConfig struct {
-	ServerURL           string
-	Token               string
-	WorkRoot            string
-	RuntimeBindAddress  string
-	BuildNetwork        string
-	BuildTimeout        time.Duration
-	SecretBrokerURL     string
-	SecretBrokerTimeout time.Duration
-	SecretMemoryRoot    string
-	Draining            bool
+	ServerURL               string
+	Token                   string
+	WorkRoot                string
+	RuntimeBindAddress      string
+	BuildNetwork            string
+	BuildTimeout            time.Duration
+	SecretBrokerURL         string
+	SecretBrokerTimeout     time.Duration
+	SecretMemoryRoot        string
+	SessionID               string
+	PriorAcceptedSessionIDs []string
+	HeartbeatSequence       *atomic.Int64
+	SessionAccepted         *atomic.Bool
+	HeartbeatMu             *sync.Mutex
+	Draining                bool
+}
+
+var errHostingAgentSessionSuperseded = errors.New("hosting agent session was superseded")
+var errHostingAgentSessionDraining = errors.New("hosting agent superseded session is draining")
+
+type hostingAgentAPIError struct {
+	StatusCode        int
+	Code              string
+	Message           string
+	CleanupAuthorized bool
+	RetainedReleases  []hostingRetainedRelease
+}
+
+func (err *hostingAgentAPIError) Error() string {
+	return fmt.Sprintf("hosting agent API returned HTTP %d (%s): %s", err.StatusCode, err.Code, err.Message)
 }
 
 func runHostingAgent() {
@@ -92,12 +113,34 @@ func runHostingAgent() {
 		logFatal("hosting_agent_runtime_error", "reconcile runtime secret directories", err, nil)
 	}
 	config := hostingAgentConfig{ServerURL: *serverURL, Token: *token, WorkRoot: canonicalWorkRoot, RuntimeBindAddress: *runtimeBindAddress, BuildNetwork: *buildNetwork, BuildTimeout: *buildTimeout,
-		SecretBrokerURL: *secretBrokerURL, SecretBrokerTimeout: *secretBrokerTimeout, SecretMemoryRoot: secretMemoryRoot, Draining: *draining}
+		SecretBrokerURL: *secretBrokerURL, SecretBrokerTimeout: *secretBrokerTimeout, SecretMemoryRoot: secretMemoryRoot,
+		SessionID: generateToken(), HeartbeatSequence: new(atomic.Int64), SessionAccepted: new(atomic.Bool),
+		HeartbeatMu: new(sync.Mutex), Draining: *draining}
+	config.PriorAcceptedSessionIDs, err = loadHostingAcceptedSessions(canonicalWorkRoot)
+	if err != nil {
+		logFatal("hosting_agent_runtime_error", "load accepted runner session", err, nil)
+	}
 	for {
 		if err := flushHostingAgentCompletions(context.Background(), config); err != nil {
 			logOperationalError("retry hosting job completions", err)
 		}
 		if err := sendHostingAgentHeartbeat(context.Background(), config); err != nil {
+			if errors.Is(err, errHostingAgentSessionDraining) {
+				if config.SessionAccepted != nil && config.SessionAccepted.Load() {
+					config.PriorAcceptedSessionIDs = appendUniqueHostingSession(
+						config.PriorAcceptedSessionIDs, config.SessionID)
+					config.SessionID = generateToken()
+					config.HeartbeatSequence.Store(0)
+					config.SessionAccepted.Store(false)
+				}
+				logOperationalInfo("superseded hosting runner session is retaining routed runtimes until handoff")
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			if errors.Is(err, errHostingAgentSessionSuperseded) {
+				logOperationalInfo("superseded hosting runner session completed autonomous runtime cleanup")
+				return
+			}
 			logOperationalError("hosting runner heartbeat", err)
 			time.Sleep(5 * time.Second)
 			continue
@@ -146,6 +189,11 @@ func hostingAgentSecretMemoryRoot(workRoot string) string {
 
 func hostingAgentSecretNamespace(secretRoot string) string {
 	digest := sha256.Sum256([]byte(filepath.Clean(secretRoot)))
+	return hex.EncodeToString(digest[:16])
+}
+
+func hostingAgentRuntimeNamespace(workRoot string) string {
+	digest := sha256.Sum256([]byte(filepath.Clean(workRoot)))
 	return hex.EncodeToString(digest[:16])
 }
 
@@ -231,22 +279,144 @@ func detectHostingAgentCapacity(workRoot string) (capacityDTO, capacityDTO, erro
 }
 
 func sendHostingAgentHeartbeat(ctx context.Context, config hostingAgentConfig) error {
+	return publishHostingAgentHeartbeat(ctx, config, true)
+}
+
+func publishHostingAgentHeartbeat(ctx context.Context, config hostingAgentConfig, reconcile bool) error {
+	if config.HeartbeatMu != nil {
+		config.HeartbeatMu.Lock()
+		defer config.HeartbeatMu.Unlock()
+	}
 	_, free, err := detectHostingAgentCapacity(config.WorkRoot)
 	if err != nil {
 		return err
 	}
-	payload := hostingHeartbeatRequest{Free: free, Draining: config.Draining, ProtocolVersion: hostingRunnerProtocolVersion,
-		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"20", "22"},
-		Operations: hostingAgentOperations(config)}
-	var response hostingHeartbeatResponse
-	if err := hostingAgentJSON(ctx, config, http.MethodPost, "/api/hosting-agent/v1/heartbeat", payload, &response, nil); err != nil {
+	namespace := hostingAgentRuntimeNamespace(config.WorkRoot)
+	adoptions, err := loadHostingRuntimeAdoptions(config.WorkRoot)
+	if err != nil {
+		return fmt.Errorf("load legacy runtime adoptions: %w", err)
+	}
+	containers, err := listHostingAgentRuntimes(ctx, namespace, func(containerID string, runtime hostingObservedRuntime) bool {
+		adopted, ok := adoptions[containerID]
+		return ok && hostingObservedRuntimeIdentity(adopted.Runtime) == hostingObservedRuntimeIdentity(runtime)
+	})
+	if err != nil {
 		return err
 	}
-	return reconcileHostingAgentReleases(ctx, response.RetainedReleases)
+	if config.SessionAccepted == nil || !config.SessionAccepted.Load() {
+		priorRetained, priorAuthorized, retentionErr := hostingAgentPriorSessionRetention(ctx, config)
+		if retentionErr != nil {
+			return retentionErr
+		}
+		if priorAuthorized {
+			cleanupErr := reconcileSupersededHostingAgentSession(ctx, config, containers, priorRetained,
+				errHostingAgentSessionSuperseded)
+			if !errors.Is(cleanupErr, errHostingAgentSessionDraining) {
+				return cleanupErr
+			}
+		}
+		if !hostingStringListContains(config.PriorAcceptedSessionIDs, config.SessionID) {
+			pendingSessions := append(append([]string(nil), config.PriorAcceptedSessionIDs...), config.SessionID)
+			if err := persistHostingAcceptedSessions(config.WorkRoot, pendingSessions); err != nil {
+				return fmt.Errorf("persist pending runner session: %w", err)
+			}
+		}
+	}
+	inventory := make([]hostingObservedRuntime, len(containers))
+	for index := range containers {
+		inventory[index] = containers[index].Runtime
+	}
+	sequence := int64(1)
+	if config.HeartbeatSequence != nil {
+		sequence = config.HeartbeatSequence.Add(1)
+	}
+	payload := hostingHeartbeatRequest{Free: free, Draining: config.Draining, ProtocolVersion: hostingRunnerProtocolVersion,
+		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"20", "22"},
+		Operations: hostingAgentOperations(config), SessionID: config.SessionID, Sequence: sequence,
+		RuntimeInventory: &inventory}
+	var response hostingHeartbeatResponse
+	if err := hostingAgentJSON(ctx, config, http.MethodPost, "/api/hosting-agent/v1/heartbeat", payload, &response, nil); err != nil {
+		var apiErr *hostingAgentAPIError
+		if errors.As(err, &apiErr) && apiErr.Code == errCodeRunnerSessionSuperseded {
+			retained := apiErr.RetainedReleases
+			authorized := apiErr.CleanupAuthorized
+			if !authorized {
+				priorRetained, priorAuthorized, retentionErr := hostingAgentPriorSessionRetention(ctx, config)
+				if retentionErr != nil {
+					return retentionErr
+				}
+				authorized = priorAuthorized
+				retained = priorRetained
+			}
+			if !authorized {
+				return err
+			}
+			return reconcileSupersededHostingAgentSession(ctx, config, containers, retained, err)
+		}
+		return err
+	}
+	if config.SessionAccepted == nil || !config.SessionAccepted.Load() {
+		if err := persistHostingAcceptedSessions(config.WorkRoot, []string{config.SessionID}); err != nil {
+			return fmt.Errorf("persist accepted runner session: %w", err)
+		}
+	}
+	if config.SessionAccepted != nil {
+		config.SessionAccepted.Store(true)
+	}
+	if !reconcile {
+		return nil
+	}
+	return reconcileHostingAgentReleases(ctx, config, response.RetainedReleases)
+}
+
+func appendUniqueHostingSession(sessions []string, sessionID string) []string {
+	if hostingStringListContains(sessions, sessionID) {
+		return sessions
+	}
+	return append(sessions, sessionID)
+}
+
+func hostingAgentPriorSessionRetention(ctx context.Context, config hostingAgentConfig) ([]hostingRetainedRelease, bool, error) {
+	for _, sessionID := range config.PriorAcceptedSessionIDs {
+		if sessionID == config.SessionID {
+			continue
+		}
+		var response hostingHeartbeatResponse
+		err := hostingAgentJSON(ctx, config, http.MethodPost, "/api/hosting-agent/v1/session-retention",
+			hostingSessionRetentionRequest{SessionID: sessionID}, &response, nil)
+		if err == nil {
+			return response.RetainedReleases, true, nil
+		}
+		var apiErr *hostingAgentAPIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+			return nil, false, err
+		}
+	}
+	return nil, false, nil
+}
+
+func reconcileSupersededHostingAgentSession(ctx context.Context, config hostingAgentConfig,
+	containers []hostingManagedRuntime, retained []hostingRetainedRelease, cause error) error {
+	if err := reconcileHostingAgentReleases(ctx, config, retained); err != nil {
+		return err
+	}
+	if config.SecretMemoryRoot != "" {
+		if err := reconcileHostingSecretDirectories(config.SecretMemoryRoot,
+			config.SecretBrokerURL != ""); err != nil {
+			return err
+		}
+	}
+	if hostingAgentInventoryContainsRetainedRuntime(containers, retained) {
+		return fmt.Errorf("%w: %v", errHostingAgentSessionDraining, cause)
+	}
+	if err := clearHostingAcceptedSession(config.WorkRoot); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %v", errHostingAgentSessionSuperseded, cause)
 }
 
 func hostingAgentOperations(config hostingAgentConfig) []string {
-	operations := []string{"build", "restore"}
+	operations := []string{"build", "restore", hostingRunnerInventoryOperation}
 	if config.SecretBrokerURL != "" {
 		operations = append(operations, hostingRunnerSecretOperation)
 	}
@@ -296,8 +466,15 @@ func hostingAgentJSONStatus(ctx context.Context, config hostingAgentConfig, meth
 	}
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
-		limited, _ := io.ReadAll(io.LimitReader(httpResponse.Body, 64<<10))
-		return httpResponse.StatusCode, fmt.Errorf("hosting agent API returned HTTP %d: %s", httpResponse.StatusCode, redactSecrets(string(limited)))
+		limited, _ := io.ReadAll(io.LimitReader(httpResponse.Body, 1<<20))
+		responseError := apiErrorResponse{}
+		if json.Unmarshal(limited, &responseError) == nil && responseError.Code != "" {
+			return httpResponse.StatusCode, &hostingAgentAPIError{StatusCode: httpResponse.StatusCode,
+				Code: responseError.Code, Message: redactSecrets(responseError.Error),
+				CleanupAuthorized: responseError.CleanupAuthorized, RetainedReleases: responseError.RetainedReleases}
+		}
+		return httpResponse.StatusCode, &hostingAgentAPIError{StatusCode: httpResponse.StatusCode,
+			Code: defaultErrorCode(httpResponse.StatusCode), Message: redactSecrets(string(limited))}
 	}
 	if response != nil && httpResponse.StatusCode != http.StatusNoContent {
 		decoder := json.NewDecoder(io.LimitReader(httpResponse.Body, 1<<20))
@@ -306,6 +483,95 @@ func hostingAgentJSONStatus(ctx context.Context, config hostingAgentConfig, meth
 		}
 	}
 	return httpResponse.StatusCode, nil
+}
+
+func hostingAcceptedSessionPath(workRoot string) string {
+	return filepath.Join(workRoot, "accepted-session")
+}
+
+func loadHostingAcceptedSessions(workRoot string) ([]string, error) {
+	encoded, err := os.ReadFile(hostingAcceptedSessionPath(workRoot))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Fields(string(encoded))
+	if len(lines) == 0 || len(lines) > 64 {
+		return nil, fmt.Errorf("accepted runner session file is invalid")
+	}
+	sessions := make([]string, 0, len(lines))
+	seen := make(map[string]struct{}, len(lines))
+	for _, sessionID := range lines {
+		if !validHostingRunnerSessionID(sessionID) {
+			return nil, fmt.Errorf("accepted runner session file is invalid")
+		}
+		if _, duplicate := seen[sessionID]; duplicate {
+			continue
+		}
+		seen[sessionID] = struct{}{}
+		sessions = append(sessions, sessionID)
+	}
+	return sessions, nil
+}
+
+func persistHostingAcceptedSession(workRoot, sessionID string) error {
+	return persistHostingAcceptedSessions(workRoot, []string{sessionID})
+}
+
+func persistHostingAcceptedSessions(workRoot string, sessionIDs []string) error {
+	if len(sessionIDs) == 0 || len(sessionIDs) > 64 {
+		return fmt.Errorf("accepted runner session list is invalid")
+	}
+	for _, sessionID := range sessionIDs {
+		if !validHostingRunnerSessionID(sessionID) {
+			return fmt.Errorf("accepted runner session is invalid")
+		}
+	}
+	path := hostingAcceptedSessionPath(workRoot)
+	temporary := path + ".tmp"
+	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.WriteString(strings.Join(sessionIDs, "\n") + "\n"); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporary, path)
+}
+
+func clearHostingAcceptedSession(workRoot string) error {
+	err := os.Remove(hostingAcceptedSessionPath(workRoot))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func hostingAgentInventoryContainsRetainedRuntime(containers []hostingManagedRuntime,
+	retained []hostingRetainedRelease) bool {
+	retainedIdentities := make(map[string]struct{}, len(retained))
+	for _, release := range retained {
+		retainedIdentities[hostingObservedRuntimeIdentity(hostingObservedRuntime{
+			ReleaseDigest: release.ReleaseDigest, ExternalProjectID: release.ExternalProjectID,
+			ExternalDeploymentID: release.ExternalDeploymentID, RuntimeInstanceID: release.RuntimeInstanceID,
+		})] = struct{}{}
+	}
+	for _, container := range containers {
+		if _, ok := retainedIdentities[hostingObservedRuntimeIdentity(container.Runtime)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func executeHostingAgentJob(config hostingAgentConfig, job *hostingClaimedJob) {
@@ -317,13 +583,18 @@ func executeHostingAgentJob(config hostingAgentConfig, job *hostingClaimedJob) {
 	var controlPlaneUnavailable atomic.Bool
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(hostingAgentJobHeartbeatInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if err := publishHostingAgentHeartbeat(ctx, config, true); err != nil {
+					controlPlaneUnavailable.Store(true)
+					cancel()
+					return
+				}
 				var state map[string]bool
 				if err := hostingAgentJSON(ctx, config, http.MethodPost, hostingAgentWorkPath(job, "heartbeat"), nil, &state, headers); err != nil {
 					controlPlaneUnavailable.Store(true)
@@ -597,7 +868,9 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 	}
 	instanceID := hostingAgentInstanceID(job)
 	containerName := "deployer-hosting-" + safeFileName(job.Recipe.ExternalDeploymentID) + "-" + safeFileName(instanceID)
-	if err := removeStaleHostingContainer(ctx, containerName, job.Recipe.ExternalProjectID, job.Recipe.ExternalDeploymentID, instanceID); err != nil {
+	agentNamespace := hostingAgentRuntimeNamespace(config.WorkRoot)
+	if err := removeStaleHostingContainer(ctx, containerName, agentNamespace, releaseDigest,
+		job.Recipe.ExternalProjectID, job.Recipe.ExternalDeploymentID, instanceID); err != nil {
 		return fail("workload_policy_violation", err)
 	}
 	secretDirectory, err := prepareHostingRuntimeSecrets(ctx, config, job, instanceID)
@@ -616,6 +889,7 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 	}
 	runArgs := []string{"run", "-d", "--name", containerName, "--restart", "unless-stopped",
 		"--label", "light-apps.hosting.managed=true", "--label", "light-apps.hosting.release=" + releaseDigest,
+		"--label", "light-apps.hosting.agent-namespace=" + agentNamespace,
 		"--label", "light-apps.hosting.project=" + job.Recipe.ExternalProjectID,
 		"--label", "light-apps.hosting.deployment=" + job.Recipe.ExternalDeploymentID,
 		"--label", "light-apps.hosting.instance=" + instanceID,
@@ -656,6 +930,14 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 	if err != nil {
 		return hostingCompletionRequest{Status: "failed", FailureCode: "health_check_failed", FailureMessage: redactSecrets(err.Error()), HealthEvidence: map[string]any{"healthy": false, "attempts": attempts, "status_code": statusCode}}
 	}
+	// The control plane must observe the exact immutable runtime identity before it
+	// accepts completion. This also refreshes the candidate's lease while the
+	// completion outbox is pending.
+	if config.SessionID != "" {
+		if err := publishHostingAgentHeartbeat(ctx, config, true); err != nil {
+			return fail("runner_lost", fmt.Errorf("publish exact runtime inventory: %w", err))
+		}
+	}
 	keepContainer = true
 	if secretDirectory != "" {
 		go cleanupHostingSecretsAfterContainerExit(containerName, secretDirectory)
@@ -663,9 +945,10 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 	return hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: releaseArtifactDigest, RuntimeEndpoint: endpoint, HealthEvidence: map[string]any{"healthy": true, "attempts": attempts, "status_code": statusCode}}
 }
 
-func removeStaleHostingContainer(ctx context.Context, containerName, externalProjectID, externalDeploymentID, instanceID string) error {
+func removeStaleHostingContainer(ctx context.Context, containerName, agentNamespace, releaseDigest,
+	externalProjectID, externalDeploymentID, instanceID string) error {
 	output, err := exec.CommandContext(ctx, "docker", "inspect", "--format",
-		`{{index .Config.Labels "light-apps.hosting.managed"}}\t{{index .Config.Labels "light-apps.hosting.project"}}\t{{index .Config.Labels "light-apps.hosting.deployment"}}\t{{index .Config.Labels "light-apps.hosting.instance"}}`,
+		`{{index .Config.Labels "light-apps.hosting.managed"}}\t{{index .Config.Labels "light-apps.hosting.agent-namespace"}}\t{{index .Config.Labels "light-apps.hosting.release"}}\t{{index .Config.Labels "light-apps.hosting.project"}}\t{{index .Config.Labels "light-apps.hosting.deployment"}}\t{{index .Config.Labels "light-apps.hosting.instance"}}`,
 		containerName).CombinedOutput()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -675,7 +958,8 @@ func removeStaleHostingContainer(ctx context.Context, containerName, externalPro
 		return fmt.Errorf("inspect existing hosting container: %w", err)
 	}
 	fields := strings.Split(strings.TrimSpace(string(output)), "\t")
-	if len(fields) != 4 || fields[0] != "true" || fields[1] != externalProjectID || fields[2] != externalDeploymentID || fields[3] != instanceID {
+	if len(fields) != 6 || fields[0] != "true" || fields[1] != agentNamespace || fields[2] != releaseDigest ||
+		fields[3] != externalProjectID || fields[4] != externalDeploymentID || fields[5] != instanceID {
 		return fmt.Errorf("refusing to replace container with mismatched ownership labels")
 	}
 	if err := exec.CommandContext(ctx, "docker", "rm", "-f", containerName).Run(); err != nil {
@@ -719,7 +1003,159 @@ func uploadHostingReleaseArtifact(ctx context.Context, config hostingAgentConfig
 	return nil
 }
 
-func reconcileHostingAgentReleases(ctx context.Context, retained []hostingRetainedRelease) error {
+type hostingManagedRuntime struct {
+	ContainerID string                 `json:"container_id"`
+	Runtime     hostingObservedRuntime `json:"runtime"`
+	Legacy      bool                   `json:"legacy"`
+}
+
+func listHostingAgentRuntimes(ctx context.Context, namespace string,
+	legacyFilter func(string, hostingObservedRuntime) bool) ([]hostingManagedRuntime, error) {
+	if len(namespace) != 32 {
+		return nil, fmt.Errorf("invalid hosting agent namespace")
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(commandCtx, "docker", "ps", "-a",
+		"--filter", "label=light-apps.hosting.managed=true",
+		"--format", `{{.ID}}\t{{.Label "light-apps.hosting.agent-namespace"}}\t{{.Label "light-apps.hosting.release"}}\t{{.Label "light-apps.hosting.project"}}\t{{.Label "light-apps.hosting.deployment"}}\t{{.Label "light-apps.hosting.instance"}}\t{{.State}}`).Output()
+	if err != nil {
+		return nil, fmt.Errorf("list managed hosting containers: %w", err)
+	}
+	containers := make([]hostingManagedRuntime, 0)
+	seen := make(map[string]int)
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 7 || strings.TrimSpace(fields[0]) == "" {
+			return nil, fmt.Errorf("container runtime returned invalid managed container metadata")
+		}
+		containerNamespace := strings.TrimSpace(fields[1])
+		if containerNamespace != "" && containerNamespace != namespace {
+			continue
+		}
+		runtime := hostingObservedRuntime{ReleaseDigest: strings.TrimSpace(fields[2]),
+			ExternalProjectID: strings.TrimSpace(fields[3]), ExternalDeploymentID: strings.TrimSpace(fields[4]),
+			RuntimeInstanceID: strings.TrimSpace(fields[5]), State: strings.TrimSpace(fields[6])}
+		legacy := containerNamespace == ""
+		if err := validateHostingRuntimeInventory([]hostingObservedRuntime{runtime}); err != nil &&
+			!(legacy && validLegacyHostingRuntime(runtime)) {
+			return nil, fmt.Errorf("container runtime returned invalid managed container metadata: %w", err)
+		}
+		if !legacy && runtime.RuntimeInstanceID == "" {
+			return nil, fmt.Errorf("container runtime returned empty namespaced runtime instance")
+		}
+		containerID := strings.TrimSpace(fields[0])
+		if legacy && (legacyFilter == nil || !legacyFilter(containerID, runtime)) {
+			continue
+		}
+		identity := hostingObservedRuntimeIdentity(runtime)
+		if existingIndex, duplicate := seen[identity]; duplicate {
+			if containers[existingIndex].Legacy && !legacy {
+				containers[existingIndex] = hostingManagedRuntime{ContainerID: strings.TrimSpace(fields[0]), Runtime: runtime}
+				continue
+			}
+			if !containers[existingIndex].Legacy && legacy {
+				continue
+			}
+			if containers[existingIndex].Legacy && legacy {
+				continue
+			}
+			return nil, fmt.Errorf("multiple managed containers claim runtime identity")
+		}
+		seen[identity] = len(containers)
+		containers = append(containers, hostingManagedRuntime{ContainerID: containerID, Runtime: runtime, Legacy: legacy})
+		if len(containers) > hostingMaxRuntimeInventoryEntries {
+			return nil, fmt.Errorf("managed runtime inventory exceeds %d entries", hostingMaxRuntimeInventoryEntries)
+		}
+	}
+	return containers, nil
+}
+
+func validLegacyHostingRuntime(runtime hostingObservedRuntime) bool {
+	if runtime.RuntimeInstanceID != "" || !validSHA256Digest(runtime.ReleaseDigest) ||
+		!externalIDPattern.MatchString(runtime.ExternalProjectID) ||
+		!externalIDPattern.MatchString(runtime.ExternalDeploymentID) {
+		return false
+	}
+	switch runtime.State {
+	case "created", "restarting", "running", "removing", "paused", "exited", "dead":
+		return true
+	default:
+		return false
+	}
+}
+
+type hostingRuntimeAdoptionFile struct {
+	Version  int                     `json:"version"`
+	Runtimes []hostingManagedRuntime `json:"runtimes"`
+}
+
+func loadHostingRuntimeAdoptions(workRoot string) (map[string]hostingManagedRuntime, error) {
+	adoptions := make(map[string]hostingManagedRuntime)
+	file, err := os.Open(filepath.Join(workRoot, "runtime-adoptions.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return adoptions, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
+	decoder.DisallowUnknownFields()
+	var stored hostingRuntimeAdoptionFile
+	if err := decoder.Decode(&stored); err != nil || stored.Version != 1 || len(stored.Runtimes) > hostingMaxRuntimeInventoryEntries {
+		return nil, fmt.Errorf("invalid runtime adoption registry")
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return nil, fmt.Errorf("invalid runtime adoption registry")
+	}
+	for _, runtime := range stored.Runtimes {
+		if runtime.ContainerID == "" || !runtime.Legacy ||
+			(validateHostingRuntimeInventory([]hostingObservedRuntime{runtime.Runtime}) != nil && !validLegacyHostingRuntime(runtime.Runtime)) {
+			return nil, fmt.Errorf("invalid runtime adoption registry")
+		}
+		if _, duplicate := adoptions[runtime.ContainerID]; duplicate {
+			return nil, fmt.Errorf("duplicate runtime adoption registry entry")
+		}
+		adoptions[runtime.ContainerID] = runtime
+	}
+	return adoptions, nil
+}
+
+func saveHostingRuntimeAdoptions(workRoot string, adoptions map[string]hostingManagedRuntime) error {
+	stored := hostingRuntimeAdoptionFile{Version: 1, Runtimes: make([]hostingManagedRuntime, 0, len(adoptions))}
+	for _, runtime := range adoptions {
+		stored.Runtimes = append(stored.Runtimes, runtime)
+	}
+	temporary, err := os.CreateTemp(workRoot, ".runtime-adoptions-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := json.NewEncoder(temporary).Encode(stored); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, filepath.Join(workRoot, "runtime-adoptions.json"))
+}
+
+func reconcileHostingAgentReleases(ctx context.Context, config hostingAgentConfig, retained []hostingRetainedRelease) error {
+	namespace := hostingAgentRuntimeNamespace(config.WorkRoot)
 	retainedSet := make(map[string]struct{}, len(retained))
 	legacyRetainedSet := make(map[string]struct{})
 	for _, release := range retained {
@@ -733,34 +1169,69 @@ func reconcileHostingAgentReleases(ctx context.Context, retained []hostingRetain
 			retainedSet[base+"\x00"+release.RuntimeInstanceID] = struct{}{}
 		}
 	}
-	output, err := exec.CommandContext(ctx, "docker", "ps", "-a", "--filter", "label=light-apps.hosting.managed=true", "--format", `{{.ID}}\t{{.Label "light-apps.hosting.release"}}\t{{.Label "light-apps.hosting.project"}}\t{{.Label "light-apps.hosting.deployment"}}\t{{.Label "light-apps.hosting.instance"}}`).Output()
+	adoptions, err := loadHostingRuntimeAdoptions(config.WorkRoot)
 	if err != nil {
-		return fmt.Errorf("list managed hosting containers: %w", err)
+		return fmt.Errorf("load legacy runtime adoptions: %w", err)
 	}
-	for _, line := range strings.Split(string(output), "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
+	containers, err := listHostingAgentRuntimes(ctx, namespace, func(containerID string, runtime hostingObservedRuntime) bool {
+		if _, adopted := adoptions[containerID]; adopted {
+			return true
 		}
-		fields := strings.Split(line, "\t")
-		if len(fields) != 5 || strings.TrimSpace(fields[0]) == "" || !validSHA256Digest(strings.TrimSpace(fields[1])) {
-			return fmt.Errorf("container runtime returned invalid managed container metadata")
+		base := runtime.ExternalProjectID + "\x00" + runtime.ExternalDeploymentID + "\x00" + runtime.ReleaseDigest
+		if runtime.RuntimeInstanceID == "" {
+			_, retained := legacyRetainedSet[base]
+			return retained
 		}
-		containerID := strings.TrimSpace(fields[0])
-		base := strings.TrimSpace(fields[2]) + "\x00" + strings.TrimSpace(fields[3]) + "\x00" + strings.TrimSpace(fields[1])
-		identity := base + "\x00" + strings.TrimSpace(fields[4])
+		_, retained := retainedSet[hostingObservedRuntimeIdentity(runtime)]
+		return retained
+	})
+	if err != nil {
+		return err
+	}
+	found := make(map[string]struct{}, len(containers))
+	for _, container := range containers {
+		found[container.ContainerID] = struct{}{}
+		containerID := container.ContainerID
+		base := container.Runtime.ExternalProjectID + "\x00" + container.Runtime.ExternalDeploymentID + "\x00" + container.Runtime.ReleaseDigest
+		identity := hostingObservedRuntimeIdentity(container.Runtime)
 		_, exact := retainedSet[identity]
 		_, legacy := legacyRetainedSet[base]
-		if exact || (legacy && strings.TrimSpace(fields[4]) == "") {
+		if exact || (legacy && container.Runtime.RuntimeInstanceID == "") {
+			if container.Legacy {
+				adoptions[containerID] = container
+			}
 			continue
 		}
-		imageOutput, _ := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.Image}}", containerID).Output()
-		if err := exec.CommandContext(ctx, "docker", "rm", "-f", containerID).Run(); err != nil {
+		if container.Legacy {
+			adopted, owned := adoptions[containerID]
+			if !owned || hostingObservedRuntimeIdentity(adopted.Runtime) != identity {
+				continue
+			}
+		}
+		inspectCtx, cancelInspect := context.WithTimeout(ctx, 10*time.Second)
+		imageOutput, _ := exec.CommandContext(inspectCtx, "docker", "inspect", "--format", "{{.Image}}", containerID).Output()
+		cancelInspect()
+		removeCtx, cancelRemove := context.WithTimeout(ctx, 10*time.Second)
+		err := exec.CommandContext(removeCtx, "docker", "rm", "-f", containerID).Run()
+		cancelRemove()
+		if err != nil {
 			return fmt.Errorf("remove expired managed hosting container: %w", err)
 		}
 		imageID := strings.TrimSpace(string(imageOutput))
 		if validSHA256Digest(imageID) {
-			_ = exec.CommandContext(ctx, "docker", "image", "rm", imageID).Run()
+			imageCtx, cancelImage := context.WithTimeout(ctx, 10*time.Second)
+			_ = exec.CommandContext(imageCtx, "docker", "image", "rm", imageID).Run()
+			cancelImage()
 		}
+		delete(adoptions, containerID)
+	}
+	for containerID := range adoptions {
+		if _, exists := found[containerID]; !exists {
+			delete(adoptions, containerID)
+		}
+	}
+	if err := saveHostingRuntimeAdoptions(config.WorkRoot, adoptions); err != nil {
+		return fmt.Errorf("persist legacy runtime adoptions: %w", err)
 	}
 	return nil
 }

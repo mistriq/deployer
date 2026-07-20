@@ -60,11 +60,14 @@ const (
 	errCodeSnapshotUnavailable        = "snapshot_unavailable"
 	errCodeSnapshotUnmanaged          = "snapshot_unmanaged"
 	errCodeInvalidAgentCompletion     = "invalid_agent_completion"
+	errCodeRunnerSessionSuperseded    = "runner_session_superseded"
 )
 
 type apiErrorResponse struct {
-	Error string `json:"error"`
-	Code  string `json:"code"`
+	Error             string                   `json:"error"`
+	Code              string                   `json:"code"`
+	CleanupAuthorized bool                     `json:"cleanup_authorized,omitempty"`
+	RetainedReleases  []hostingRetainedRelease `json:"retained_releases,omitempty"`
 }
 
 func jsonError(w http.ResponseWriter, msg string, status int) {

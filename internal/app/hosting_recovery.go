@@ -28,6 +28,11 @@ type hostingRuntimeRecoveryState struct {
 	LeaseExpiresAt          sql.NullString
 	RunnerStatus            string
 	RunnerLastSeen          sql.NullString
+	RunnerActiveSession     string
+	RuntimeObservedAt       sql.NullString
+	RuntimeObservedSession  string
+	RuntimeObservedDigest   string
+	RuntimeObservedInstance string
 	ExternalProjectID       string
 	ExternalDeploymentID    string
 	ReleaseDigest           string
@@ -53,6 +58,8 @@ var allowedHostingRecoveryFailureCodes = map[string]struct{}{
 	"workload_policy_violation":    {},
 }
 
+const hostingRuntimeMissingGrace = 15 * time.Second
+
 func claimHostingRuntimeRecovery(ctx context.Context, runnerID int64) (*hostingClaimedJob, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -71,7 +78,8 @@ func claimHostingRuntimeRecovery(ctx context.Context, runnerID int64) (*hostingC
 	var state hostingRuntimeRecoveryState
 	var runtimeJSON, secretsJSON string
 	err = conn.QueryRowContext(ctx, `SELECT recovery.id, recovery.hosting_release_id,
-		release.hosting_deployment_id, release.hosting_project_id, release.runtime_runner_id,
+		release.hosting_deployment_id, release.hosting_project_id,
+		COALESCE(recovery.runtime_owner_runner_id, release.runtime_runner_id),
 		recovery.lease_generation,
 		project.external_project_id, deployment.external_deployment_id, release.release_digest,
 		release.release_artifact_digest, artifact.artifact_path, artifact.size_bytes,
@@ -185,20 +193,24 @@ func authenticateHostingRecoveryLease(ctx context.Context, runnerID, recoveryID,
 	var runtimeJSON, secretsJSON string
 	err := db.QueryRowContext(ctx, `SELECT recovery.id, recovery.hosting_release_id,
 		release.hosting_deployment_id, release.hosting_project_id, recovery.hosting_runner_id,
-		release.runtime_runner_id,
+		COALESCE(recovery.runtime_owner_runner_id, release.runtime_runner_id),
 		recovery.lease_generation, recovery.lease_token_hash, recovery.completion_fingerprint,
 		recovery.status, recovery.attempts,
 		recovery.cancel_requested_at,
 		project.external_project_id, deployment.external_deployment_id, release.release_digest,
 		release.release_artifact_digest, artifact.artifact_path, artifact.size_bytes,
 		release.runtime_endpoint, recovery.required_cpu_millis, recovery.required_ram_bytes,
-		recovery.required_disk_bytes, recovery.required_pids, release.runtime_manifest_json, job.secret_refs_json
+		recovery.required_disk_bytes, recovery.required_pids, release.runtime_manifest_json, job.secret_refs_json,
+		runner.status, runner.last_seen, runner.active_session_id, recovery.runtime_observed_at,
+		recovery.runtime_observed_session_id, recovery.runtime_observed_release_digest,
+		recovery.runtime_observed_instance_id
 		FROM hosting_runtime_recoveries recovery
 		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
 		JOIN hosting_release_artifacts artifact ON artifact.artifact_digest=release.release_artifact_digest
 		JOIN hosting_projects project ON project.id=release.hosting_project_id
 		JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
 		JOIN hosting_jobs job ON job.hosting_deployment_id=deployment.id
+		JOIN hosting_runners runner ON runner.id=recovery.hosting_runner_id
 		WHERE recovery.id=? AND recovery.hosting_runner_id=? AND recovery.lease_generation=?
 		  AND recovery.lease_token_hash=? AND recovery.status IN ('leased','running')
 		  AND recovery.lease_expires_at>?`, recoveryID, runnerID, generation, hashToken(leaseToken),
@@ -208,7 +220,9 @@ func authenticateHostingRecoveryLease(ctx context.Context, runnerID, recoveryID,
 		&state.ExternalProjectID, &state.ExternalDeploymentID,
 		&state.ReleaseDigest, &state.ReleaseArtifactDigest, &state.ReleaseArtifactPath,
 		&state.ReleaseArtifactSize, &state.PreviousRuntimeEndpoint, &state.Limits.CPUMillis,
-		&state.Limits.RAMBytes, &state.Limits.DiskBytes, &state.Limits.PIDs, &runtimeJSON, &secretsJSON)
+		&state.Limits.RAMBytes, &state.Limits.DiskBytes, &state.Limits.PIDs, &runtimeJSON, &secretsJSON,
+		&state.RunnerStatus, &state.RunnerLastSeen, &state.RunnerActiveSession, &state.RuntimeObservedAt,
+		&state.RuntimeObservedSession, &state.RuntimeObservedDigest, &state.RuntimeObservedInstance)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +294,8 @@ func handleHostingRecoveryHeartbeat(w http.ResponseWriter, r *http.Request, reco
 		jsonErrorCode(w, errCodeJobForbidden, "valid recovery lease is required", http.StatusForbidden)
 		return
 	}
-	if _, err := db.ExecContext(r.Context(), `UPDATE hosting_runners SET status='online', last_seen=? WHERE id=?`,
+	if _, err := db.ExecContext(r.Context(), `UPDATE hosting_runners SET status='online', last_seen=?
+		WHERE id=? AND active_session_id=''`,
 		formatSQLiteTime(now), runner.ID); err != nil {
 		jsonErrorCode(w, errCodeInternal, "update recovery runner liveness failed", http.StatusInternalServerError)
 		return
@@ -350,7 +365,227 @@ func handleHostingRecoveryComplete(w http.ResponseWriter, r *http.Request, recov
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func queueMissingHostingRuntimes(ctx context.Context, conn *sql.Conn, runnerID int64,
+	inventory []hostingObservedRuntime, now time.Time) error {
+	observed := make(map[string]string, len(inventory))
+	for _, runtime := range inventory {
+		observed[hostingObservedRuntimeIdentity(runtime)] = runtime.State
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT release.id, release.hosting_project_id,
+		release.hosting_deployment_id, release.release_digest, release.runtime_instance_id,
+		release.status, release.runtime_missing_since, release.runtime_missing_observations,
+		release.runtime_failure_code, release.release_artifact_digest,
+		project.external_project_id, deployment.external_deployment_id,
+		job.required_cpu_millis, job.required_ram_bytes, job.required_disk_bytes, job.required_pids,
+		recovery.id, recovery.status, recovery.hosting_runner_id
+		FROM hosting_releases release
+		JOIN hosting_projects project ON project.id=release.hosting_project_id
+		JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+		JOIN hosting_jobs job ON job.hosting_deployment_id=release.hosting_deployment_id
+		LEFT JOIN hosting_runtime_recoveries recovery ON recovery.hosting_release_id=release.id
+			AND recovery.status IN ('queued','leased','running')
+		WHERE (release.runtime_runner_id=? OR (release.runtime_runner_id IS NULL AND recovery.runtime_owner_runner_id=?))
+		  AND release.status IN ('healthy','active','inactive')
+		ORDER BY release.id`, runnerID, runnerID)
+	if err != nil {
+		return err
+	}
+	type expectedRuntime struct {
+		releaseID, projectID, deploymentID int64
+		releaseDigest, instanceID, status  string
+		missingSince                       sql.NullString
+		missingObservations                int
+		failureCode                        string
+		artifactDigest                     sql.NullString
+		externalProjectID                  string
+		externalDeploymentID               string
+		limits                             hostingWorkloadLimits
+		recoveryID                         sql.NullInt64
+		recoveryStatus                     sql.NullString
+		recoveryRunnerID                   sql.NullInt64
+	}
+	var expected []expectedRuntime
+	for rows.Next() {
+		var runtime expectedRuntime
+		if err := rows.Scan(&runtime.releaseID, &runtime.projectID, &runtime.deploymentID,
+			&runtime.releaseDigest, &runtime.instanceID, &runtime.status, &runtime.missingSince,
+			&runtime.missingObservations, &runtime.failureCode, &runtime.artifactDigest,
+			&runtime.externalProjectID, &runtime.externalDeploymentID,
+			&runtime.limits.CPUMillis, &runtime.limits.RAMBytes, &runtime.limits.DiskBytes,
+			&runtime.limits.PIDs, &runtime.recoveryID, &runtime.recoveryStatus,
+			&runtime.recoveryRunnerID); err != nil {
+			rows.Close()
+			return err
+		}
+		expected = append(expected, runtime)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, runtime := range expected {
+		identity := hostingObservedRuntimeIdentity(hostingObservedRuntime{ReleaseDigest: runtime.releaseDigest,
+			ExternalProjectID: runtime.externalProjectID, ExternalDeploymentID: runtime.externalDeploymentID,
+			RuntimeInstanceID: runtime.instanceID})
+		state, exists := observed[identity]
+		if exists && state == "running" {
+			if runtime.recoveryID.Valid && runtime.recoveryStatus.String == "queued" {
+				if _, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET status='cancelled',
+					cancel_requested_at=COALESCE(cancel_requested_at, ?), completed_at=?, lease_expires_at=NULL
+					WHERE id=? AND status='queued'`, formatSQLiteTime(now), formatSQLiteTime(now), runtime.recoveryID.Int64); err != nil {
+					return err
+				}
+				if runtime.recoveryRunnerID.Valid {
+					if err := recomputeHostingRunnerCapacity(ctx, conn, runtime.recoveryRunnerID.Int64); err != nil {
+						return err
+					}
+				}
+				if err := recordHostingEvent(ctx, conn, runtime.projectID, runtime.deploymentID,
+					"runtime_reappeared_before_recovery", hostingPhaseActive, "", nil, now); err != nil {
+					return err
+				}
+			} else if runtime.recoveryID.Valid {
+				if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_runner_id=NULL,
+					runtime_observed_at=?, runtime_failure_code=CASE WHEN runtime_failure_code='' THEN 'runner_lost' ELSE runtime_failure_code END
+					WHERE id=? AND runtime_runner_id=?`, formatSQLiteTime(now), runtime.releaseID, runnerID); err != nil {
+					return err
+				}
+				if err := recomputeHostingRunnerCapacity(ctx, conn, runnerID); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_runner_id=?,
+				runtime_observed_at=?, runtime_missing_since=NULL, runtime_missing_observations=0,
+				runtime_failure_code='' WHERE id=?`, runnerID, formatSQLiteTime(now), runtime.releaseID); err != nil {
+				return err
+			}
+			if err := recomputeHostingRunnerCapacity(ctx, conn, runnerID); err != nil {
+				return err
+			}
+			continue
+		}
+
+		observations := runtime.missingObservations + 1
+		missingSince := now
+		if runtime.missingSince.Valid {
+			missingSince = parseSQLiteTime(runtime.missingSince.String)
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_observed_at=NULL,
+			runtime_observed_session_id='', runtime_missing_since=COALESCE(runtime_missing_since, ?),
+			runtime_missing_observations=? WHERE id=?`,
+			formatSQLiteTime(now), observations, runtime.releaseID); err != nil {
+			return err
+		}
+		if observations == 1 {
+			if err := recordHostingEvent(ctx, conn, runtime.projectID, runtime.deploymentID,
+				"runtime_instance_missing_observed", hostingPhaseStarting, "",
+				map[string]any{"runtime_instance_id": runtime.instanceID, "state": state}, now); err != nil {
+				return err
+			}
+		}
+		if observations < 2 || now.Before(missingSince.Add(hostingRuntimeMissingGrace)) {
+			continue
+		}
+		if runtime.failureCode != "runtime_instance_lost" {
+			if err := recordHostingEvent(ctx, conn, runtime.projectID, runtime.deploymentID,
+				"runtime_instance_loss_confirmed", hostingPhaseStarting, "runtime_instance_lost",
+				map[string]any{"runtime_instance_id": runtime.instanceID, "state": state}, now); err != nil {
+				return err
+			}
+		}
+		if runtime.status != "active" {
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_runner_id=NULL,
+				runtime_failure_code='runtime_instance_lost' WHERE id=? AND runtime_runner_id=?`, runtime.releaseID, runnerID); err != nil {
+				return err
+			}
+			if err := recomputeHostingRunnerCapacity(ctx, conn, runnerID); err != nil {
+				return err
+			}
+			continue
+		}
+		if !runtime.artifactDigest.Valid || !validSHA256Digest(runtime.artifactDigest.String) {
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='failed', runtime_runner_id=NULL,
+				runtime_failure_code='artifact_unavailable' WHERE id=?`, runtime.releaseID); err != nil {
+				return err
+			}
+			if err := stageHostingRuntimeUnavailable(ctx, conn, runtime.projectID, runtime.deploymentID,
+				runtime.releaseID, now); err != nil {
+				return err
+			}
+			if err := recomputeHostingRunnerCapacity(ctx, conn, runnerID); err != nil {
+				return err
+			}
+			continue
+		}
+		if runtime.recoveryID.Valid {
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET
+				runtime_owner_runner_id=COALESCE(runtime_owner_runner_id, ?), allow_owner_runner=1
+				WHERE id=? AND status IN ('queued','leased','running')`, runnerID, runtime.recoveryID.Int64); err != nil {
+				return err
+			}
+		} else {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_runtime_recoveries
+				(hosting_release_id, runtime_owner_runner_id, allow_owner_runner, status,
+				 required_cpu_millis, required_ram_bytes, required_disk_bytes, required_pids, created_at)
+				VALUES (?, ?, 1, 'queued', ?, ?, ?, ?, ?)`, runtime.releaseID, runnerID,
+				runtime.limits.CPUMillis, runtime.limits.RAMBytes, runtime.limits.DiskBytes,
+				runtime.limits.PIDs, formatSQLiteTime(now)); err != nil {
+				return err
+			}
+			if err := recordHostingEvent(ctx, conn, runtime.projectID, runtime.deploymentID,
+				"runtime_recovery_queued", hostingPhaseStarting, "runtime_instance_lost", nil, now); err != nil {
+				return err
+			}
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_runner_id=NULL,
+			runtime_failure_code='runtime_instance_lost' WHERE id=? AND runtime_runner_id=?`, runtime.releaseID, runnerID); err != nil {
+			return err
+		}
+		if err := recomputeHostingRunnerCapacity(ctx, conn, runnerID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func queueLostHostingRuntimes(ctx context.Context, conn *sql.Conn, now time.Time) error {
+	inactiveRows, err := conn.QueryContext(ctx, `SELECT release.id, release.hosting_project_id,
+		release.hosting_deployment_id, release.runtime_runner_id
+		FROM hosting_releases release
+		JOIN hosting_runners runner ON runner.id=release.runtime_runner_id
+		WHERE release.status='inactive' AND runner.status='offline'`)
+	if err != nil {
+		return err
+	}
+	type lostInactiveRuntime struct {
+		releaseID, projectID, deploymentID, runnerID int64
+	}
+	var lostInactive []lostInactiveRuntime
+	for inactiveRows.Next() {
+		var runtime lostInactiveRuntime
+		if err := inactiveRows.Scan(&runtime.releaseID, &runtime.projectID, &runtime.deploymentID, &runtime.runnerID); err != nil {
+			inactiveRows.Close()
+			return err
+		}
+		lostInactive = append(lostInactive, runtime)
+	}
+	if err := inactiveRows.Close(); err != nil {
+		return err
+	}
+	for _, runtime := range lostInactive {
+		if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_runner_id=NULL,
+			runtime_failure_code='runner_lost' WHERE id=? AND status='inactive' AND runtime_runner_id=?`,
+			runtime.releaseID, runtime.runnerID); err != nil {
+			return err
+		}
+		if err := recomputeHostingRunnerCapacity(ctx, conn, runtime.runnerID); err != nil {
+			return err
+		}
+		if err := recordHostingEvent(ctx, conn, runtime.projectID, runtime.deploymentID,
+			"inactive_runtime_runner_lost", hostingPhaseActive, "runner_lost", nil, now); err != nil {
+			return err
+		}
+	}
 	rows, err := conn.QueryContext(ctx, `SELECT release.id, release.hosting_project_id,
 		release.hosting_deployment_id, release.runtime_runner_id, job.required_cpu_millis,
 			job.required_ram_bytes, job.required_disk_bytes, job.required_pids, release.release_artifact_digest
@@ -386,6 +621,10 @@ func queueLostHostingRuntimes(ctx context.Context, conn *sql.Conn, now time.Time
 		return err
 	}
 	for _, runtime := range lost {
+		if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_failure_code='runner_lost'
+			WHERE id=? AND runtime_failure_code=''`, runtime.releaseID); err != nil {
+			return err
+		}
 		if !runtime.artifactDigest.Valid || !validSHA256Digest(runtime.artifactDigest.String) {
 			if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='failed', runtime_runner_id=NULL WHERE id=?`, runtime.releaseID); err != nil {
 				return err
@@ -404,9 +643,9 @@ func queueLostHostingRuntimes(ctx context.Context, conn *sql.Conn, now time.Time
 			continue
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_runtime_recoveries
-			(hosting_release_id, status, required_cpu_millis, required_ram_bytes,
+			(hosting_release_id, runtime_owner_runner_id, status, required_cpu_millis, required_ram_bytes,
 			 required_disk_bytes, required_pids, created_at)
-			VALUES (?, 'queued', ?, ?, ?, ?, ?)`, runtime.releaseID, runtime.limits.CPUMillis,
+			VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)`, runtime.releaseID, runtime.runnerID, runtime.limits.CPUMillis,
 			runtime.limits.RAMBytes, runtime.limits.DiskBytes, runtime.limits.PIDs, formatSQLiteTime(now)); err != nil {
 			return err
 		}
@@ -471,7 +710,8 @@ func placeHostingRuntimeRecoveries(ctx context.Context, conn *sql.Conn, now time
 		project.external_project_id, project.manifest_json, project.manifest_digest,
 		project.resource_profile, project.deploy_path, project.desired_state, project.kill_switch_reason,
 		recovery.required_cpu_millis, recovery.required_ram_bytes, recovery.required_disk_bytes,
-		recovery.required_pids, release.runtime_runner_id, job.secret_refs_json
+		recovery.required_pids, COALESCE(recovery.runtime_owner_runner_id, release.runtime_runner_id, 0),
+		recovery.allow_owner_runner, job.secret_refs_json
 		FROM hosting_runtime_recoveries recovery
 		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
 		JOIN hosting_jobs job ON job.hosting_deployment_id=release.hosting_deployment_id
@@ -490,6 +730,7 @@ func placeHostingRuntimeRecoveries(ctx context.Context, conn *sql.Conn, now time
 		limits         hostingWorkloadLimits
 		manifestJSON   string
 		ownerRunner    int64
+		allowOwner     bool
 		requireSecrets bool
 	}
 	var recoveries []queuedRecovery
@@ -500,7 +741,7 @@ func placeHostingRuntimeRecoveries(ctx context.Context, conn *sql.Conn, now time
 			&recovery.manifestJSON, &recovery.project.ManifestDigest, &recovery.project.ResourceProfile,
 			&recovery.project.DeployPath, &recovery.project.DesiredState, &recovery.project.KillSwitchReason,
 			&recovery.limits.CPUMillis, &recovery.limits.RAMBytes, &recovery.limits.DiskBytes,
-			&recovery.limits.PIDs, &recovery.ownerRunner, &secretsJSON); err != nil {
+			&recovery.limits.PIDs, &recovery.ownerRunner, &recovery.allowOwner, &secretsJSON); err != nil {
 			rows.Close()
 			return err
 		}
@@ -520,7 +761,11 @@ func placeHostingRuntimeRecoveries(ctx context.Context, conn *sql.Conn, now time
 		return err
 	}
 	for _, recovery := range recoveries {
-		runnerID, err := reserveHostingRunner(ctx, conn, &recovery.project, recovery.limits, "restore", recovery.requireSecrets, recovery.ownerRunner)
+		excludedRunnerID := recovery.ownerRunner
+		if recovery.allowOwner {
+			excludedRunnerID = 0
+		}
+		runnerID, err := reserveHostingRunner(ctx, conn, &recovery.project, recovery.limits, "restore", recovery.requireSecrets, excludedRunnerID)
 		if err != nil {
 			var apiErr *hostingAPIError
 			if errorsAsHosting(err, &apiErr) && apiErr.Code == errCodeRunnerCapacityUnavailable {
@@ -597,7 +842,8 @@ func reconcileExpiredHostingRecoveries(ctx context.Context, conn *sql.Conn, now 
 				hosting_runner_id=NULL, lease_token_hash='', lease_expires_at=NULL, completed_at=? WHERE id=?`, formatSQLiteTime(now), recovery.id); err != nil {
 				return err
 			}
-			if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='failed', runtime_runner_id=NULL WHERE id=?`, recovery.releaseID); err != nil {
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='failed', runtime_runner_id=NULL,
+				runtime_failure_code='runner_lost' WHERE id=?`, recovery.releaseID); err != nil {
 				return err
 			}
 			if err := stageHostingRuntimeUnavailable(ctx, conn, recovery.projectID, recovery.deploymentID,
@@ -640,16 +886,21 @@ func stageHostingRuntimeUnavailable(ctx context.Context, conn *sql.Conn, project
 	return err
 }
 
-func compensateCancelledHostingRecovery(ctx context.Context, proxy hostingProxyClient, state *hostingRuntimeRecoveryState) error {
-	operationID := hashHostingOperation("compensate-recovery", fmt.Sprint(state.ID), fmt.Sprint(state.LeaseGeneration))
-	return executeHostingCompensation(ctx, proxy, operationID, state.ProjectID, state.DeploymentID,
+func compensateHostingRecoveryIfCurrent(ctx context.Context, proxy hostingProxyClient, operationID string,
+	state *hostingRuntimeRecoveryState, lateActivation bool) (bool, error) {
+	compensationID := hashHostingOperation("compensate-recovery", fmt.Sprint(state.ID), fmt.Sprint(state.LeaseGeneration))
+	if lateActivation {
+		compensationID = hashHostingOperation("compensate-recovery-late-activation", fmt.Sprint(state.ID), fmt.Sprint(state.LeaseGeneration))
+	}
+	err := executeHostingCompensation(ctx, proxy, compensationID, operationID, state.ProjectID, state.DeploymentID,
 		state.ExternalProjectID, state.ReleaseDigest, state.ReleaseDigest, state.PreviousRuntimeEndpoint)
-}
-
-func reconcileLateHostingRecoveryActivation(ctx context.Context, proxy hostingProxyClient, state *hostingRuntimeRecoveryState) error {
-	operationID := hashHostingOperation("compensate-recovery-late-activation", fmt.Sprint(state.ID), fmt.Sprint(state.LeaseGeneration))
-	return executeHostingCompensation(ctx, proxy, operationID, state.ProjectID, state.DeploymentID,
-		state.ExternalProjectID, state.ReleaseDigest, state.ReleaseDigest, state.PreviousRuntimeEndpoint)
+	if errors.Is(err, errHostingProxyOperationSuperseded) {
+		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return true, err
 }
 
 func completeHostingRuntimeRecovery(ctx context.Context, runnerID, recoveryID, generation int64, leaseToken string, input hostingCompletionRequest) error {
@@ -755,6 +1006,10 @@ func completeHostingRuntimeRecovery(ctx context.Context, runnerID, recoveryID, g
 	if err := validateRuntimeEndpoint(input.RuntimeEndpoint); err != nil {
 		return &hostingAPIError{Code: errCodeInvalidDeployment, Message: err.Error(), StatusCode: http.StatusBadRequest}
 	}
+	if err := verifyHostingRecoveryCandidate(ctx, state, input.RuntimeEndpoint); err != nil {
+		state.Attempts = hostingMaxJobAttempts
+		return failHostingRuntimeRecovery(ctx, state, "health_check_failed", err.Error())
+	}
 	operationID := hashHostingOperation("recover", fmt.Sprint(state.ID), fmt.Sprint(state.LeaseGeneration), state.ReleaseDigest)
 	healthJSON, _ := json.Marshal(input.HealthEvidence)
 	now := time.Now().UTC()
@@ -849,9 +1104,6 @@ func completeHostingRuntimeRecovery(ctx context.Context, runnerID, recoveryID, g
 		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
 			return err
 		}
-		if err := reconcileLateHostingRecoveryActivation(ctx, proxy, state); err != nil {
-			return err
-		}
 		if err := cancelHostingRuntimeRecovery(ctx, state, "a newer routing intent superseded runtime recovery"); err != nil && !errors.Is(err, errHostingStateConflict) {
 			return err
 		}
@@ -862,15 +1114,67 @@ func completeHostingRuntimeRecovery(ctx context.Context, runnerID, recoveryID, g
 		var operationStatus string
 		if statusErr := db.QueryRowContext(ctx, `SELECT status FROM hosting_proxy_operations
 			WHERE operation_id=?`, operationID).Scan(&operationStatus); statusErr == nil && operationStatus == "failed" {
-			if compensateErr := reconcileLateHostingRecoveryActivation(ctx, proxy, state); compensateErr != nil {
-				return compensateErr
-			}
 			return &hostingAPIError{Code: errCodeProjectSuspended,
-				Message: "runtime recovery activation was fenced and compensated", StatusCode: http.StatusConflict}
+				Message: "runtime recovery activation was superseded", StatusCode: http.StatusConflict}
 		}
 		return err
 	}
-	return commitHostingRuntimeRecovery(ctx, state, input.RuntimeEndpoint, activation.RouteRevision)
+	if err := commitHostingRuntimeRecovery(ctx, state, input.RuntimeEndpoint, activation.RouteRevision); err != nil {
+		current, currentErr := hostingProxyOperationIsCurrent(ctx, operationID)
+		if currentErr != nil {
+			return currentErr
+		}
+		if !current {
+			_ = markHostingProxyOperationFailed(ctx, operationID, errCodeConflict)
+			if cancelErr := cancelHostingRuntimeRecovery(ctx, state,
+				"a newer routing intent superseded runtime recovery"); cancelErr != nil && !errors.Is(cancelErr, errHostingStateConflict) {
+				return cancelErr
+			}
+			return &hostingAPIError{Code: errCodeProjectSuspended,
+				Message: "a newer routing intent superseded runtime recovery", StatusCode: http.StatusConflict, Err: err}
+		}
+		if _, compensateErr := compensateHostingRecoveryIfCurrent(ctx, proxy, operationID, state, true); compensateErr != nil {
+			return compensateErr
+		}
+		_ = markHostingProxyOperationFailed(ctx, operationID, errCodeReleaseNotHealthy)
+		state.Attempts = hostingMaxJobAttempts
+		if failErr := failHostingRuntimeRecovery(ctx, state, "health_check_failed",
+			"recovered runtime identity changed before activation committed"); failErr != nil && !errors.Is(failErr, errHostingStateConflict) {
+			return failErr
+		}
+		return &hostingAPIError{Code: errCodeReleaseNotHealthy,
+			Message: "recovered runtime identity changed before activation committed", StatusCode: http.StatusConflict, Err: err}
+	}
+	return nil
+}
+
+func verifyHostingRecoveryCandidate(ctx context.Context, state *hostingRuntimeRecoveryState, endpoint string) error {
+	now := time.Now().UTC()
+	expectedInstance := fmt.Sprintf("restore-%d-%d", state.ID, state.LeaseGeneration)
+	if state.RunnerStatus != "online" || !state.RunnerLastSeen.Valid ||
+		parseSQLiteTime(state.RunnerLastSeen.String).Before(now.Add(-hostingRunnerStaleAfter)) {
+		return fmt.Errorf("recovery runner is no longer live")
+	}
+	if state.RunnerActiveSession == "" {
+		return nil
+	}
+	if !state.RuntimeObservedAt.Valid ||
+		parseSQLiteTime(state.RuntimeObservedAt.String).Before(now.Add(-hostingRunnerStaleAfter)) ||
+		state.RuntimeObservedSession != state.RunnerActiveSession ||
+		state.RuntimeObservedDigest != state.ReleaseDigest ||
+		state.RuntimeObservedInstance != expectedInstance {
+		return fmt.Errorf("current runner session has not observed the exact recovered runtime")
+	}
+	healthPath := state.Runtime.HealthPath
+	if healthPath == "" {
+		healthPath = "/"
+	}
+	healthCtx, cancel := context.WithTimeout(ctx, hostingActivationReconcileHealthTimeout)
+	defer cancel()
+	if _, _, err := checkHostingCandidateHealth(healthCtx, strings.TrimRight(endpoint, "/")+healthPath); err != nil {
+		return fmt.Errorf("recovered runtime failed control-plane health gate: %w", err)
+	}
+	return nil
 }
 
 func cancelHostingRuntimeRecovery(ctx context.Context, state *hostingRuntimeRecoveryState, message string) error {
@@ -941,10 +1245,19 @@ func commitHostingRuntimeRecovery(ctx context.Context, state *hostingRuntimeReco
 	if desired != "active" || kill != "" || global != 0 {
 		return &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution is disabled during runtime recovery", StatusCode: http.StatusConflict}
 	}
+	expectedInstance := fmt.Sprintf("restore-%d-%d", state.ID, state.LeaseGeneration)
 	result, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET status='succeeded',
 		runtime_endpoint=?, completed_at=?, lease_expires_at=NULL WHERE id=? AND hosting_runner_id=?
-		AND lease_generation=? AND lease_token_hash=? AND status='running' AND cancel_requested_at IS NULL`, endpoint, formatSQLiteTime(now),
-		state.ID, state.RunnerID, state.LeaseGeneration, state.LeaseTokenHash)
+		AND lease_generation=? AND lease_token_hash=? AND status='running' AND cancel_requested_at IS NULL
+		AND (COALESCE((SELECT active_session_id FROM hosting_runners WHERE id=?), '')=''
+		  OR (runtime_observed_at>=? AND runtime_observed_session_id=(SELECT active_session_id FROM hosting_runners WHERE id=?)
+		    AND runtime_observed_release_digest=? AND runtime_observed_instance_id=?))
+		AND ?=(SELECT route_generation FROM hosting_projects WHERE id=?)
+		AND EXISTS (SELECT 1 FROM hosting_proxy_operations operation WHERE operation.hosting_runtime_recovery_id=?
+		  AND operation.status='applied' AND operation.route_generation=?)`, endpoint, formatSQLiteTime(now),
+		state.ID, state.RunnerID, state.LeaseGeneration, state.LeaseTokenHash, state.RunnerID,
+		formatSQLiteTime(now.Add(-hostingRunnerStaleAfter)), state.RunnerID, state.ReleaseDigest, expectedInstance,
+		state.RouteGeneration, state.ProjectID, state.ID, state.RouteGeneration)
 	if err != nil {
 		return err
 	}
@@ -970,10 +1283,18 @@ func commitHostingRuntimeRecovery(ctx context.Context, state *hostingRuntimeReco
 		}
 		return &hostingAPIError{Code: errCodeJobForbidden, Message: "runtime recovery lease is no longer current", StatusCode: http.StatusForbidden}
 	}
+	if err := conn.QueryRowContext(ctx, `SELECT runtime_observed_at, runtime_observed_session_id
+		FROM hosting_runtime_recoveries WHERE id=?`, state.ID).Scan(
+		&state.RuntimeObservedAt, &state.RuntimeObservedSession); err != nil {
+		return err
+	}
 	releaseResult, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_endpoint=?, route_revision=?,
-		runtime_runner_id=?, runtime_generation=runtime_generation+1, runtime_instance_id=?
+		runtime_runner_id=?, runtime_generation=runtime_generation+1, runtime_instance_id=?,
+		runtime_observed_at=?, runtime_observed_session_id=?, runtime_missing_since=NULL,
+		runtime_missing_observations=0, runtime_failure_code=''
 		WHERE id=? AND status='active'`, endpoint, routeRevision, state.RunnerID,
-		fmt.Sprintf("restore-%d-%d", state.ID, state.LeaseGeneration), state.ReleaseID)
+		expectedInstance, nullableSQLiteTimeValue(state.RuntimeObservedAt),
+		state.RuntimeObservedSession, state.ReleaseID)
 	if err != nil {
 		return err
 	}
@@ -1077,7 +1398,8 @@ func failHostingRuntimeRecovery(ctx context.Context, state *hostingRuntimeRecove
 		return err
 	}
 	if status == "failed" {
-		if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='failed', runtime_runner_id=NULL WHERE id=?`, state.ReleaseID); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='failed', runtime_runner_id=NULL,
+			runtime_failure_code=? WHERE id=?`, failureCode, state.ReleaseID); err != nil {
 			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
 			return err
 		}
@@ -1107,13 +1429,16 @@ func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 		operation.runtime_endpoint, operation.route_revision, operation.route_generation, project.route_generation,
 		recovery.id, recovery.hosting_release_id,
 		release.hosting_deployment_id, release.hosting_project_id, recovery.hosting_runner_id,
-		release.runtime_runner_id,
+		COALESCE(recovery.runtime_owner_runner_id, release.runtime_runner_id),
 		recovery.lease_generation, recovery.lease_token_hash, recovery.completion_fingerprint,
 		recovery.status, recovery.attempts,
 		project.external_project_id, deployment.external_deployment_id, release.release_digest,
 		release.runtime_endpoint, recovery.required_cpu_millis, recovery.required_ram_bytes,
 		recovery.required_disk_bytes, recovery.required_pids, recovery.cancel_requested_at,
-		recovery.lease_expires_at, runner.status, runner.last_seen, project.manifest_json
+		recovery.lease_expires_at, runner.status, runner.last_seen, runner.active_session_id,
+		recovery.runtime_observed_at, recovery.runtime_observed_session_id,
+		recovery.runtime_observed_release_digest, recovery.runtime_observed_instance_id,
+		project.manifest_json
 		FROM hosting_proxy_operations operation
 		JOIN hosting_runtime_recoveries recovery ON recovery.id=operation.hosting_runtime_recovery_id
 		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
@@ -1146,7 +1471,10 @@ func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 			&operation.state.Limits.RAMBytes, &operation.state.Limits.DiskBytes,
 			&operation.state.Limits.PIDs, &operation.state.CancelRequested,
 			&operation.state.LeaseExpiresAt, &operation.state.RunnerStatus,
-			&operation.state.RunnerLastSeen, &manifestJSON); err != nil {
+			&operation.state.RunnerLastSeen, &operation.state.RunnerActiveSession,
+			&operation.state.RuntimeObservedAt, &operation.state.RuntimeObservedSession,
+			&operation.state.RuntimeObservedDigest, &operation.state.RuntimeObservedInstance,
+			&manifestJSON); err != nil {
 			rows.Close()
 			return err
 		}
@@ -1180,7 +1508,8 @@ func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 				_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
 				continue
 			}
-			if err := compensateCancelledHostingRecovery(ctx, proxy, &operation.state); err != nil {
+			if _, err := compensateHostingRecoveryIfCurrent(ctx, proxy, operation.operationID,
+				&operation.state, false); err != nil {
 				return err
 			}
 			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeProjectSuspended); err != nil {
@@ -1203,7 +1532,8 @@ func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 			return err
 		}
 		if !allowed {
-			if err := compensateCancelledHostingRecovery(ctx, proxy, &operation.state); err != nil {
+			if _, err := compensateHostingRecoveryIfCurrent(ctx, proxy, operation.operationID,
+				&operation.state, false); err != nil {
 				return err
 			}
 			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeProjectSuspended); err != nil {
@@ -1214,24 +1544,26 @@ func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 			}
 			continue
 		}
-		runnerLive := operation.state.RunnerStatus == "online" && operation.state.RunnerLastSeen.Valid &&
-			!parseSQLiteTime(operation.state.RunnerLastSeen.String).Before(time.Now().UTC().Add(-hostingRunnerStaleAfter))
-		healthPath := operation.state.Runtime.HealthPath
-		if healthPath == "" {
-			healthPath = "/"
+		healthErr := verifyHostingRecoveryCandidate(ctx, &operation.state, operation.endpoint)
+		if healthErr == nil && operation.state.RunnerActiveSession == "" {
+			healthPath := operation.state.Runtime.HealthPath
+			if healthPath == "" {
+				healthPath = "/"
+			}
+			healthCtx, cancelHealth := context.WithTimeout(ctx, hostingActivationReconcileHealthTimeout)
+			_, _, healthErr = checkHostingCandidateHealth(healthCtx, strings.TrimRight(operation.endpoint, "/")+healthPath)
+			cancelHealth()
 		}
-		healthCtx, cancelHealth := context.WithTimeout(ctx, 30*time.Second)
-		_, _, healthErr := checkHostingCandidateHealth(healthCtx, strings.TrimRight(operation.endpoint, "/")+healthPath)
-		cancelHealth()
-		if !runnerLive || healthErr != nil {
+		if healthErr != nil {
+			if _, err := compensateHostingRecoveryIfCurrent(ctx, proxy, operation.operationID,
+				&operation.state, true); err != nil {
+				return err
+			}
 			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeReleaseNotHealthy); err != nil {
 				return err
 			}
 			operation.state.Attempts = hostingMaxJobAttempts
-			message := "recovery runner is no longer live"
-			if healthErr != nil {
-				message = "recovered runtime failed reconciliation health gate"
-			}
+			message := "recovered runtime failed reconciliation identity or health gate"
 			if err := failHostingRuntimeRecovery(ctx, &operation.state, "health_check_failed", message); err != nil {
 				return err
 			}
@@ -1272,7 +1604,19 @@ func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 			}
 		}
 		if err := commitHostingRuntimeRecovery(ctx, &operation.state, operation.endpoint, operation.routeRevision); err != nil {
-			return err
+			if _, compensateErr := compensateHostingRecoveryIfCurrent(ctx, proxy, operation.operationID,
+				&operation.state, true); compensateErr != nil {
+				return compensateErr
+			}
+			if markErr := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeReleaseNotHealthy); markErr != nil {
+				return markErr
+			}
+			operation.state.Attempts = hostingMaxJobAttempts
+			if failErr := failHostingRuntimeRecovery(ctx, &operation.state, "health_check_failed",
+				"recovered runtime identity changed before activation committed"); failErr != nil && !errors.Is(failErr, errHostingStateConflict) {
+				return failErr
+			}
+			continue
 		}
 	}
 	return nil

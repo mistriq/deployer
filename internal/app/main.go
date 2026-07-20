@@ -199,6 +199,7 @@ func Run() {
 	// control plane and never talks to Deployer directly.
 	mux.Handle("/api/internal/v1/", serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI)))
 	mux.Handle("/api/hosting-agent/v1/heartbeat", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentHeartbeat)))
+	mux.Handle("/api/hosting-agent/v1/session-retention", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentSessionRetention)))
 	mux.Handle("/api/hosting-agent/v1/poll", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentPoll)))
 	mux.Handle("/api/hosting-agent/v1/jobs/", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentJob)))
 	mux.Handle("/api/hosting-agent/v1/recoveries/", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentRecovery)))

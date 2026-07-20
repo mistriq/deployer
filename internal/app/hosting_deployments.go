@@ -16,14 +16,19 @@ import (
 )
 
 const (
-	hostingRunnerProtocolVersion = "v1"
-	hostingRunnerSecretOperation = "runtime-secrets-v1"
-	hostingIdempotencyTTL        = 24 * time.Hour
-	hostingRunnerStaleAfter      = 60 * time.Second
+	hostingRunnerProtocolVersion      = "v1"
+	hostingRunnerSecretOperation      = "runtime-secrets-v1"
+	hostingRunnerInventoryOperation   = "runtime-inventory-v1"
+	hostingMaxRuntimeInventoryEntries = 1024
+	hostingIdempotencyTTL             = 24 * time.Hour
+	hostingRunnerStaleAfter           = 60 * time.Second
+	hostingRunnerSessionTakeoverAfter = 45 * time.Second
+	hostingAgentJobHeartbeatInterval  = 10 * time.Second
 )
 
 var hostingDeploymentAdmissionLocks [64]sync.Mutex
 var hostingProjectAdmissionLocks [64]sync.Mutex
+var hostingRuntimeInventorySchedulingLimit = 1000
 
 type HostingSecretReference struct {
 	Provider  string    `json:"provider"`
@@ -579,7 +584,14 @@ func selectCompatibleHostingRunner(ctx context.Context, querier hostingRunnerQue
 		  AND free_ram_bytes-reserve_ram_bytes>=?
 		  AND free_disk_bytes-reserve_disk_bytes>=?
 		  AND free_pids-reserve_pids>=?
-		ORDER BY free_cpu_millis DESC, id`, cutoff, excludedRunnerID, limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs)
+		  AND ((SELECT COUNT(*) FROM hosting_releases release
+		          WHERE release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive'))
+		     + (SELECT COUNT(*) FROM hosting_jobs job
+		          WHERE job.hosting_runner_id=hosting_runners.id AND job.status IN ('queued','leased','running'))
+		     + (SELECT COUNT(*) FROM hosting_runtime_recoveries recovery
+		          WHERE recovery.hosting_runner_id=hosting_runners.id AND recovery.status IN ('queued','leased','running'))) < ?
+		ORDER BY free_cpu_millis DESC, id`, cutoff, excludedRunnerID, limits.CPUMillis, limits.RAMBytes,
+		limits.DiskBytes, limits.PIDs, hostingRuntimeInventorySchedulingLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -620,8 +632,15 @@ func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingP
 		  AND free_cpu_millis-reserve_cpu_millis>=?
 		  AND free_ram_bytes-reserve_ram_bytes>=?
 		  AND free_disk_bytes-reserve_disk_bytes>=?
-		  AND free_pids-reserve_pids>=?`, limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs,
-		selected, limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs)
+		  AND free_pids-reserve_pids>=?
+		  AND ((SELECT COUNT(*) FROM hosting_releases release
+		          WHERE release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive'))
+		     + (SELECT COUNT(*) FROM hosting_jobs job
+		          WHERE job.hosting_runner_id=hosting_runners.id AND job.status IN ('queued','leased','running'))
+		     + (SELECT COUNT(*) FROM hosting_runtime_recoveries recovery
+		          WHERE recovery.hosting_runner_id=hosting_runners.id AND recovery.status IN ('queued','leased','running'))) < ?`,
+		limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs, selected, limits.CPUMillis,
+		limits.RAMBytes, limits.DiskBytes, limits.PIDs, hostingRuntimeInventorySchedulingLimit)
 	if err != nil {
 		return 0, err
 	}

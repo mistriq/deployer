@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,7 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func writeHostingTestTar(t *testing.T, headers ...*tar.Header) string {
@@ -176,20 +179,22 @@ func TestReconcileHostingAgentReleasesRemovesOnlyUnretainedManagedContainers(t *
 	keep := "sha256:" + strings.Repeat("a", 64)
 	drop := "sha256:" + strings.Repeat("b", 64)
 	imageDigest := "sha256:" + strings.Repeat("c", 64)
+	namespace := hostingAgentRuntimeNamespace(directory)
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = "ps" ]; then
-  printf 'keep-container\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\ndrop-container\t%s\tproject_01JDROPX\tdeployment_01JDROPX\tbuild-2-1\nstale-container\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\n'
+  printf 'keep-container\t%s\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\trunning\ndrop-container\t%s\t%s\tproject_01JDROPX\tdeployment_01JDROPX\tbuild-2-1\trunning\nstale-container\t%s\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\texited\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi
-`, logPath, keep, drop, drop, imageDigest)
+`, logPath, namespace, keep, namespace, drop, namespace, drop, imageDigest)
 	dockerPath := filepath.Join(directory, "docker")
 	if err := os.WriteFile(dockerPath, []byte(script), 0750); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if err := reconcileHostingAgentReleases(context.Background(), []hostingRetainedRelease{{ReleaseDigest: keep, ExternalProjectID: "project_01JKEEPX", ExternalDeploymentID: "deployment_01JKEEPX", RuntimeInstanceID: "build-1-1", Status: "active"}}); err != nil {
+	config := hostingAgentConfig{WorkRoot: directory}
+	if err := reconcileHostingAgentReleases(context.Background(), config, []hostingRetainedRelease{{ReleaseDigest: keep, ExternalProjectID: "project_01JKEEPX", ExternalDeploymentID: "deployment_01JKEEPX", RuntimeInstanceID: "build-1-1", Status: "active"}}); err != nil {
 		t.Fatal(err)
 	}
 	commands, err := os.ReadFile(logPath)
@@ -201,31 +206,34 @@ fi
 		!strings.Contains(text, "rm -f stale-container") || !strings.Contains(text, "image rm "+imageDigest) {
 		t.Fatalf("docker commands = %s", text)
 	}
-	if err := reconcileHostingAgentReleases(context.Background(), []hostingRetainedRelease{{ReleaseDigest: "invalid", ExternalProjectID: "project_01JKEEPX", ExternalDeploymentID: "deployment_01JKEEPX"}}); err == nil {
+	if err := reconcileHostingAgentReleases(context.Background(), config, []hostingRetainedRelease{{ReleaseDigest: "invalid", ExternalProjectID: "project_01JKEEPX", ExternalDeploymentID: "deployment_01JKEEPX"}}); err == nil {
 		t.Fatal("invalid retained digest was accepted")
 	}
 }
 
-func TestReconcileHostingAgentReleasesAcceptsOnlyUnlabelledLegacyInstance(t *testing.T) {
+func TestReconcileHostingAgentReleasesScopesDockerInventoryToAgentNamespace(t *testing.T) {
 	directory := t.TempDir()
 	logPath := filepath.Join(directory, "docker.log")
 	digest := "sha256:" + strings.Repeat("a", 64)
+	workRoot := t.TempDir()
+	namespace := hostingAgentRuntimeNamespace(workRoot)
+	otherNamespace := strings.Repeat("f", 32)
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = "ps" ]; then
-  printf 'legacy-container\t%s\tproject_01JLEGACY\tdeployment_01JLEGACY\t\nlabelled-container\t%s\tproject_01JLEGACY\tdeployment_01JLEGACY\tbuild-9-1\n'
+  printf 'owned-container\t%s\t%s\tproject_01JOWNEDX\tdeployment_01JOWNEDX\tbuild-9-1\trunning\nother-agent-container\t%s\t%s\tproject_01JOTHERX\tdeployment_01JOTHERX\tbuild-10-1\trunning\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi
-`, logPath, digest, digest, digest)
+`, logPath, namespace, digest, otherNamespace, digest, digest)
 	dockerPath := filepath.Join(directory, "docker")
 	if err := os.WriteFile(dockerPath, []byte(script), 0750); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	retained := []hostingRetainedRelease{{ReleaseDigest: digest, ExternalProjectID: "project_01JLEGACY",
-		ExternalDeploymentID: "deployment_01JLEGACY", Status: "active"}}
-	if err := reconcileHostingAgentReleases(t.Context(), retained); err != nil {
+	retained := []hostingRetainedRelease{{ReleaseDigest: digest, ExternalProjectID: "project_01JOWNEDX",
+		ExternalDeploymentID: "deployment_01JOWNEDX", RuntimeInstanceID: "build-9-1", Status: "active"}}
+	if err := reconcileHostingAgentReleases(t.Context(), hostingAgentConfig{WorkRoot: workRoot}, retained); err != nil {
 		t.Fatal(err)
 	}
 	commands, err := os.ReadFile(logPath)
@@ -233,8 +241,391 @@ fi
 		t.Fatal(err)
 	}
 	text := string(commands)
-	if strings.Contains(text, "rm -f legacy-container") || !strings.Contains(text, "rm -f labelled-container") {
-		t.Fatalf("legacy identity cleanup commands = %s", text)
+	if strings.Contains(text, "rm -f other-agent-container") || strings.Contains(text, "rm -f owned-container") {
+		t.Fatalf("namespace-scoped cleanup commands = %s", text)
+	}
+}
+
+func TestRemoveStaleHostingContainerRefusesCrossNamespaceNameCollision(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "docker.log")
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+if [ "$1" = "inspect" ]; then
+  printf 'true\tother-namespace\tsha256:%s\tproject_01JCOLLIDE\tdeployment_01JCOLLIDE\tbuild-3-1\n'
+fi
+`, logPath, strings.Repeat("a", 64))
+	if err := os.WriteFile(filepath.Join(directory, "docker"), []byte(script), 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	err := removeStaleHostingContainer(t.Context(), "colliding-name", "owned-namespace",
+		"sha256:"+strings.Repeat("a", 64), "project_01JCOLLIDE", "deployment_01JCOLLIDE", "build-3-1")
+	if err == nil || !strings.Contains(err.Error(), "mismatched ownership labels") {
+		t.Fatalf("cross-namespace collision err=%v", err)
+	}
+	commands, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(commands), "rm -f") {
+		t.Fatalf("cross-namespace container was removed: %s", commands)
+	}
+}
+
+func TestSupersededHostingAgentSessionRetainsThenCleansRuntimesAfterHandoff(t *testing.T) {
+	workRoot := t.TempDir()
+	binDirectory := t.TempDir()
+	logPath := filepath.Join(binDirectory, "docker.log")
+	namespace := hostingAgentRuntimeNamespace(workRoot)
+	digest := "sha256:" + strings.Repeat("e", 64)
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+if [ "$1" = "ps" ]; then
+  printf 'owned-container\t%s\t%s\tproject_01JSUPERX\tdeployment_01JSUPERX\tbuild-4-1\trunning\n'
+elif [ "$1" = "inspect" ]; then
+  printf '%s\n'
+fi
+`, logPath, namespace, digest, digest)
+	if err := os.WriteFile(filepath.Join(binDirectory, "docker"), []byte(script), 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var retainServing atomic.Bool
+	retainServing.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/hosting-agent/v1/heartbeat" {
+			http.NotFound(w, r)
+			return
+		}
+		response := apiErrorResponse{Error: "another session is active", Code: errCodeRunnerSessionSuperseded,
+			CleanupAuthorized: true, RetainedReleases: make([]hostingRetainedRelease, 0)}
+		if retainServing.Load() {
+			response.RetainedReleases = append(response.RetainedReleases, hostingRetainedRelease{
+				ReleaseDigest: digest, ExternalProjectID: "project_01JSUPERX",
+				ExternalDeploymentID: "deployment_01JSUPERX", RuntimeInstanceID: "build-4-1", Status: "active",
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+	config := hostingAgentConfig{ServerURL: server.URL, Token: "test-token", WorkRoot: workRoot,
+		SessionID: strings.Repeat("f", 48), HeartbeatSequence: new(atomic.Int64), SessionAccepted: new(atomic.Bool)}
+	if err := publishHostingAgentHeartbeat(t.Context(), config, true); errors.Is(err, errHostingAgentSessionSuperseded) {
+		t.Fatalf("unaccepted replacement session claimed namespace ownership: %v", err)
+	}
+	beforeAcceptance, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(beforeAcceptance), "rm -f owned-container") {
+		t.Fatalf("unaccepted replacement session cleaned inherited runtime: %s", beforeAcceptance)
+	}
+	config.SessionAccepted.Store(true)
+	err := publishHostingAgentHeartbeat(t.Context(), config, true)
+	if !errors.Is(err, errHostingAgentSessionDraining) {
+		t.Fatalf("superseded heartbeat err=%v", err)
+	}
+	commands, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(commands), "rm -f owned-container") {
+		t.Fatalf("superseded session deleted a potentially routed runtime: %s", commands)
+	}
+	retainServing.Store(false)
+	err = publishHostingAgentHeartbeat(t.Context(), config, true)
+	if !errors.Is(err, errHostingAgentSessionSuperseded) {
+		t.Fatalf("completed superseded cleanup err=%v", err)
+	}
+	commands, readErr = os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(commands), "rm -f owned-container") {
+		t.Fatalf("superseded session did not clean handed-off runtime: %s", commands)
+	}
+}
+
+func TestRestartedSupersededAgentUsesDurableSessionForCleanup(t *testing.T) {
+	workRoot := t.TempDir()
+	binDirectory := t.TempDir()
+	logPath := filepath.Join(binDirectory, "docker.log")
+	namespace := hostingAgentRuntimeNamespace(workRoot)
+	digest := "sha256:" + strings.Repeat("6", 64)
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+if [ "$1" = "ps" ]; then
+  printf 'old-container\t%s\t%s\tproject_01JOLDSESS\tdeployment_01JOLDSESS\tbuild-7-1\trunning\n'
+elif [ "$1" = "inspect" ]; then
+  printf '%s\n'
+fi
+`, logPath, namespace, digest, digest)
+	if err := os.WriteFile(filepath.Join(binDirectory, "docker"), []byte(script), 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	oldSession := strings.Repeat("a", 48)
+	if err := persistHostingAcceptedSession(workRoot, oldSession); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/hosting-agent/v1/heartbeat":
+			jsonErrorCode(w, errCodeRunnerSessionSuperseded, "another session is active", http.StatusConflict)
+		case "/api/hosting-agent/v1/session-retention":
+			var request hostingSessionRetentionRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.SessionID != oldSession {
+				t.Errorf("cleanup session request=%+v err=%v", request, err)
+			}
+			jsonResponse(w, hostingHeartbeatResponse{RetainedReleases: []hostingRetainedRelease{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	config := hostingAgentConfig{ServerURL: server.URL, Token: "test-token", WorkRoot: workRoot,
+		SessionID: strings.Repeat("b", 48), PriorAcceptedSessionIDs: []string{oldSession},
+		HeartbeatSequence: new(atomic.Int64), SessionAccepted: new(atomic.Bool)}
+	err := publishHostingAgentHeartbeat(t.Context(), config, true)
+	if !errors.Is(err, errHostingAgentSessionSuperseded) {
+		t.Fatalf("restarted cleanup err=%v", err)
+	}
+	commands, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(commands), "rm -f old-container") {
+		t.Fatalf("restarted prior owner did not clean old runtime: %s", commands)
+	}
+	if _, err := os.Stat(hostingAcceptedSessionPath(workRoot)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("accepted session marker survived completed cleanup: %v", err)
+	}
+}
+
+func TestRestartedSupersededWorkRootCanTakeOverFailedReplacement(t *testing.T) {
+	withTempDB(t)
+	withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JTAKEOLD", "deployment_01JTAKEOLD")
+	digest := "sha256:" + strings.Repeat("5", 64)
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: "http://10.99.0.1:3000",
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	oldSession := strings.Repeat("a", 48)
+	replacementSession := strings.Repeat("b", 48)
+	freshSession := strings.Repeat("c", 48)
+	now := time.Now().UTC()
+	if _, err := db.Exec(`UPDATE hosting_runners SET active_session_id=?, last_heartbeat_sequence=4,
+		status='online', last_seen=? WHERE id=?`, replacementSession,
+		formatSQLiteTime(now.Add(-hostingRunnerSessionTakeoverAfter-time.Second)), runnerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO hosting_runner_superseded_sessions
+		(hosting_runner_id, session_id, superseded_at) VALUES (?, ?, ?)`, runnerID, oldSession,
+		formatSQLiteTime(now.Add(-time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+	workRoot := t.TempDir()
+	binDirectory := t.TempDir()
+	logPath := filepath.Join(binDirectory, "docker.log")
+	namespace := hostingAgentRuntimeNamespace(workRoot)
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+if [ "$1" = "ps" ]; then
+  printf 'retained-container\t%s\t%s\t%s\tdeployment_01JTAKEOLD\tbuild-%d-%d\trunning\n'
+elif [ "$1" = "inspect" ]; then
+  printf '%s\n'
+fi
+`, logPath, namespace, digest, project.ExternalProjectID, job.JobID, job.LeaseGeneration, digest)
+	if err := os.WriteFile(filepath.Join(binDirectory, "docker"), []byte(script), 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := persistHostingAcceptedSessions(workRoot, []string{oldSession, replacementSession}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(context.WithValue(r.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: runnerID}))
+		switch r.URL.Path {
+		case "/api/hosting-agent/v1/session-retention":
+			handleHostingAgentSessionRetention(w, r)
+		case "/api/hosting-agent/v1/heartbeat":
+			handleHostingAgentHeartbeat(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	config := hostingAgentConfig{ServerURL: server.URL, Token: "test-token", WorkRoot: workRoot,
+		SessionID: freshSession, PriorAcceptedSessionIDs: []string{oldSession, replacementSession},
+		HeartbeatSequence: new(atomic.Int64), SessionAccepted: new(atomic.Bool)}
+	if err := publishHostingAgentHeartbeat(t.Context(), config, true); err != nil {
+		t.Fatalf("fresh session did not take over failed replacement: %v", err)
+	}
+	var activeSession string
+	if err := db.QueryRow(`SELECT active_session_id FROM hosting_runners WHERE id=?`, runnerID).Scan(&activeSession); err != nil {
+		t.Fatal(err)
+	}
+	if activeSession != freshSession || !config.SessionAccepted.Load() {
+		t.Fatalf("active session=%q accepted=%v", activeSession, config.SessionAccepted.Load())
+	}
+	sessions, err := loadHostingAcceptedSessions(workRoot)
+	if err != nil || len(sessions) != 1 || sessions[0] != freshSession {
+		t.Fatalf("accepted session journal=%v err=%v", sessions, err)
+	}
+	var replacementTombstone int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_runner_superseded_sessions
+		WHERE hosting_runner_id=? AND session_id=?`, runnerID, replacementSession).Scan(&replacementTombstone); err != nil {
+		t.Fatal(err)
+	}
+	if replacementTombstone != 1 {
+		t.Fatal("failed replacement session was not durably tombstoned")
+	}
+}
+
+func TestHostingAgentDecodesMaximumSupersededRetentionResponse(t *testing.T) {
+	retained := make([]hostingRetainedRelease, hostingMaxRuntimeInventoryEntries)
+	for index := range retained {
+		retained[index] = hostingRetainedRelease{ReleaseDigest: "sha256:" + strings.Repeat("a", 64),
+			ExternalProjectID:    fmt.Sprintf("project_%0120d", index),
+			ExternalDeploymentID: fmt.Sprintf("deployment_%0117d", index),
+			RuntimeInstanceID:    fmt.Sprintf("build-%d-1", index+1), Status: "inactive"}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(hostingSupersededSessionError{Error: "superseded",
+			Code: errCodeRunnerSessionSuperseded, CleanupAuthorized: true, RetainedReleases: retained})
+	}))
+	defer server.Close()
+	_, err := hostingAgentJSONStatus(t.Context(), hostingAgentConfig{ServerURL: server.URL, Token: "test"},
+		http.MethodPost, "", map[string]bool{"heartbeat": true}, nil, nil)
+	var apiErr *hostingAgentAPIError
+	if !errors.As(err, &apiErr) || !apiErr.CleanupAuthorized || len(apiErr.RetainedReleases) != len(retained) {
+		t.Fatalf("maximum retention error=%T %v decoded=%d", err, err, func() int {
+			if apiErr == nil {
+				return 0
+			}
+			return len(apiErr.RetainedReleases)
+		}())
+	}
+}
+
+func TestHostingAgentSafelyAdoptsLegacyRuntimeBeforeCleanup(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "docker.log")
+	digest := "sha256:" + strings.Repeat("d", 64)
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+if [ "$1" = "ps" ]; then
+  printf 'legacy-container\t\t%s\tproject_01JLEGACY\tdeployment_01JLEGACY\tbuild-11-2\trunning\n'
+elif [ "$1" = "inspect" ]; then
+  printf '%s\n'
+fi
+`, logPath, digest, digest)
+	if err := os.WriteFile(filepath.Join(directory, "docker"), []byte(script), 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	otherConfig := hostingAgentConfig{WorkRoot: t.TempDir()}
+	if err := reconcileHostingAgentReleases(t.Context(), otherConfig, nil); err != nil {
+		t.Fatal(err)
+	}
+	commands, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(commands), "rm -f legacy-container") {
+		t.Fatal("unowned legacy runtime was removed")
+	}
+	ownerConfig := hostingAgentConfig{WorkRoot: t.TempDir()}
+	retained := []hostingRetainedRelease{{ReleaseDigest: digest, ExternalProjectID: "project_01JLEGACY",
+		ExternalDeploymentID: "deployment_01JLEGACY", RuntimeInstanceID: "build-11-2", Status: "active"}}
+	if err := reconcileHostingAgentReleases(t.Context(), ownerConfig, retained); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := loadHostingRuntimeAdoptions(ownerConfig.WorkRoot)
+	if err != nil || len(registry) != 1 {
+		t.Fatalf("legacy runtime adoption registry=%v err=%v", registry, err)
+	}
+	if err := reconcileHostingAgentReleases(t.Context(), ownerConfig, nil); err != nil {
+		t.Fatal(err)
+	}
+	commands, err = os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(commands), "rm -f legacy-container") {
+		t.Fatalf("adopted legacy runtime was not removed: %s", commands)
+	}
+}
+
+func TestHostingAgentPublishesLegacyRuntimeOnlyAfterDurableAdoption(t *testing.T) {
+	directory := t.TempDir()
+	workRoot := t.TempDir()
+	digest := "sha256:" + strings.Repeat("b", 64)
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "ps" ]; then
+  printf 'legacy-container\t\t%s\tproject_01JLEGACY2\tdeployment_01JLEGACY2\tbuild-12-3\trunning\n'
+elif [ "$1" = "inspect" ]; then
+  printf '%s\n'
+fi
+`, digest, digest)
+	if err := os.WriteFile(filepath.Join(directory, "docker"), []byte(script), 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var inventories [][]hostingObservedRuntime
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request hostingHeartbeatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode heartbeat: %v", err)
+		}
+		inventories = append(inventories, append([]hostingObservedRuntime(nil), (*request.RuntimeInventory)...))
+		jsonResponse(w, hostingHeartbeatResponse{RetainedReleases: []hostingRetainedRelease{{
+			ReleaseDigest: digest, ExternalProjectID: "project_01JLEGACY2",
+			ExternalDeploymentID: "deployment_01JLEGACY2", RuntimeInstanceID: "build-12-3", Status: "active",
+		}}})
+	}))
+	defer server.Close()
+	config := hostingAgentConfig{ServerURL: server.URL, Token: "htr_test", WorkRoot: workRoot,
+		SessionID: strings.Repeat("c", 48), HeartbeatSequence: new(atomic.Int64), SessionAccepted: new(atomic.Bool)}
+	if err := publishHostingAgentHeartbeat(t.Context(), config, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishHostingAgentHeartbeat(t.Context(), config, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(inventories) != 2 || len(inventories[0]) != 0 || len(inventories[1]) != 1 ||
+		inventories[1][0].RuntimeInstanceID != "build-12-3" {
+		t.Fatalf("legacy adoption inventories=%+v", inventories)
+	}
+}
+
+func TestHostingAgentInventoryFailureSuppressesHeartbeat(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "docker"), []byte("#!/bin/sh\nexit 1\n"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		jsonResponse(w, hostingHeartbeatResponse{})
+	}))
+	defer server.Close()
+	config := hostingAgentConfig{ServerURL: server.URL, Token: "htr_test", WorkRoot: t.TempDir(),
+		SessionID: strings.Repeat("a", 48), HeartbeatSequence: new(atomic.Int64)}
+	if err := publishHostingAgentHeartbeat(t.Context(), config, false); err == nil {
+		t.Fatal("Docker inventory failure was accepted")
+	}
+	if requests != 0 || config.HeartbeatSequence.Load() != 0 {
+		t.Fatalf("inventory failure sent heartbeat requests=%d sequence=%d", requests, config.HeartbeatSequence.Load())
 	}
 }
 
@@ -346,8 +737,9 @@ fi
 		ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
 		ReleaseArtifactURL: "/api/hosting-agent/v1/recoveries/77/artifact",
 	}}
+	workRoot := t.TempDir()
 	completion := runHostingWorkload(t.Context(), hostingAgentConfig{ServerURL: server.URL, Token: "runner-token",
-		WorkRoot: t.TempDir(), RuntimeBindAddress: "127.0.0.1"}, job)
+		WorkRoot: workRoot, RuntimeBindAddress: "127.0.0.1"}, job)
 	if completion.Status != "success" || completion.ReleaseDigest != releaseDigest || completion.ReleaseArtifactDigest != artifactDigest {
 		t.Fatalf("restore completion = %+v", completion)
 	}
@@ -360,6 +752,7 @@ fi
 		!strings.Contains(text, "--cap-drop=ALL") || !strings.Contains(text, "127.0.0.1::3000") ||
 		!strings.Contains(text, "--name deployer-hosting-deployment_01JRESTORE-restore-77-4") ||
 		!strings.Contains(text, "light-apps.hosting.instance=restore-77-4") ||
+		!strings.Contains(text, "light-apps.hosting.agent-namespace="+hostingAgentRuntimeNamespace(workRoot)) ||
 		strings.Contains(text, " build ") {
 		t.Fatalf("unexpected restore docker commands:\n%s", text)
 	}

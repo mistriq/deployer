@@ -60,7 +60,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [ ] Structured workload limits propagated and enforced.
 - [ ] Deny public host ports, privileged mode, capabilities, host mounts and Docker socket.
 - [x] Runtime receives secrets by short-lived reference/identity; Deployer/build DB and logs never persist plaintext.
-- [ ] Runner loss and recovery state are deterministic.
+- [x] Runner loss and recovery state are deterministic.
 - [ ] Per-project and global execution kill switches with audit reason.
 
 ## P1 — observability and operations

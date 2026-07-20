@@ -330,7 +330,8 @@ func TestHostingAgentSecretRootsAreNamespacedByWorkRoot(t *testing.T) {
 func TestHostingAgentAdvertisesSecretCapabilityOnlyWithBroker(t *testing.T) {
 	without := hostingAgentOperations(hostingAgentConfig{})
 	with := hostingAgentOperations(hostingAgentConfig{SecretBrokerURL: "https://broker.internal"})
-	if hostingStringListContains(without, hostingRunnerSecretOperation) || !hostingStringListContains(with, hostingRunnerSecretOperation) {
+	if hostingStringListContains(without, hostingRunnerSecretOperation) || !hostingStringListContains(with, hostingRunnerSecretOperation) ||
+		!hostingStringListContains(without, hostingRunnerInventoryOperation) || !hostingStringListContains(with, hostingRunnerInventoryOperation) {
 		t.Fatalf("unexpected secret capabilities: without=%v with=%v", without, with)
 	}
 }

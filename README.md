@@ -431,14 +431,45 @@ Legacy v1 agents that omit it are treated as build-only and never receive a
 restore recipe. During a rolling upgrade, deploy the new agents and confirm
 `restore` appears in `/api/internal/v1/runners` before enabling reliance on
 active-runtime recovery. Deployment polling exposes `runtime_status` as
-`available`, `recovering`, or `unavailable`; it remains authoritative after the
+`available`, `checking`, `recovering`, or `unavailable`; it remains authoritative after the
 original deployment callback. Secret-bearing releases obtain a fresh
 restore-lease identity and redeem their references again after runner loss;
-plaintext is never copied from the prior runner. Recovery currently starts
-from whole-runner liveness loss. The heartbeat
-response is an authoritative retention set, not a runner-reported runtime
-inventory, so a missing container on an otherwise online runner is not yet
-detected and the overall runner-recovery TODO item remains open.
+plaintext is never copied from the prior runner.
+
+The current agent also negotiates `runtime-inventory-v1`. Every successful
+heartbeat carries a complete, work-root-namespaced Docker snapshot under a
+random boot session and strictly increasing sequence. Omission by a legacy
+agent is non-authoritative; an explicit empty array is authoritative. A Docker
+inventory failure suppresses the heartbeat, so it cannot refresh false runner
+liveness. The first accepted snapshot enrolls a new session and records
+positive observations without treating inherited runtimes as absent; absence
+proof begins on the next accepted snapshot from that session. Missing or
+non-running exact instances then enter a persisted 15-second,
+two-observation `checking` state before recovery. Proven absence releases the
+phantom reservation and permits same-runner restore; an exact instance that
+returns before a recovery lease is claimed cancels the queued move, while a
+claimed move fences and prunes the old instance. Polling exposes the independent
+`runtime_failure_code` and latest recovery ID/status.
+
+Heartbeat bodies are bounded to 512 KiB and 1,024 unique exact identities;
+scheduling stops at 1,000 expected entries to preserve cleanup headroom.
+Unadopted global legacy containers are excluded. Exact legacy containers named
+by the authoritative retention response are recorded in the work root and are
+included in later complete snapshots, including pre-inventory empty-instance
+rows. New sessions wait through a 45-second takeover fence (before the
+60-second runner-loss threshold) without pruning inherited containers. The
+agent publishes job heartbeats and inventory every 10 seconds, so a healthy
+old process refreshes its fence before takeover is possible.
+An old accepted session that loses the fence receives
+`runner_session_superseded` with an authenticated retention set. It keeps any
+still-retained local runtime, polls through route/recovery handoff, then removes
+unretained containers and secret material before exiting. Takeover durably
+tombstones the old session so it cannot reclaim a stale replacement; after an
+old-process crash, its `0600` work-root session marker resumes cleanup through
+the non-owning retention endpoint. Candidate and
+recovery activation require a
+recent exact observation from the current session plus a fresh control-plane
+health gate. Resume remains pending while that runtime is unavailable.
 
 Runtime-secret support is negotiated independently as the
 `runtime-secrets-v1` runner operation. The agent advertises it only when a fixed
@@ -464,6 +495,7 @@ Agent API:
 Dedicated hosting-agent API:
 
 - `POST /api/hosting-agent/v1/heartbeat`
+- `POST /api/hosting-agent/v1/session-retention`
 - `POST /api/hosting-agent/v1/poll`
 - `/api/hosting-agent/v1/jobs/:jobId/{source,release-artifact,heartbeat,workload-identity,phase,logs,complete}`
 - `/api/hosting-agent/v1/recoveries/:recoveryId/{artifact,heartbeat,workload-identity,logs,complete}`

@@ -30,6 +30,7 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"/api/internal/v1/metrics:",
 		"/api/internal/v1/settings/kill-switch:",
 		"/api/hosting-agent/v1/heartbeat:",
+		"/api/hosting-agent/v1/session-retention:",
 		"/api/hosting-agent/v1/poll:",
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/source:",
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/heartbeat:",
@@ -48,7 +49,10 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"X-Deployer-Event-ID", "outside a five-minute window", "at-least-once",
 		"source-broker-openapi.yaml", "HostingSourceReference", "source_reference",
 		"secret-broker-openapi.yaml", "HostingWorkloadIdentity", "secret_reference_unavailable",
-		"runtime-secrets-v1",
+		"runtime-secrets-v1", "runtime-inventory-v1", "HostingObservedRuntime",
+		"runtime_instance_lost", "runtime_failure_code", "runtime_recovery_status",
+		"runner_session_superseded", "runtime_instance_missing_observed",
+		"runtime-adoptions.json", "cleanup_authorized", "512 KiB", "maxItems: 1024",
 	}
 	for _, value := range required {
 		if !strings.Contains(document, value) {

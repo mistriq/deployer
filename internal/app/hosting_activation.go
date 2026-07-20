@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -49,6 +50,7 @@ type hostingCompletionState struct {
 	ReleaseUploadSize       int64
 	CompletionFingerprint   string
 	RouteGeneration         int64
+	Runtime                 HostingRuntimeManifest
 }
 
 type hostingRouteGenerationQuerier interface {
@@ -151,6 +153,10 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 	if err := stageHealthyHostingRelease(ctx, state, input); err != nil {
 		return err
 	}
+	if err := verifyStagedHostingCandidate(ctx, state, input.ReleaseDigest, input.RuntimeEndpoint); err != nil {
+		return finishHostingJobTerminal(ctx, state, hostingStatusFailed, hostingPhaseFailed,
+			"health_check_failed", err.Error())
+	}
 
 	state, err = getHostingCompletionState(ctx, runnerID, jobID, generation, leaseToken)
 	if err != nil {
@@ -166,7 +172,7 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 			return proxyErr
 		}
 		operationID := hashHostingOperation("activate", state.ExternalDeploymentID, input.ReleaseDigest)
-		if err := compensateCancelledActivation(ctx, proxy, state, input.ReleaseDigest); err != nil {
+		if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operationID, state, input.ReleaseDigest); err != nil {
 			return err
 		}
 		if err := markHostingProxyOperationCommitted(ctx, operationID); err != nil {
@@ -208,9 +214,6 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
 			return err
 		}
-		if err := compensateCancelledActivation(ctx, proxy, state, input.ReleaseDigest); err != nil {
-			return err
-		}
 		return finishHostingJobTerminal(ctx, state, hostingStatusCancelled, hostingPhaseCancelled,
 			"cancelled", "a newer routing intent superseded candidate activation")
 	}
@@ -220,12 +223,30 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 
 	cancelled, err := activateHealthyHostingRelease(ctx, state, input.ReleaseDigest, activation.RouteRevision)
 	if err != nil {
-		return err
+		current, currentErr := hostingProxyOperationIsCurrent(ctx, operationID)
+		if currentErr != nil {
+			return currentErr
+		}
+		if !current {
+			_ = markHostingProxyOperationFailed(ctx, operationID, errCodeConflict)
+			return finishHostingJobTerminal(ctx, state, hostingStatusCancelled, hostingPhaseCancelled,
+				"cancelled", "a newer routing intent superseded candidate activation")
+		}
+		if _, compensateErr := compensateHostingActivationIfCurrent(ctx, proxy, operationID, state, input.ReleaseDigest); compensateErr != nil {
+			return &hostingAPIError{Code: errCodeProxyRejected,
+				Message: "candidate commit failed and proxy compensation failed", StatusCode: http.StatusBadGateway, Err: compensateErr}
+		}
+		_ = markHostingProxyOperationFailed(ctx, operationID, errCodeReleaseNotHealthy)
+		if finishErr := finishHostingJobTerminal(ctx, state, hostingStatusFailed, hostingPhaseFailed,
+			"health_check_failed", "candidate identity changed before activation committed"); finishErr != nil {
+			return finishErr
+		}
+		return nil
 	}
 	if !cancelled {
 		return nil
 	}
-	if err := compensateCancelledActivation(ctx, proxy, state, input.ReleaseDigest); err != nil {
+	if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operationID, state, input.ReleaseDigest); err != nil {
 		return &hostingAPIError{Code: errCodeProxyRejected, Message: "candidate activation was cancelled but proxy compensation failed", StatusCode: http.StatusBadGateway, Err: err}
 	}
 	if err := markHostingProxyOperationCommitted(ctx, operationID); err != nil {
@@ -309,11 +330,15 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
 		}
 	}()
-	var status, recipeJSON string
+	var status, recipeJSON, observedSession, observedDigest, observedInstance string
 	var cancelRequested sql.NullString
-	err = conn.QueryRowContext(ctx, `SELECT status, cancel_requested_at, recipe_json FROM hosting_jobs
+	var observedAt sql.NullString
+	err = conn.QueryRowContext(ctx, `SELECT status, cancel_requested_at, recipe_json,
+		runtime_observed_at, runtime_observed_session_id, runtime_observed_release_digest,
+		runtime_observed_instance_id FROM hosting_jobs
 		WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=? AND lease_expires_at>?`,
-		state.JobID, state.RunnerID, state.LeaseGeneration, state.LeaseTokenHash, formatSQLiteTime(now)).Scan(&status, &cancelRequested, &recipeJSON)
+		state.JobID, state.RunnerID, state.LeaseGeneration, state.LeaseTokenHash, formatSQLiteTime(now)).Scan(
+		&status, &cancelRequested, &recipeJSON, &observedAt, &observedSession, &observedDigest, &observedInstance)
 	if err != nil {
 		return err
 	}
@@ -326,6 +351,21 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 	var recipe hostingJobRecipe
 	if err := json.Unmarshal([]byte(recipeJSON), &recipe); err != nil {
 		return fmt.Errorf("decode immutable hosting recipe: %w", err)
+	}
+	state.Runtime = recipe.Runtime
+	var activeSession, runnerStatus string
+	var runnerLastSeen sql.NullString
+	if err := conn.QueryRowContext(ctx, `SELECT active_session_id, status, last_seen
+		FROM hosting_runners WHERE id=?`, state.RunnerID).Scan(&activeSession, &runnerStatus, &runnerLastSeen); err != nil {
+		return err
+	}
+	expectedInstance := fmt.Sprintf("build-%d-%d", state.JobID, state.LeaseGeneration)
+	if activeSession != "" && (runnerStatus != "online" || !runnerLastSeen.Valid ||
+		parseSQLiteTime(runnerLastSeen.String).Before(now.Add(-hostingRunnerStaleAfter)) ||
+		!observedAt.Valid || parseSQLiteTime(observedAt.String).Before(now.Add(-hostingRunnerStaleAfter)) ||
+		observedSession != activeSession || observedDigest != input.ReleaseDigest || observedInstance != expectedInstance) {
+		return &hostingAPIError{Code: errCodeReleaseNotHealthy,
+			Message: "current runner session has not observed the exact candidate runtime", StatusCode: http.StatusConflict}
 	}
 	runtimeJSON, err := json.Marshal(recipe.Runtime)
 	if err != nil {
@@ -359,10 +399,12 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 	if err == sql.ErrNoRows {
 		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_releases
 			(hosting_project_id, hosting_deployment_id, release_digest, release_artifact_digest, commit_sha, artifact_digest,
-			 status, health_evidence_json, previous_release_digest, runtime_endpoint, runtime_manifest_json, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, 'healthy', ?, ?, ?, ?, ?)`, state.ProjectID, state.DeploymentID,
+			 status, health_evidence_json, previous_release_digest, runtime_endpoint, runtime_manifest_json,
+			 runtime_runner_id, runtime_instance_id, runtime_observed_at, runtime_observed_session_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, 'healthy', ?, ?, ?, ?, ?, ?, ?, ?, ?)`, state.ProjectID, state.DeploymentID,
 			input.ReleaseDigest, input.ReleaseArtifactDigest, state.CommitSHA, state.ArtifactDigest, string(healthJSON),
-			state.PreviousReleaseDigest, input.RuntimeEndpoint, string(runtimeJSON), formatSQLiteTime(now)); err != nil {
+			state.PreviousReleaseDigest, input.RuntimeEndpoint, string(runtimeJSON), state.RunnerID,
+			expectedInstance, nullableSQLiteTimeValue(observedAt), observedSession, formatSQLiteTime(now)); err != nil {
 			return err
 		}
 	}
@@ -411,6 +453,58 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 		return err
 	}
 	committed = true
+	return nil
+}
+
+func nullableSQLiteTimeValue(value sql.NullString) any {
+	if !value.Valid {
+		return nil
+	}
+	return value.String
+}
+
+func verifyStagedHostingCandidate(ctx context.Context, state *hostingCompletionState, releaseDigest, endpoint string) error {
+	var runnerStatus, activeSession, observedSession, runtimeFailureCode, runtimeInstanceID string
+	var runnerLastSeen, observedAt sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT runner.status, runner.last_seen, runner.active_session_id,
+		release.runtime_observed_at, release.runtime_observed_session_id, release.runtime_failure_code,
+		release.runtime_instance_id
+		FROM hosting_releases release
+		JOIN hosting_runners runner ON runner.id=release.runtime_runner_id
+		WHERE release.hosting_project_id=? AND release.hosting_deployment_id=?
+		  AND release.release_digest=? AND release.runtime_endpoint=? AND release.status='healthy'
+		  AND release.runtime_runner_id=?`, state.ProjectID, state.DeploymentID, releaseDigest, endpoint,
+		state.RunnerID).Scan(&runnerStatus, &runnerLastSeen, &activeSession, &observedAt,
+		&observedSession, &runtimeFailureCode, &runtimeInstanceID)
+	if err != nil {
+		return fmt.Errorf("candidate identity is no longer current: %w", err)
+	}
+	now := time.Now().UTC()
+	expectedInstance := fmt.Sprintf("build-%d-%d", state.JobID, state.LeaseGeneration)
+	if runnerStatus != "online" || !runnerLastSeen.Valid ||
+		parseSQLiteTime(runnerLastSeen.String).Before(now.Add(-hostingRunnerStaleAfter)) ||
+		runtimeFailureCode != "" || runtimeInstanceID != expectedInstance {
+		return fmt.Errorf("candidate runner or exact runtime instance is no longer live")
+	}
+	if activeSession != "" && (!observedAt.Valid ||
+		parseSQLiteTime(observedAt.String).Before(now.Add(-hostingRunnerStaleAfter)) || observedSession != activeSession) {
+		return fmt.Errorf("current runner session has not recently observed the exact candidate runtime")
+	}
+	// Legacy agents predate authoritative inventory sessions. Preserve their
+	// existing completion contract during the rolling upgrade; every
+	// inventory-capable session is subject to the fresh control-plane gate.
+	if activeSession == "" {
+		return nil
+	}
+	healthPath := state.Runtime.HealthPath
+	if healthPath == "" {
+		healthPath = "/"
+	}
+	healthCtx, cancel := context.WithTimeout(ctx, hostingActivationReconcileHealthTimeout)
+	defer cancel()
+	if _, _, err := checkHostingCandidateHealth(healthCtx, strings.TrimRight(endpoint, "/")+healthPath); err != nil {
+		return fmt.Errorf("candidate failed control-plane health gate: %w", err)
+	}
 	return nil
 }
 
@@ -464,11 +558,20 @@ func activateHealthyHostingRelease(ctx context.Context, state *hostingCompletion
 		WHERE hosting_project_id=? AND status='active' AND hosting_deployment_id<>?`, formatSQLiteTime(now), state.ProjectID, state.DeploymentID); err != nil {
 		return false, err
 	}
+	expectedInstance := fmt.Sprintf("build-%d-%d", state.JobID, state.LeaseGeneration)
 	result, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?, activated_at=?,
-		deactivated_at=NULL, runtime_runner_id=?, runtime_generation=runtime_generation+1, runtime_instance_id=?
-		WHERE hosting_project_id=? AND hosting_deployment_id=? AND release_digest=? AND status='healthy'`,
-		routeRevision, formatSQLiteTime(now), state.RunnerID,
-		fmt.Sprintf("build-%d-%d", state.JobID, state.LeaseGeneration), state.ProjectID, state.DeploymentID, releaseDigest)
+		deactivated_at=NULL, runtime_generation=runtime_generation+1
+		WHERE hosting_project_id=? AND hosting_deployment_id=? AND release_digest=? AND status='healthy'
+		  AND runtime_runner_id=? AND runtime_instance_id=? AND runtime_failure_code=''
+		  AND (COALESCE((SELECT active_session_id FROM hosting_runners WHERE id=?), '')=''
+		    OR (runtime_observed_at>=? AND runtime_observed_session_id=(SELECT active_session_id FROM hosting_runners WHERE id=?)))
+		  AND ?=(SELECT route_generation FROM hosting_projects WHERE id=?)
+		  AND EXISTS (SELECT 1 FROM hosting_proxy_operations operation
+		    WHERE operation.operation_id=? AND operation.status='applied' AND operation.route_generation=?)`,
+		routeRevision, formatSQLiteTime(now), state.ProjectID, state.DeploymentID, releaseDigest,
+		state.RunnerID, expectedInstance, state.RunnerID,
+		formatSQLiteTime(now.Add(-hostingRunnerStaleAfter)), state.RunnerID, state.RouteGeneration,
+		state.ProjectID, hashHostingOperation("activate", state.ExternalDeploymentID, releaseDigest), state.RouteGeneration)
 	if err != nil {
 		return false, err
 	}
@@ -576,13 +679,24 @@ func finishHostingJobTerminal(ctx context.Context, state *hostingCompletionState
 	return nil
 }
 
-func compensateCancelledActivation(ctx context.Context, proxy hostingProxyClient, state *hostingCompletionState, candidateDigest string) error {
-	operationID := hashHostingOperation("compensate", state.ExternalDeploymentID, candidateDigest)
-	return executeHostingCompensation(ctx, proxy, operationID, state.ProjectID, state.DeploymentID,
+func compensateHostingActivationIfCurrent(ctx context.Context, proxy hostingProxyClient, operationID string,
+	state *hostingCompletionState, candidateDigest string) (bool, error) {
+	compensationID := hashHostingOperation("compensate", operationID, state.ExternalDeploymentID, candidateDigest)
+	err := executeHostingCompensation(ctx, proxy, compensationID, operationID, state.ProjectID, state.DeploymentID,
 		state.ExternalProjectID, candidateDigest, state.PreviousReleaseDigest, state.PreviousRuntimeEndpoint)
+	if errors.Is(err, errHostingProxyOperationSuperseded) {
+		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
-func executeHostingCompensation(ctx context.Context, proxy hostingProxyClient, operationID string,
+func executeHostingCompensation(ctx context.Context, proxy hostingProxyClient, operationID, sourceOperationID string,
 	projectID, deploymentID int64, externalProjectID, candidateDigest, previousDigest, previousEndpoint string) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -600,10 +714,32 @@ func executeHostingCompensation(ctx context.Context, proxy hostingProxyClient, o
 	}()
 	var generation int64
 	var storedDigest, storedEndpoint, storedStatus string
-	err = conn.QueryRowContext(ctx, `SELECT route_generation, release_digest, runtime_endpoint, status
+	var targetRunnerID sql.NullInt64
+	var targetInstance, targetSession string
+	err = conn.QueryRowContext(ctx, `SELECT route_generation, release_digest, runtime_endpoint, status,
+		target_runtime_runner_id, target_runtime_instance_id, target_runtime_session_id
 		FROM hosting_proxy_operations WHERE operation_id=? AND operation_type='compensate'`, operationID).Scan(
-		&generation, &storedDigest, &storedEndpoint, &storedStatus)
+		&generation, &storedDigest, &storedEndpoint, &storedStatus, &targetRunnerID, &targetInstance, &targetSession)
 	if err == sql.ErrNoRows {
+		if sourceOperationID != "" {
+			var sourceCurrent int
+			sourceErr := conn.QueryRowContext(ctx, `SELECT CASE
+				WHEN source.route_generation=project.route_generation AND source.status IN ('pending','applied')
+				THEN 1 ELSE 0 END
+				FROM hosting_proxy_operations source JOIN hosting_projects project
+				  ON project.id=source.hosting_project_id
+				WHERE source.operation_id=? AND source.hosting_project_id=?`, sourceOperationID, projectID).Scan(&sourceCurrent)
+			if sourceErr == sql.ErrNoRows || (sourceErr == nil && sourceCurrent == 0) {
+				if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+					return err
+				}
+				committed = true
+				return errHostingProxyOperationSuperseded
+			}
+			if sourceErr != nil {
+				return sourceErr
+			}
+		}
 		var desired, kill string
 		var global int
 		if err := conn.QueryRowContext(ctx, `SELECT project.desired_state, project.kill_switch_reason,
@@ -614,6 +750,17 @@ func executeHostingCompensation(ctx context.Context, proxy hostingProxyClient, o
 		storedDigest, storedEndpoint = previousDigest, previousEndpoint
 		if desired != "active" || kill != "" || global != 0 || storedDigest == "" || storedEndpoint == "" {
 			storedDigest, storedEndpoint = "", ""
+		} else {
+			fence, available, fenceErr := currentHostingReleaseRuntimeFence(ctx, conn, projectID, storedDigest, storedEndpoint)
+			if fenceErr != nil {
+				return fenceErr
+			}
+			if !available {
+				storedDigest, storedEndpoint = "", ""
+			} else {
+				targetRunnerID = sql.NullInt64{Int64: fence.RunnerID, Valid: true}
+				targetInstance, targetSession = fence.InstanceID, fence.SessionID
+			}
 		}
 		generation, err = nextHostingRouteGeneration(ctx, conn, projectID)
 		if err != nil {
@@ -621,20 +768,66 @@ func executeHostingCompensation(ctx context.Context, proxy hostingProxyClient, o
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
 			(operation_id, hosting_project_id, hosting_deployment_id, operation_type, release_digest,
-			 runtime_endpoint, expected_previous_release_digest, route_generation, status, created_at, updated_at)
-			VALUES (?, ?, NULLIF(?, 0), 'compensate', ?, ?, ?, ?, 'pending', ?, ?)`, operationID,
-			projectID, deploymentID, storedDigest, storedEndpoint, candidateDigest, generation,
+			 runtime_endpoint, expected_previous_release_digest, target_runtime_runner_id,
+			 target_runtime_instance_id, target_runtime_session_id, route_generation, status, created_at, updated_at)
+			VALUES (?, ?, NULLIF(?, 0), 'compensate', ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`, operationID,
+			projectID, deploymentID, storedDigest, storedEndpoint, candidateDigest, targetRunnerID,
+			targetInstance, targetSession, generation,
 			formatSQLiteTime(time.Now().UTC()), formatSQLiteTime(time.Now().UTC())); err != nil {
 			return err
 		}
 	} else if err != nil {
 		return err
-	} else if storedStatus == "committed" || storedStatus == "failed" {
+	} else if storedStatus == "committed" {
 		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
 			return err
 		}
 		committed = true
 		return nil
+	} else if storedStatus == "failed" {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return err
+		}
+		committed = true
+		return errHostingProxyOperationSuperseded
+	} else {
+		var currentGeneration int64
+		if err := conn.QueryRowContext(ctx, `SELECT route_generation FROM hosting_projects WHERE id=?`,
+			projectID).Scan(&currentGeneration); err != nil {
+			return err
+		}
+		if generation != currentGeneration {
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_proxy_operations SET status='failed',
+				last_error_code=?, updated_at=? WHERE operation_id=? AND status IN ('pending','applied')`,
+				errCodeConflict, formatSQLiteTime(time.Now().UTC()), operationID); err != nil {
+				return err
+			}
+			if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+				return err
+			}
+			committed = true
+			return errHostingProxyOperationSuperseded
+		}
+	}
+	if storedDigest != "" {
+		fence, available, fenceErr := currentHostingReleaseRuntimeFence(ctx, conn, projectID, storedDigest, storedEndpoint)
+		if fenceErr != nil {
+			return fenceErr
+		}
+		if !available || !targetRunnerID.Valid || fence.RunnerID != targetRunnerID.Int64 ||
+			fence.InstanceID != targetInstance || fence.SessionID != targetSession {
+			correctiveID, err := stageCorrectiveHostingSuspension(ctx, conn, operationID, projectID,
+				deploymentID, candidateDigest)
+			if err != nil {
+				return err
+			}
+			if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+				return err
+			}
+			committed = true
+			return executeHostingCompensation(ctx, proxy, correctiveID, "", projectID, deploymentID,
+				externalProjectID, candidateDigest, "", "")
+		}
 	}
 	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
 		return err
@@ -652,14 +845,155 @@ func executeHostingCompensation(ctx context.Context, proxy hostingProxyClient, o
 		_ = markHostingProxyOperationError(ctx, operationID, errCodeProxyUnavailable)
 		return err
 	}
-	current, err := hostingProxyOperationIsCurrent(ctx, operationID)
+	correctiveID, err := finalizeHostingCompensation(ctx, operationID, projectID, deploymentID,
+		storedDigest, storedEndpoint, candidateDigest, targetRunnerID, targetInstance, targetSession)
 	if err != nil {
 		return err
 	}
-	if !current {
-		return markHostingProxyOperationFailed(ctx, operationID, errCodeConflict)
+	if correctiveID != "" {
+		return executeHostingCompensation(ctx, proxy, correctiveID, "", projectID, deploymentID,
+			externalProjectID, candidateDigest, "", "")
 	}
-	return markHostingProxyOperationCommitted(ctx, operationID)
+	return nil
+}
+
+func stageCorrectiveHostingSuspension(ctx context.Context, conn *sql.Conn, sourceOperationID string,
+	projectID, deploymentID int64, candidateDigest string) (string, error) {
+	correctiveID := hashHostingOperation("suspend-stale-compensation", sourceOperationID)
+	now := formatSQLiteTime(time.Now().UTC())
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_proxy_operations SET status='failed',
+		last_error_code=?, updated_at=? WHERE operation_id=? AND status IN ('pending','applied')`,
+		errCodeReleaseNotHealthy, now, sourceOperationID); err != nil {
+		return "", err
+	}
+	var existing int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM hosting_proxy_operations WHERE operation_id=?`,
+		correctiveID).Scan(&existing); err != nil {
+		return "", err
+	}
+	if existing == 0 {
+		generation, err := nextHostingRouteGeneration(ctx, conn, projectID)
+		if err != nil {
+			return "", err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
+			(operation_id, hosting_project_id, hosting_deployment_id, operation_type,
+			 expected_previous_release_digest, route_generation, status, created_at, updated_at)
+			VALUES (?, ?, NULLIF(?, 0), 'compensate', ?, ?, 'pending', ?, ?)`, correctiveID,
+			projectID, deploymentID, candidateDigest, generation, now, now); err != nil {
+			return "", err
+		}
+	}
+	return correctiveID, nil
+}
+
+func finalizeHostingCompensation(ctx context.Context, operationID string, projectID, deploymentID int64,
+	storedDigest, storedEndpoint, candidateDigest string, targetRunnerID sql.NullInt64,
+	targetInstance, targetSession string) (string, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return "", err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	var generation, currentGeneration int64
+	var status string
+	if err := conn.QueryRowContext(ctx, `SELECT operation.route_generation, operation.status,
+		project.route_generation FROM hosting_proxy_operations operation JOIN hosting_projects project
+		  ON project.id=operation.hosting_project_id
+		WHERE operation.operation_id=? AND operation.hosting_project_id=?`, operationID, projectID).Scan(
+		&generation, &status, &currentGeneration); err != nil {
+		return "", err
+	}
+	if generation != currentGeneration || (status != "pending" && status != "applied") {
+		if _, err := conn.ExecContext(ctx, `UPDATE hosting_proxy_operations SET status='failed',
+			last_error_code=?, updated_at=? WHERE operation_id=? AND status IN ('pending','applied')`,
+			errCodeConflict, formatSQLiteTime(time.Now().UTC()), operationID); err != nil {
+			return "", err
+		}
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return "", err
+		}
+		committed = true
+		return "", errHostingProxyOperationSuperseded
+	}
+	correctiveID := ""
+	if storedDigest != "" {
+		fence, available, fenceErr := currentHostingReleaseRuntimeFence(ctx, conn, projectID, storedDigest, storedEndpoint)
+		if fenceErr != nil {
+			return "", fenceErr
+		}
+		if !available || !targetRunnerID.Valid || fence.RunnerID != targetRunnerID.Int64 ||
+			fence.InstanceID != targetInstance || fence.SessionID != targetSession {
+			correctiveID, err = stageCorrectiveHostingSuspension(ctx, conn, operationID, projectID,
+				deploymentID, candidateDigest)
+		}
+	}
+	if err == nil && correctiveID == "" {
+		result, updateErr := conn.ExecContext(ctx, `UPDATE hosting_proxy_operations SET status='committed',
+			last_error_code='', updated_at=? WHERE operation_id=? AND status IN ('pending','applied')
+			  AND route_generation=(SELECT route_generation FROM hosting_projects WHERE id=?)`,
+			formatSQLiteTime(time.Now().UTC()), operationID, projectID)
+		err = updateErr
+		if err == nil {
+			if affected, _ := result.RowsAffected(); affected != 1 {
+				err = errHostingStateConflict
+			}
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return "", err
+	}
+	committed = true
+	return correctiveID, nil
+}
+
+type hostingRuntimeFence struct {
+	RunnerID   int64
+	InstanceID string
+	SessionID  string
+}
+
+func currentHostingReleaseRuntimeFence(ctx context.Context, querier hostingRouteGenerationQuerier,
+	projectID int64, digest, endpoint string) (hostingRuntimeFence, bool, error) {
+	var fence hostingRuntimeFence
+	var runnerStatus, failureCode, observedSession string
+	var runnerLastSeen, observedAt, missingSince sql.NullString
+	err := querier.QueryRowContext(ctx, `SELECT release.runtime_runner_id, release.runtime_instance_id,
+		runner.active_session_id, runner.status, runner.last_seen, release.runtime_failure_code,
+		release.runtime_observed_at, release.runtime_observed_session_id, release.runtime_missing_since
+		FROM hosting_releases release JOIN hosting_runners runner ON runner.id=release.runtime_runner_id
+		WHERE release.hosting_project_id=? AND release.release_digest=? AND release.runtime_endpoint=?
+		  AND release.status IN ('healthy','active','inactive')
+		  AND NOT EXISTS (SELECT 1 FROM hosting_runtime_recoveries recovery
+		    WHERE recovery.hosting_release_id=release.id AND recovery.status IN ('queued','leased','running'))`,
+		projectID, digest, endpoint).Scan(&fence.RunnerID, &fence.InstanceID, &fence.SessionID,
+		&runnerStatus, &runnerLastSeen, &failureCode, &observedAt, &observedSession, &missingSince)
+	if err == sql.ErrNoRows {
+		return hostingRuntimeFence{}, false, nil
+	}
+	if err != nil {
+		return hostingRuntimeFence{}, false, err
+	}
+	now := time.Now().UTC()
+	available := failureCode == "" && !missingSince.Valid && runnerStatus == "online" &&
+		runnerLastSeen.Valid && !parseSQLiteTime(runnerLastSeen.String).Before(now.Add(-hostingRunnerStaleAfter))
+	if available && fence.SessionID != "" {
+		available = observedAt.Valid && observedSession == fence.SessionID &&
+			!parseSQLiteTime(observedAt.String).Before(now.Add(-hostingRunnerStaleAfter))
+	}
+	return fence, available, nil
 }
 
 func hostingActivationAllowed(ctx context.Context, projectID int64) (bool, error) {

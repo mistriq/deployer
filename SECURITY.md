@@ -56,6 +56,26 @@ command execution.
   untrusted customer build code inside platform-generated containers; keep the
   host kernel and Docker engine patched and do not mount the Docker socket into
   customer workloads.
+- Every generated managed runtime carries a canonical-work-root namespace
+  label. Agent inventory and pruning filter that exact namespace; unnamespaced
+  legacy containers become eligible only after an exact retention match is
+  durably recorded in that work root. Random boot sessions and
+  monotonic heartbeat sequences fence duplicated runner credentials from
+  publishing competing complete snapshots, and inventory collection failure
+  never refreshes runner liveness.
+- A replacement agent does not own or prune inherited runtimes until its first
+  accepted session heartbeat. Legacy containers are adopted only after an
+  exact authoritative retention match is durably recorded; unknown legacy or
+  cross-namespace containers are never removed. Accepted superseded sessions
+  are durably tombstoned so they cannot reclaim ownership. They use only the
+  authenticated bounded retention response or non-owning session-retention
+  endpoint, backed by a `0600` work-root acceptance marker, and exit after
+  deleting handed-off containers and secret material without deleting
+  potentially routed runtimes.
+- Inventory-session activation requires recent exact instance evidence from
+  the current session and a fresh control-plane health check. Rollback commits
+  compare the same runner/instance identity and compensate a racing ownership
+  loss; resume cannot route to a known-missing runtime.
 - Do not publish `deployer.db`, build logs, screenshots, or local systemd/env
   files.
 

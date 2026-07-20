@@ -29,6 +29,8 @@ type fakeProxyClient struct {
 	activateContinue chan struct{}
 	suspendStarted   chan struct{}
 	suspendContinue  chan struct{}
+	resumeStarted    chan struct{}
+	resumeContinue   chan struct{}
 	suspendedOps     map[string]struct{}
 	routeGenerations map[string]int64
 	currentSuspended bool
@@ -74,10 +76,16 @@ func (fake *fakeProxyClient) SetSuspended(_ context.Context, request proxySuspen
 	fail := fake.fail
 	started := fake.suspendStarted
 	continued := fake.suspendContinue
+	resumeStarted := fake.resumeStarted
+	resumeContinued := fake.resumeContinue
 	fake.mu.Unlock()
 	if started != nil && request.Suspended {
 		started <- struct{}{}
 		<-continued
+	}
+	if resumeStarted != nil && !request.Suspended {
+		resumeStarted <- struct{}{}
+		<-resumeContinued
 	}
 	if fail {
 		return errors.New("adapter unavailable")
@@ -294,6 +302,480 @@ func TestHostingHeartbeatCannotEraseOutstandingReservations(t *testing.T) {
 	}
 	if freeCPU != capacity.CPUMillis-limits.CPUMillis {
 		t.Fatalf("heartbeat erased reservation: free=%d", freeCPU)
+	}
+}
+
+func TestHostingRunnerPlacementReservesInventoryHeadroom(t *testing.T) {
+	withTempDB(t)
+	oldLimit := hostingRuntimeInventorySchedulingLimit
+	hostingRuntimeInventorySchedulingLimit = 1
+	t.Cleanup(func() { hostingRuntimeInventorySchedulingLimit = oldLimit })
+	_, _, runnerID, _ := createAndClaimHostingJob(t, "project_01JINVCAP1", "deployment_01JINVCAP1")
+	project, _ := provisionDeploymentTestProject(t, "project_01JINVCAP2")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, err = selectCompatibleHostingRunner(t.Context(), conn, project.Manifest, limits, "build", false, 0)
+	var capacityErr *hostingAPIError
+	if !errors.As(err, &capacityErr) || capacityErr.Code != errCodeRunnerCapacityUnavailable {
+		t.Fatalf("runner %d exceeded inventory scheduling limit: %v", runnerID, err)
+	}
+}
+
+func postHostingInventoryHeartbeat(t *testing.T, runnerID int64, free capacityDTO, sessionID string,
+	sequence int64, inventory []hostingObservedRuntime) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, err := json.Marshal(hostingHeartbeatRequest{Free: free, ProtocolVersion: hostingRunnerProtocolVersion,
+		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"20", "22"},
+		Operations: []string{"build", "restore", hostingRunnerInventoryOperation}, SessionID: sessionID,
+		Sequence: sequence, RuntimeInventory: &inventory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/heartbeat", bytes.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	request = request.WithContext(context.WithValue(request.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: runnerID}))
+	recorder := httptest.NewRecorder()
+	handleHostingAgentHeartbeat(recorder, request)
+	return recorder
+}
+
+func reconcileHostingRuntimeInventoryAt(t *testing.T, runnerID int64, inventory []hostingObservedRuntime, now time.Time) {
+	t.Helper()
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(t.Context(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	if err := queueMissingHostingRuntimes(t.Context(), conn, runnerID, inventory, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := placeHostingRuntimeRecoveries(t.Context(), conn, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(t.Context(), `COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+	committed = true
+}
+
+func TestHostingRuntimeInventoryRequiresCompleteFencedSessionSnapshots(t *testing.T) {
+	withTempDB(t)
+	capacity := hostingWorkloadLimits{CPUMillis: 1000, RAMBytes: 1 << 30, DiskBytes: 4 << 30, PIDs: 512}
+	runnerID := insertHostingRunnerForTest(t, "inventory-session", capacity)
+	free := capacityDTO{CPUMillis: capacity.CPUMillis, RAMBytes: capacity.RAMBytes,
+		DiskBytes: capacity.DiskBytes, PIDs: capacity.PIDs}
+	empty := make([]hostingObservedRuntime, 0)
+	firstSession := strings.Repeat("a", 48)
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, firstSession, 1, empty); recorder.Code != http.StatusConflict {
+		t.Fatalf("live legacy takeover status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(hostingHeartbeatRequest{RuntimeInventory: &empty})
+	if err != nil || !bytes.Contains(encoded, []byte(`"runtime_inventory":[]`)) {
+		t.Fatalf("empty complete inventory was not encoded: %s err=%v", encoded, err)
+	}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, firstSession, 1, empty); recorder.Code != http.StatusOK {
+		t.Fatalf("initial inventory heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, firstSession, 1, empty); recorder.Code != http.StatusConflict {
+		t.Fatalf("stale sequence status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	secondSession := strings.Repeat("b", 48)
+	concurrent := postHostingInventoryHeartbeat(t, runnerID, free, secondSession, 1, empty)
+	if concurrent.Code != http.StatusConflict {
+		t.Fatalf("concurrent session status=%d body=%s", concurrent.Code, concurrent.Body.String())
+	}
+	var concurrentBody apiErrorResponse
+	if err := json.Unmarshal(concurrent.Body.Bytes(), &concurrentBody); err != nil || concurrentBody.CleanupAuthorized {
+		t.Fatalf("unaccepted session received cleanup authority: %+v err=%v", concurrentBody, err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='online', last_seen=? WHERE id=?`,
+		formatSQLiteTime(time.Now().UTC().Add(-hostingRunnerSessionTakeoverAfter-time.Second)), runnerID); err != nil {
+		t.Fatal(err)
+	}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, secondSession, 1, empty); recorder.Code != http.StatusOK {
+		t.Fatalf("stale-session takeover status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	superseded := postHostingInventoryHeartbeat(t, runnerID, free, firstSession, 2, empty)
+	if superseded.Code != http.StatusConflict {
+		t.Fatalf("superseded session status=%d body=%s", superseded.Code, superseded.Body.String())
+	}
+	var supersededBody apiErrorResponse
+	if err := json.Unmarshal(superseded.Body.Bytes(), &supersededBody); err != nil ||
+		supersededBody.Code != errCodeRunnerSessionSuperseded || !supersededBody.CleanupAuthorized {
+		t.Fatalf("superseded session error=%+v decode=%v", supersededBody, err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET last_seen=? WHERE id=?`,
+		formatSQLiteTime(time.Now().UTC().Add(-hostingRunnerSessionTakeoverAfter-time.Second)), runnerID); err != nil {
+		t.Fatal(err)
+	}
+	stillSuperseded := postHostingInventoryHeartbeat(t, runnerID, free, firstSession, 3, empty)
+	if stillSuperseded.Code != http.StatusConflict {
+		t.Fatalf("tombstoned session reclaimed stale runner status=%d body=%s",
+			stillSuperseded.Code, stillSuperseded.Body.String())
+	}
+	var activeSession string
+	if err := db.QueryRow(`SELECT active_session_id FROM hosting_runners WHERE id=?`, runnerID).Scan(&activeSession); err != nil {
+		t.Fatal(err)
+	}
+	if activeSession != secondSession {
+		t.Fatalf("tombstoned session reclaimed ownership: %q", activeSession)
+	}
+	retentionPayload, _ := json.Marshal(hostingSessionRetentionRequest{SessionID: firstSession})
+	retentionRequest := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/session-retention", bytes.NewReader(retentionPayload))
+	retentionRequest.Header.Set("Content-Type", "application/json")
+	retentionRequest = retentionRequest.WithContext(context.WithValue(retentionRequest.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: runnerID}))
+	retentionRecorder := httptest.NewRecorder()
+	handleHostingAgentSessionRetention(retentionRecorder, retentionRequest)
+	if retentionRecorder.Code != http.StatusOK {
+		t.Fatalf("durable session retention status=%d body=%s", retentionRecorder.Code, retentionRecorder.Body.String())
+	}
+	legacyPayload, _ := json.Marshal(hostingHeartbeatRequest{Free: free, ProtocolVersion: "v1",
+		ManifestVersions: []string{"v1"}, RuntimeVersions: []string{"20", "22"}, Operations: []string{"build", "restore"}})
+	legacyRequest := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/heartbeat", bytes.NewReader(legacyPayload))
+	legacyRequest.Header.Set("Content-Type", "application/json")
+	legacyRequest = legacyRequest.WithContext(context.WithValue(legacyRequest.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: runnerID}))
+	legacyRecorder := httptest.NewRecorder()
+	handleHostingAgentHeartbeat(legacyRecorder, legacyRequest)
+	if legacyRecorder.Code != http.StatusConflict {
+		t.Fatalf("inventory downgrade status=%d body=%s", legacyRecorder.Code, legacyRecorder.Body.String())
+	}
+	legacyRuntime := []hostingObservedRuntime{{ReleaseDigest: "sha256:" + strings.Repeat("d", 64),
+		ExternalProjectID: "project_01JLEGEMPTY", ExternalDeploymentID: "deployment_01JLEGEMPTY",
+		RuntimeInstanceID: "", State: "running"}}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, secondSession, 2, legacyRuntime); recorder.Code != http.StatusOK {
+		t.Fatalf("adopted legacy empty-instance inventory status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	duplicate := []hostingObservedRuntime{{ReleaseDigest: "sha256:" + strings.Repeat("c", 64),
+		ExternalProjectID: "project_01JINVLDX", ExternalDeploymentID: "deployment_01JINVLDX",
+		RuntimeInstanceID: "build-1-1", State: "running"}}
+	duplicate = append(duplicate, duplicate[0])
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, secondSession, 3, duplicate); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("duplicate inventory status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestNewInventorySessionDoesNotTreatEnrollmentAsRuntimeAbsence(t *testing.T) {
+	withTempDB(t)
+	withFakeProxy(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JINVBOOT", "deployment_01JINVBOOT")
+	digest := "sha256:" + strings.Repeat("1", 64)
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: "http://10.72.0.1:3000",
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile("starter")
+	free := capacityDTO{CPUMillis: limits.CPUMillis, RAMBytes: limits.RAMBytes,
+		DiskBytes: limits.DiskBytes, PIDs: limits.PIDs}
+	sessionID := strings.Repeat("e", 48)
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 1, []hostingObservedRuntime{}); recorder.Code != http.StatusOK {
+		t.Fatalf("new session status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var missing sql.NullString
+	if err := db.QueryRow(`SELECT runtime_missing_since FROM hosting_releases WHERE release_digest=?`, digest).Scan(&missing); err != nil {
+		t.Fatal(err)
+	}
+	if missing.Valid {
+		t.Fatalf("first accepted session snapshot started absence proof at %q", missing.String)
+	}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, []hostingObservedRuntime{}); recorder.Code != http.StatusOK {
+		t.Fatalf("second session snapshot status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if err := db.QueryRow(`SELECT runtime_missing_since FROM hosting_releases WHERE release_digest=?`, digest).Scan(&missing); err != nil {
+		t.Fatal(err)
+	}
+	if !missing.Valid {
+		t.Fatal("second same-session snapshot did not begin durable absence proof")
+	}
+}
+
+func TestHostingCompletionRequiresExactCurrentSessionRuntimeObservation(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JOBSERVE", "deployment_01JOBSERVE")
+	digest := "sha256:" + strings.Repeat("6", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	healthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer healthServer.Close()
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	free := capacityDTO{CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
+		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2}
+	sessionID := strings.Repeat("d", 48)
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 1, []hostingObservedRuntime{}); recorder.Code != http.StatusOK {
+		t.Fatalf("open inventory session status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	completion := hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: healthServer.URL,
+		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}
+	var notObserved *hostingAPIError
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); !errors.As(err, &notObserved) || notObserved.Code != errCodeReleaseNotHealthy {
+		t.Fatalf("unobserved candidate err=%v", err)
+	}
+	instanceID := fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration)
+	inventory := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
+		ExternalDeploymentID: "deployment_01JOBSERVE", RuntimeInstanceID: instanceID, State: "running"}}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, inventory); recorder.Code != http.StatusOK {
+		t.Fatalf("observe candidate status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err != nil {
+		t.Fatalf("observed candidate completion: %v", err)
+	}
+	if len(fake.activations) != 1 || fake.activations[0].RuntimeEndpoint != healthServer.URL {
+		t.Fatalf("activations=%+v", fake.activations)
+	}
+}
+
+func TestHostingActivationCompensatesIfCandidateDisappearsAfterProxyCallStarts(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JOBCASXX", "deployment_01JOBCASXX")
+	digest := "sha256:" + strings.Repeat("5", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	healthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer healthServer.Close()
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	free := capacityDTO{CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
+		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2}
+	sessionID := strings.Repeat("c", 48)
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 1, []hostingObservedRuntime{}); recorder.Code != http.StatusOK {
+		t.Fatalf("open inventory session status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	instanceID := fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration)
+	inventory := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
+		ExternalDeploymentID: "deployment_01JOBCASXX", RuntimeInstanceID: instanceID, State: "running"}}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, inventory); recorder.Code != http.StatusOK {
+		t.Fatalf("observe candidate status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	fake.activateStarted = make(chan struct{}, 1)
+	fake.activateContinue = make(chan struct{})
+	completionResult := make(chan error, 1)
+	go func() {
+		completionResult <- completeHostingJob(context.Background(), runnerID, job.JobID,
+			job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{Status: "success",
+				ReleaseDigest: digest, ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: healthServer.URL,
+				HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}})
+	}()
+	<-fake.activateStarted
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 3, []hostingObservedRuntime{}); recorder.Code != http.StatusOK {
+		t.Fatalf("candidate-loss heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	close(fake.activateContinue)
+	if err := <-completionResult; err != nil {
+		t.Fatalf("fenced completion should persist terminal failure: %v", err)
+	}
+	deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JOBCASXX")
+	if err != nil || deployment.Status != hostingStatusFailed || deployment.FailureCode != "health_check_failed" {
+		t.Fatalf("fenced deployment=%+v err=%v", deployment, err)
+	}
+	if len(fake.activations) != 1 || len(fake.suspensions) != 1 || !fake.suspensions[0].Suspended || !fake.currentSuspended {
+		t.Fatalf("candidate race activations=%+v suspensions=%+v", fake.activations, fake.suspensions)
+	}
+}
+
+func TestHostingRuntimeInventorySelfHealsAndFencesReappearingInstance(t *testing.T) {
+	withTempDB(t)
+	withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JINVENT", "deployment_01JINVENT")
+	digest := "sha256:" + strings.Repeat("7", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.72.0.1:3000",
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	instanceID := fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration)
+	running := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
+		ExternalDeploymentID: "deployment_01JINVENT", RuntimeInstanceID: instanceID, State: "running"}}
+	start := time.Now().UTC()
+	reconcileHostingRuntimeInventoryAt(t, runnerID, nil, start)
+	var missingCount, recoveryCount int
+	if err := db.QueryRow(`SELECT runtime_missing_observations FROM hosting_releases WHERE release_digest=?`, digest).Scan(&missingCount); err != nil || missingCount != 1 {
+		t.Fatalf("first missing observation=%d err=%v", missingCount, err)
+	}
+	checking, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JINVENT")
+	if err != nil || checking.RuntimeStatus != "checking" || checking.RuntimeFailureCode != "" {
+		t.Fatalf("checking runtime state=%+v err=%v", checking, err)
+	}
+	reconcileHostingRuntimeInventoryAt(t, runnerID, nil, start.Add(hostingRuntimeMissingGrace+time.Second))
+	var recoveryID, recoveryRunnerID int64
+	var allowOwner int
+	if err := db.QueryRow(`SELECT id, hosting_runner_id, allow_owner_runner FROM hosting_runtime_recoveries WHERE status='queued'`).Scan(
+		&recoveryID, &recoveryRunnerID, &allowOwner); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryRunnerID != runnerID || allowOwner != 1 {
+		t.Fatalf("missing runtime recovery runner=%d allow_owner=%d", recoveryRunnerID, allowOwner)
+	}
+	recovering, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JINVENT")
+	if err != nil || recovering.RuntimeStatus != "recovering" ||
+		recovering.RuntimeFailureCode != "runtime_instance_lost" || recovering.RuntimeRecoveryStatus != "queued" {
+		t.Fatalf("confirmed runtime state=%+v err=%v", recovering, err)
+	}
+	var capacityCPU, freeCPU int64
+	if err := db.QueryRow(`SELECT capacity_cpu_millis, free_cpu_millis FROM hosting_runners WHERE id=?`, runnerID).Scan(&capacityCPU, &freeCPU); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	if freeCPU != capacityCPU-limits.CPUMillis {
+		t.Fatalf("phantom reservation was not transferred exactly once: free=%d capacity=%d", freeCPU, capacityCPU)
+	}
+	reconcileHostingRuntimeInventoryAt(t, runnerID, running, start.Add(hostingRuntimeMissingGrace+2*time.Second))
+	var firstRecoveryStatus string
+	var restoredOwner sql.NullInt64
+	if err := db.QueryRow(`SELECT status FROM hosting_runtime_recoveries WHERE id=?`, recoveryID).Scan(&firstRecoveryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT runtime_runner_id FROM hosting_releases WHERE release_digest=?`, digest).Scan(&restoredOwner); err != nil {
+		t.Fatal(err)
+	}
+	if firstRecoveryStatus != "cancelled" || !restoredOwner.Valid || restoredOwner.Int64 != runnerID {
+		t.Fatalf("pre-claim reappearance recovery=%q owner=%v", firstRecoveryStatus, restoredOwner)
+	}
+
+	secondLoss := start.Add(2 * hostingRuntimeMissingGrace)
+	reconcileHostingRuntimeInventoryAt(t, runnerID, nil, secondLoss)
+	reconcileHostingRuntimeInventoryAt(t, runnerID, nil, secondLoss.Add(hostingRuntimeMissingGrace+time.Second))
+	recovery, err := claimHostingRuntimeRecovery(t.Context(), runnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileHostingRuntimeInventoryAt(t, runnerID, running, secondLoss.Add(hostingRuntimeMissingGrace+2*time.Second))
+	var detachedOwner sql.NullInt64
+	if err := db.QueryRow(`SELECT runtime_runner_id FROM hosting_releases WHERE release_digest=?`, digest).Scan(&detachedOwner); err != nil {
+		t.Fatal(err)
+	}
+	if detachedOwner.Valid {
+		t.Fatalf("old runtime reappearance after claim regained ownership: %v", detachedOwner)
+	}
+	if err := completeHostingRuntimeRecovery(t.Context(), runnerID, recovery.JobID,
+		recovery.LeaseGeneration, recovery.LeaseToken, hostingCompletionRequest{Status: "success",
+			ReleaseDigest: digest, ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.72.0.2:3000",
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, runnerID).Scan(&freeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if freeCPU != capacityCPU-limits.CPUMillis {
+		t.Fatalf("completed self-recovery reservation free=%d capacity=%d", freeCPU, capacityCPU)
+	}
+	available, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JINVENT")
+	if err != nil || available.RuntimeStatus != "available" || available.RuntimeFailureCode != "" ||
+		available.RuntimeRecoveryStatus != "succeeded" {
+		t.Fatalf("restored runtime state=%+v err=%v", available, err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_runtime_recoveries`).Scan(&recoveryCount); err != nil || recoveryCount != 2 {
+		t.Fatalf("recovery history count=%d err=%v", recoveryCount, err)
+	}
+}
+
+func TestHostingHeartbeatRetainsObservedCurrentLeaseCandidate(t *testing.T) {
+	withTempDB(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JINFLGT", "deployment_01JINFLGT")
+	var capacity capacityDTO
+	if err := db.QueryRow(`SELECT capacity_cpu_millis, capacity_ram_bytes, capacity_disk_bytes, capacity_pids
+		FROM hosting_runners WHERE id=?`, runnerID).Scan(&capacity.CPUMillis, &capacity.RAMBytes, &capacity.DiskBytes, &capacity.PIDs); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("8", 64)
+	inventory := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
+		ExternalDeploymentID: "deployment_01JINFLGT", RuntimeInstanceID: fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration), State: "running"}}
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	recorder := postHostingInventoryHeartbeat(t, runnerID, capacity, strings.Repeat("c", 48), 1, inventory)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("candidate inventory heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response hostingHeartbeatResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.RetainedReleases) != 1 || response.RetainedReleases[0].ReleaseDigest != digest ||
+		response.RetainedReleases[0].RuntimeInstanceID != inventory[0].RuntimeInstanceID {
+		t.Fatalf("current lease candidate was not retained: %+v", response.RetainedReleases)
+	}
+	oldSeen := formatSQLiteTime(time.Now().UTC().Add(-30 * time.Second))
+	if _, err := db.Exec(`UPDATE hosting_runners SET last_seen=? WHERE id=?`, oldSeen, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/heartbeat", job.JobID), nil)
+	request.Header.Set("X-Deployer-Lease-Generation", fmt.Sprint(job.LeaseGeneration))
+	request.Header.Set("X-Deployer-Lease-Token", job.LeaseToken)
+	request = request.WithContext(context.WithValue(request.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: runnerID}))
+	leaseRecorder := httptest.NewRecorder()
+	handleHostingJobLeaseHeartbeat(leaseRecorder, request, job.JobID)
+	if leaseRecorder.Code != http.StatusOK {
+		t.Fatalf("job lease heartbeat status=%d body=%s", leaseRecorder.Code, leaseRecorder.Body.String())
+	}
+	var seen string
+	if err := db.QueryRow(`SELECT last_seen FROM hosting_runners WHERE id=?`, runnerID).Scan(&seen); err != nil {
+		t.Fatal(err)
+	}
+	if seen != oldSeen {
+		t.Fatalf("lease-only heartbeat refreshed inventory-fenced liveness: %q != %q", seen, oldSeen)
+	}
+}
+
+func TestMissingInactiveHostingRuntimeReleasesPhantomCapacity(t *testing.T) {
+	withTempDB(t)
+	withFakeProxy(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JINACTV", "deployment_01JINACTV")
+	digest := "sha256:" + strings.Repeat("4", 64)
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: "http://10.73.0.1:3000",
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_releases SET status='inactive' WHERE release_digest=?`, digest); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().UTC()
+	reconcileHostingRuntimeInventoryAt(t, runnerID, nil, start)
+	reconcileHostingRuntimeInventoryAt(t, runnerID, nil, start.Add(hostingRuntimeMissingGrace+time.Second))
+	var owner sql.NullInt64
+	var failure string
+	if err := db.QueryRow(`SELECT runtime_runner_id, runtime_failure_code FROM hosting_releases WHERE release_digest=?`, digest).Scan(&owner, &failure); err != nil {
+		t.Fatal(err)
+	}
+	var capacityCPU, freeCPU int64
+	if err := db.QueryRow(`SELECT capacity_cpu_millis, free_cpu_millis FROM hosting_runners WHERE id=?`, runnerID).Scan(&capacityCPU, &freeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if owner.Valid || failure != "runtime_instance_lost" || freeCPU != capacityCPU {
+		t.Fatalf("inactive loss owner=%v failure=%q free=%d capacity=%d", owner, failure, freeCPU, capacityCPU)
 	}
 }
 
@@ -862,10 +1344,11 @@ func TestHostingRuntimeRecoveryHonorsDurableProjectSuspension(t *testing.T) {
 	if status != "cancelled" || operationStatus != "failed" || freeCPU != capacity.CPUMillis {
 		t.Fatalf("cancelled recovery status=%q operation=%q free CPU=%d", status, operationStatus, freeCPU)
 	}
-	if len(fake.activations) != 3 || fake.activations[2].RuntimeEndpoint != "http://10.73.0.1:3000" ||
-		len(fake.suspensions) != 2 || fake.activations[2].RouteGeneration <= fake.suspensions[1].RouteGeneration ||
-		fake.activations[2].OperationID == fake.suspensions[1].OperationID || fake.currentSuspended ||
-		fake.currentEndpoint != "http://10.73.0.1:3000" {
+	if err := reconcileHostingDesiredStateOperations(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.activations) != 2 || len(fake.suspensions) != 1 ||
+		!fake.suspensions[0].Suspended || !fake.currentSuspended {
 		t.Fatalf("late recovery activation=%#v suspensions=%#v", fake.activations, fake.suspensions)
 	}
 }
@@ -1171,6 +1654,10 @@ func TestHostingPhaseReportsCannotRegress(t *testing.T) {
 func TestHostingRestartReconcilesPendingActivationAndPreservesDurableState(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
+	healthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer healthServer.Close()
 	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JREOPEN", "deployment_01JREOPEN")
 	digest := "sha256:" + strings.Repeat("9", 64)
 	releaseArtifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
@@ -1179,7 +1666,7 @@ func TestHostingRestartReconcilesPendingActivationAndPreservesDurableState(t *te
 		t.Fatal(err)
 	}
 	if err := stageHealthyHostingRelease(t.Context(), state, hostingCompletionRequest{
-		Status: "success", ReleaseDigest: digest, ReleaseArtifactDigest: releaseArtifactDigest, RuntimeEndpoint: "http://10.44.0.2:3000",
+		Status: "success", ReleaseDigest: digest, ReleaseArtifactDigest: releaseArtifactDigest, RuntimeEndpoint: healthServer.URL,
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)
@@ -1234,6 +1721,56 @@ func TestHostingRestartReconcilesPendingActivationAndPreservesDurableState(t *te
 	var freeCPU int64
 	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, runnerID).Scan(&freeCPU); err != nil || freeCPU <= 0 {
 		t.Fatalf("capacity invariant after reopen free=%d err=%v", freeCPU, err)
+	}
+}
+
+func TestHostingRestartRefusesDeadPendingCandidateActivation(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		offlineRunner bool
+	}{
+		{name: "offline runner", offlineRunner: true},
+		{name: "unhealthy endpoint"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			withTempDB(t)
+			fake := withFakeProxy(t)
+			healthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer healthServer.Close()
+			_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JDEADPX", "deployment_01JDEADPX")
+			digest := "sha256:" + strings.Repeat("3", 64)
+			artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+			state, err := getHostingCompletionState(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := stageHealthyHostingRelease(t.Context(), state, hostingCompletionRequest{Status: "success",
+				ReleaseDigest: digest, ReleaseArtifactDigest: artifactDigest,
+				RuntimeEndpoint: healthServer.URL,
+				HealthEvidence:  map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+				t.Fatal(err)
+			}
+			if test.offlineRunner {
+				if _, err := db.Exec(`UPDATE hosting_runners SET status='offline' WHERE id=?`, runnerID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			oldTimeout := hostingActivationReconcileHealthTimeout
+			hostingActivationReconcileHealthTimeout = 100 * time.Millisecond
+			t.Cleanup(func() { hostingActivationReconcileHealthTimeout = oldTimeout })
+			if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JDEADPX")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if deployment.Status != hostingStatusFailed || deployment.FailureCode != "health_check_failed" || len(fake.activations) != 0 {
+				t.Fatalf("dead candidate deployment=%+v activations=%#v", deployment, fake.activations)
+			}
+		})
 	}
 }
 
@@ -1492,6 +2029,81 @@ func TestRollbackSelectedReleaseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRollbackCompensatesWhenExactRuntimeDisappearsDuringProxyActivation(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	targetHealth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer targetHealth.Close()
+	currentHealth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer currentHealth.Close()
+	project, token, runnerID, firstJob := createAndClaimHostingJob(t, "project_01JROLLRACE", "deployment_01JROLLR1")
+	firstDigest := "sha256:" + strings.Repeat("7", 64)
+	if err := completeHostingJob(t.Context(), runnerID, firstJob.JobID, firstJob.LeaseGeneration, firstJob.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: firstDigest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, firstJob.JobID, firstDigest), RuntimeEndpoint: targetHealth.URL,
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	request := validHostingDeploymentRequest("deployment_01JROLLR2")
+	request.ManifestDigest = project.ManifestDigest
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JROLLR2", request); err != nil {
+		t.Fatal(err)
+	}
+	secondJob, err := claimHostingJob(t.Context(), runnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest := "sha256:" + strings.Repeat("8", 64)
+	if err := completeHostingJob(t.Context(), runnerID, secondJob.JobID, secondJob.LeaseGeneration, secondJob.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: secondDigest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, secondJob.JobID, secondDigest), RuntimeEndpoint: currentHealth.URL,
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	free := capacityDTO{CPUMillis: limits.CPUMillis, RAMBytes: limits.RAMBytes,
+		DiskBytes: limits.DiskBytes, PIDs: limits.PIDs}
+	sessionID := strings.Repeat("9", 48)
+	inventory := []hostingObservedRuntime{
+		{ReleaseDigest: firstDigest, ExternalProjectID: project.ExternalProjectID,
+			ExternalDeploymentID: "deployment_01JROLLR1",
+			RuntimeInstanceID:    fmt.Sprintf("build-%d-%d", firstJob.JobID, firstJob.LeaseGeneration), State: "running"},
+		{ReleaseDigest: secondDigest, ExternalProjectID: project.ExternalProjectID,
+			ExternalDeploymentID: "deployment_01JROLLR2",
+			RuntimeInstanceID:    fmt.Sprintf("build-%d-%d", secondJob.JobID, secondJob.LeaseGeneration), State: "running"},
+	}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 1, inventory); recorder.Code != http.StatusOK {
+		t.Fatalf("rollback inventory session status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	fake.activateStarted = make(chan struct{}, 1)
+	fake.activateContinue = make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, _, rollbackErr := rollbackHostingRelease(context.Background(), token, project.ExternalProjectID,
+			"deployment_01JROLLR1", firstDigest, "rollback_runtime_race_01")
+		result <- rollbackErr
+	}()
+	<-fake.activateStarted
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, []hostingObservedRuntime{}); recorder.Code != http.StatusOK {
+		t.Fatalf("rollback loss heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	close(fake.activateContinue)
+	var fenced *hostingAPIError
+	if err := <-result; !errors.As(err, &fenced) || fenced.Code != errCodeReleaseNotHealthy {
+		t.Fatalf("rollback race was not fenced: %v", err)
+	}
+	if len(fake.activations) != 3 || len(fake.suspensions) != 1 || !fake.suspensions[0].Suspended || !fake.currentSuspended {
+		t.Fatalf("rollback compensation activations=%+v suspensions=%+v", fake.activations, fake.suspensions)
+	}
+	var activeDigest string
+	if err := db.QueryRow(`SELECT release_digest FROM hosting_releases WHERE hosting_project_id=? AND status='active'`, project.ID).Scan(&activeDigest); err != nil || activeDigest != secondDigest {
+		t.Fatalf("active digest=%q err=%v", activeDigest, err)
+	}
+}
+
 func TestSuspendIntentPersistsAndReconcilesAfterProxyFailure(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
@@ -1527,6 +2139,121 @@ func TestSuspendIntentPersistsAndReconcilesAfterProxyFailure(t *testing.T) {
 	}
 	if len(fake.suspensions) != 4 || !fake.suspensions[1].Suspended || !fake.suspensions[2].Suspended || fake.suspensions[3].Suspended {
 		t.Fatalf("proxy suspension calls=%#v", fake.suspensions)
+	}
+}
+
+func TestResumeCompensatesRuntimeLossAndRemainsPendingUntilAvailable(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JRESUMEC", "deployment_01JRESUMEC")
+	digest := "sha256:" + strings.Repeat("a", 64)
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: "http://10.91.0.1:3000",
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	free := capacityDTO{CPUMillis: limits.CPUMillis, RAMBytes: limits.RAMBytes,
+		DiskBytes: limits.DiskBytes, PIDs: limits.PIDs}
+	sessionID := strings.Repeat("b", 48)
+	running := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
+		ExternalDeploymentID: "deployment_01JRESUMEC",
+		RuntimeInstanceID:    fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration), State: "running"}}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 1, running); recorder.Code != http.StatusOK {
+		t.Fatalf("resume inventory session status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	operator, err := createServiceToken("resume-race-operator", []string{serviceScopeProjectsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := setHostingProjectDesiredState(t.Context(), operator, project.ExternalProjectID,
+		"suspended", "suspend_resume_race_01"); err != nil {
+		t.Fatal(err)
+	}
+	fake.resumeStarted = make(chan struct{}, 1)
+	fake.resumeContinue = make(chan struct{})
+	resumeResult := make(chan error, 1)
+	go func() {
+		_, _, resumeErr := setHostingProjectDesiredState(context.Background(), operator, project.ExternalProjectID,
+			"active", "resume_runtime_race_01")
+		resumeResult <- resumeErr
+	}()
+	<-fake.resumeStarted
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, []hostingObservedRuntime{}); recorder.Code != http.StatusOK {
+		t.Fatalf("resume-loss heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	close(fake.resumeContinue)
+	if err := <-resumeResult; err != nil {
+		t.Fatalf("durable resume race result: %v", err)
+	}
+	if !fake.currentSuspended {
+		t.Fatal("runtime loss during resume left routing unsuspended")
+	}
+	var pendingResume, failedResume, committedCompensation int
+	if err := db.QueryRow(`SELECT
+		SUM(CASE WHEN operation_type='resume' AND status='pending' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN operation_type='resume' AND status='failed' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN operation_type='compensate' AND status='committed' THEN 1 ELSE 0 END)
+		FROM hosting_proxy_operations WHERE hosting_project_id=?`, project.ID).Scan(
+		&pendingResume, &failedResume, &committedCompensation); err != nil {
+		t.Fatal(err)
+	}
+	if pendingResume != 1 || failedResume != 1 || committedCompensation != 1 {
+		t.Fatalf("resume operations pending=%d failed=%d compensation=%d",
+			pendingResume, failedResume, committedCompensation)
+	}
+}
+
+func TestCommittedResumeCompensationMarkerRecoversPendingRetry(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _ := provisionDeploymentTestProject(t, "project_01JRESMARK")
+	resumeID := hashHostingOperation("resume-marker-source", project.ExternalProjectID)
+	now := formatSQLiteTime(time.Now().UTC())
+	if _, err := db.Exec(`INSERT INTO hosting_proxy_operations
+		(operation_id, hosting_project_id, operation_type, route_generation, desired_state, status, created_at, updated_at)
+		VALUES (?, ?, 'resume', 1, 'active', 'pending', ?, ?)`, resumeID, project.ID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_projects SET route_generation=1 WHERE id=?`, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	compensationID := hashHostingOperation("suspend-unavailable-resume", resumeID)
+	if err := stageHostingResumeCompensation(t.Context(), project.ID, resumeID, compensationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := executeHostingCompensation(t.Context(), fake, compensationID, "", project.ID, 0,
+		project.ExternalProjectID, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO hosting_proxy_operations
+		(operation_id, hosting_project_id, operation_type, route_generation, desired_state, status, created_at, updated_at)
+		VALUES (?, ?, 'resume', 1, 'active', 'pending', ?, ?)`,
+		hashHostingOperation("stale-pending-resume", project.ExternalProjectID), project.ID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a process crash after the external suspension and durable commit,
+	// but before the follow-up resume intent was staged.
+	if err := reconcileHostingCompensationOperations(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var pendingResume, currentPendingResume, markedCompensation int
+	if err := db.QueryRow(`SELECT
+		SUM(CASE WHEN operation_type='resume' AND status='pending' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN operation_type='resume' AND status='pending'
+		  AND route_generation=(SELECT route_generation FROM hosting_projects WHERE id=?) THEN 1 ELSE 0 END),
+		SUM(CASE WHEN operation_type='compensate' AND desired_state='resume_after_runtime' THEN 1 ELSE 0 END)
+		FROM hosting_proxy_operations WHERE hosting_project_id=?`, project.ID, project.ID).Scan(
+		&pendingResume, &currentPendingResume, &markedCompensation); err != nil {
+		t.Fatal(err)
+	}
+	if pendingResume != 2 || currentPendingResume != 1 || markedCompensation != 0 || !fake.currentSuspended {
+		t.Fatalf("recovered marker pending resumes=%d current=%d marked compensations=%d suspended=%v",
+			pendingResume, currentPendingResume, markedCompensation, fake.currentSuspended)
 	}
 }
 
@@ -1581,14 +2308,14 @@ func TestDesiredStateRouteGenerationFencesLateSuspend(t *testing.T) {
 	}
 }
 
-func TestHostingRouteCompensationSurvivesAdapterFailureAndRestart(t *testing.T) {
+func TestHostingRouteCompensationSurvivesAdapterFailureAndSuspendsUnavailableFallback(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
 	project, _ := provisionDeploymentTestProject(t, "project_01JCOMPSAG")
 	digest := "sha256:" + strings.Repeat("e", 64)
 	operationID := hashHostingOperation("test-compensation", project.ExternalProjectID)
 	fake.fail = true
-	err := executeHostingCompensation(t.Context(), fake, operationID, project.ID, 0,
+	err := executeHostingCompensation(t.Context(), fake, operationID, "", project.ID, 0,
 		project.ExternalProjectID, "sha256:"+strings.Repeat("f", 64), digest, "http://10.88.0.1:3000")
 	if err == nil {
 		t.Fatal("adapter failure unexpectedly committed compensation")
@@ -1609,8 +2336,209 @@ func TestHostingRouteCompensationSurvivesAdapterFailureAndRestart(t *testing.T) 
 	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE operation_id=?`, operationID).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if status != "committed" || fake.currentEndpoint != "http://10.88.0.1:3000" {
-		t.Fatalf("reconciled compensation status=%q endpoint=%q", status, fake.currentEndpoint)
+	if status != "committed" || !fake.currentSuspended || fake.currentEndpoint != "" {
+		t.Fatalf("reconciled compensation status=%q suspended=%v endpoint=%q",
+			status, fake.currentSuspended, fake.currentEndpoint)
+	}
+}
+
+func TestHostingCompensationSuspendsIfExactFallbackDisappearsDuringProxyActivation(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JCOMPLOS", "deployment_01JCOMPLOS")
+	digest := "sha256:" + strings.Repeat("7", 64)
+	endpoint := "http://10.88.1.1:3000"
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: endpoint,
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	fake.activateStarted = make(chan struct{}, 1)
+	fake.activateContinue = make(chan struct{})
+	operationID := hashHostingOperation("test-fallback-loss", project.ExternalProjectID)
+	result := make(chan error, 1)
+	go func() {
+		result <- executeHostingCompensation(context.Background(), fake, operationID, "", project.ID,
+			job.JobID, project.ExternalProjectID, "sha256:"+strings.Repeat("8", 64), digest, endpoint)
+	}()
+	<-fake.activateStarted
+	start := time.Now().UTC()
+	reconcileHostingRuntimeInventoryAt(t, runnerID, nil, start)
+	reconcileHostingRuntimeInventoryAt(t, runnerID, nil, start.Add(hostingRuntimeMissingGrace+time.Second))
+	close(fake.activateContinue)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE operation_id=?`, operationID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || !fake.currentSuspended {
+		t.Fatalf("stale fallback compensation status=%q suspended=%v activations=%+v suspensions=%+v",
+			status, fake.currentSuspended, fake.activations, fake.suspensions)
+	}
+}
+
+func TestHostingCompensationIdentityIncludesSourceRoutingIntent(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _ := provisionDeploymentTestProject(t, "project_01JCOMPIDS")
+	state := &hostingCompletionState{ProjectID: project.ID, ExternalProjectID: project.ExternalProjectID,
+		ExternalDeploymentID: "deployment_01JCOMPIDS"}
+	candidate := "sha256:" + strings.Repeat("9", 64)
+	for index := 1; index <= 2; index++ {
+		sourceID := hashHostingOperation("rollback-source", fmt.Sprint(index))
+		now := formatSQLiteTime(time.Now().UTC())
+		if _, err := db.Exec(`UPDATE hosting_projects SET route_generation=? WHERE id=?`, index*2-1, project.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO hosting_proxy_operations
+			(operation_id, hosting_project_id, operation_type, release_digest, route_generation, status, created_at, updated_at)
+			VALUES (?, ?, 'rollback', ?, ?, 'pending', ?, ?)`, sourceID, project.ID, candidate, index*2-1, now, now); err != nil {
+			t.Fatal(err)
+		}
+		compensated, err := compensateHostingActivationIfCurrent(t.Context(), fake, sourceID, state, candidate)
+		if err != nil || !compensated {
+			t.Fatalf("source %d compensation applied=%v err=%v", index, compensated, err)
+		}
+	}
+	var compensations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations WHERE hosting_project_id=?
+		AND operation_type='compensate'`, project.ID).Scan(&compensations); err != nil {
+		t.Fatal(err)
+	}
+	if compensations != 2 || len(fake.suspensions) != 2 ||
+		fake.suspensions[0].OperationID == fake.suspensions[1].OperationID {
+		t.Fatalf("compensations=%d suspensions=%+v", compensations, fake.suspensions)
+	}
+}
+
+func TestSupersededPendingCompensationCannotStageNewerSuspension(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JCOMPNEW", "deployment_01JCOMPNEW")
+	digest := "sha256:" + strings.Repeat("2", 64)
+	endpoint := "http://10.88.2.1:3000"
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: endpoint,
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	operationID := hashHostingOperation("pending-compensation", project.ExternalProjectID)
+	fake.fail = true
+	if err := executeHostingCompensation(t.Context(), fake, operationID, "", project.ID, job.JobID,
+		project.ExternalProjectID, "sha256:"+strings.Repeat("3", 64), digest, endpoint); err == nil {
+		t.Fatal("adapter failure did not leave compensation pending")
+	}
+	fake.fail = false
+	var newerGeneration int64
+	if err := db.QueryRow(`UPDATE hosting_projects SET route_generation=route_generation+1 WHERE id=? RETURNING route_generation`,
+		project.ID).Scan(&newerGeneration); err != nil {
+		t.Fatal(err)
+	}
+	now := formatSQLiteTime(time.Now().UTC())
+	if _, err := db.Exec(`INSERT INTO hosting_proxy_operations
+		(operation_id, hosting_project_id, operation_type, route_generation, status, created_at, updated_at)
+		VALUES (?, ?, 'rollback', ?, 'committed', ?, ?)`, hashHostingOperation("newer-route"), project.ID,
+		newerGeneration, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_releases SET runtime_missing_since=? WHERE release_digest=?`, now, digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingCompensationOperations(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var generation int64
+	var status string
+	if err := db.QueryRow(`SELECT route_generation FROM hosting_projects WHERE id=?`, project.ID).Scan(&generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE operation_id=?`, operationID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if generation != newerGeneration || status != "failed" || len(fake.suspensions) != 0 {
+		t.Fatalf("generation=%d newer=%d status=%q suspensions=%+v", generation, newerGeneration, status, fake.suspensions)
+	}
+}
+
+func TestUnavailableResumeCannotFenceNewerRoutingIntent(t *testing.T) {
+	withTempDB(t)
+	project, _ := provisionDeploymentTestProject(t, "project_01JRESFENC")
+	now := formatSQLiteTime(time.Now().UTC())
+	resumeID := hashHostingOperation("resume-source", project.ExternalProjectID)
+	if _, err := db.Exec(`UPDATE hosting_projects SET route_generation=2 WHERE id=?`, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO hosting_proxy_operations
+		(operation_id, hosting_project_id, operation_type, route_generation, desired_state, status, created_at, updated_at)
+		VALUES (?, ?, 'resume', 1, 'active', 'pending', ?, ?),
+		       (?, ?, 'rollback', 2, '', 'committed', ?, ?)`, resumeID, project.ID, now, now,
+		hashHostingOperation("newer-resume-route"), project.ID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	compensationID := hashHostingOperation("suspend-unavailable-resume", resumeID)
+	err := stageHostingResumeCompensation(t.Context(), project.ID, resumeID, compensationID)
+	if !errors.Is(err, errHostingProxyOperationSuperseded) {
+		t.Fatalf("stale resume compensation err=%v", err)
+	}
+	var generation, compensations int
+	if err := db.QueryRow(`SELECT route_generation FROM hosting_projects WHERE id=?`, project.ID).Scan(&generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations WHERE operation_id=?`, compensationID).Scan(&compensations); err != nil {
+		t.Fatal(err)
+	}
+	if generation != 2 || compensations != 0 {
+		t.Fatalf("stale resume generation=%d compensations=%d", generation, compensations)
+	}
+}
+
+func TestSupersededStagedResumeCompensationCannotCreateRetry(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _ := provisionDeploymentTestProject(t, "project_01JRESSTAL")
+	now := formatSQLiteTime(time.Now().UTC())
+	resumeID := hashHostingOperation("staged-resume-source", project.ExternalProjectID)
+	if _, err := db.Exec(`UPDATE hosting_projects SET route_generation=1 WHERE id=?`, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO hosting_proxy_operations
+		(operation_id, hosting_project_id, operation_type, route_generation, desired_state, status, created_at, updated_at)
+		VALUES (?, ?, 'resume', 1, 'active', 'pending', ?, ?)`, resumeID, project.ID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	compensationID := hashHostingOperation("suspend-unavailable-resume", resumeID)
+	if err := stageHostingResumeCompensation(t.Context(), project.ID, resumeID, compensationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := executeHostingCompensation(t.Context(), fake, compensationID, "", project.ID, 0,
+		project.ExternalProjectID, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	var newerGeneration int64
+	if err := db.QueryRow(`UPDATE hosting_projects SET route_generation=route_generation+1 WHERE id=? RETURNING route_generation`,
+		project.ID).Scan(&newerGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO hosting_proxy_operations
+		(operation_id, hosting_project_id, operation_type, route_generation, status, created_at, updated_at)
+		VALUES (?, ?, 'rollback', ?, 'committed', ?, ?)`, hashHostingOperation("newer-staged-route"), project.ID,
+		newerGeneration, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingCompensationOperations(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var pendingResume int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations WHERE hosting_project_id=?
+		AND operation_type='resume' AND status='pending'`, project.ID).Scan(&pendingResume); err != nil {
+		t.Fatal(err)
+	}
+	if pendingResume != 0 || len(fake.suspensions) != 1 {
+		t.Fatalf("stale compensation pending resumes=%d suspensions=%+v", pendingResume, fake.suspensions)
 	}
 }
 

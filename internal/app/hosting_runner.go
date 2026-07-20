@@ -137,7 +137,7 @@ func createHostingRunner(ctx context.Context, input hostingRunnerInput, requestI
 	}
 	input.Operations = normalizeStringList(input.Operations)
 	for _, operation := range input.Operations {
-		if operation != "build" && operation != "restore" && operation != hostingRunnerSecretOperation {
+		if operation != "build" && operation != "restore" && operation != hostingRunnerSecretOperation && operation != hostingRunnerInventoryOperation {
 			return nil, fmt.Errorf("runner operation is unsupported")
 		}
 	}
@@ -283,16 +283,30 @@ func hostingRunnerAuthMiddleware(next http.Handler) http.Handler {
 }
 
 type hostingHeartbeatRequest struct {
-	Free             capacityDTO `json:"free"`
-	Draining         bool        `json:"draining"`
-	ProtocolVersion  string      `json:"protocol_version"`
-	ManifestVersions []string    `json:"manifest_versions"`
-	RuntimeVersions  []string    `json:"runtime_versions"`
-	Operations       []string    `json:"operations,omitempty"`
+	Free             capacityDTO               `json:"free"`
+	Draining         bool                      `json:"draining"`
+	ProtocolVersion  string                    `json:"protocol_version"`
+	ManifestVersions []string                  `json:"manifest_versions"`
+	RuntimeVersions  []string                  `json:"runtime_versions"`
+	Operations       []string                  `json:"operations,omitempty"`
+	SessionID        string                    `json:"session_id,omitempty"`
+	Sequence         int64                     `json:"sequence,omitempty"`
+	RuntimeInventory *[]hostingObservedRuntime `json:"runtime_inventory,omitempty"`
 }
 
 type hostingHeartbeatResponse struct {
 	RetainedReleases []hostingRetainedRelease `json:"retained_releases"`
+}
+
+type hostingSupersededSessionError struct {
+	Error             string                   `json:"error"`
+	Code              string                   `json:"code"`
+	CleanupAuthorized bool                     `json:"cleanup_authorized"`
+	RetainedReleases  []hostingRetainedRelease `json:"retained_releases"`
+}
+
+type hostingSessionRetentionRequest struct {
+	SessionID string `json:"session_id"`
 }
 
 type hostingRetainedRelease struct {
@@ -303,13 +317,21 @@ type hostingRetainedRelease struct {
 	Status               string `json:"status"`
 }
 
+type hostingObservedRuntime struct {
+	ReleaseDigest        string `json:"release_digest"`
+	ExternalProjectID    string `json:"external_project_id"`
+	ExternalDeploymentID string `json:"external_deployment_id"`
+	RuntimeInstanceID    string `json:"runtime_instance_id"`
+	State                string `json:"state"`
+}
+
 func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) || !requireJSONContentType(w, r) {
 		return
 	}
 	runner := r.Context().Value(hostingRunnerContextKey{}).(*HostingRunner)
 	var input hostingHeartbeatRequest
-	if !decodeInternalJSON(w, r, 16<<10, &input) {
+	if !decodeInternalJSON(w, r, 512<<10, &input) {
 		return
 	}
 	if input.Free.CPUMillis < 0 || input.Free.RAMBytes < 0 || input.Free.DiskBytes < 0 || input.Free.PIDs < 0 {
@@ -325,13 +347,34 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	input.Operations = normalizeStringList(input.Operations)
 	for _, operation := range input.Operations {
-		if operation != "build" && operation != "restore" && operation != hostingRunnerSecretOperation {
+		if operation != "build" && operation != "restore" && operation != hostingRunnerSecretOperation && operation != hostingRunnerInventoryOperation {
 			jsonErrorCode(w, errCodeValidation, "hosting runner operation is unsupported", http.StatusBadRequest)
 			return
 		}
 	}
 	if !hostingStringListContains(input.Operations, "build") {
 		jsonErrorCode(w, errCodeValidation, "hosting runner must advertise the build operation", http.StatusBadRequest)
+		return
+	}
+	hasRuntimeInventory := hostingStringListContains(input.Operations, hostingRunnerInventoryOperation)
+	if hasRuntimeInventory && input.RuntimeInventory == nil {
+		jsonErrorCode(w, errCodeValidation, "runtime-inventory-v1 requires a complete runtime_inventory array", http.StatusBadRequest)
+		return
+	}
+	if !hasRuntimeInventory && input.RuntimeInventory != nil {
+		jsonErrorCode(w, errCodeValidation, "runtime_inventory requires runtime-inventory-v1", http.StatusBadRequest)
+		return
+	}
+	var runtimeInventory []hostingObservedRuntime
+	if input.RuntimeInventory != nil {
+		runtimeInventory = *input.RuntimeInventory
+	}
+	if err := validateHostingRuntimeInventory(runtimeInventory); err != nil {
+		jsonErrorCode(w, errCodeValidation, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if hasRuntimeInventory && (!validHostingRunnerSessionID(input.SessionID) || input.Sequence <= 0) {
+		jsonErrorCode(w, errCodeValidation, "runtime-inventory-v1 requires a valid session_id and positive sequence", http.StatusBadRequest)
 		return
 	}
 	manifests, _ := json.Marshal(normalizeStringList(input.ManifestVersions))
@@ -354,12 +397,82 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
 		}
 	}()
+	var activeSession, runnerStatus string
+	var lastSequence int64
+	var lastSeen sql.NullString
+	if err := conn.QueryRowContext(r.Context(), `SELECT active_session_id, last_heartbeat_sequence, status, last_seen
+		FROM hosting_runners WHERE id=?`, runner.ID).Scan(&activeSession, &lastSequence, &runnerStatus, &lastSeen); err != nil {
+		jsonErrorCode(w, errCodeRunnerNotFound, "hosting runner not found", http.StatusNotFound)
+		return
+	}
+	if activeSession != "" && !hasRuntimeInventory {
+		jsonErrorCode(w, errCodeConflict, "runtime inventory cannot be downgraded after session fencing is active", http.StatusConflict)
+		return
+	}
+	if hasRuntimeInventory {
+		var tombstoned int
+		if err := conn.QueryRowContext(r.Context(), `SELECT COUNT(*)
+			FROM hosting_runner_superseded_sessions WHERE hosting_runner_id=? AND session_id=?`,
+			runner.ID, input.SessionID).Scan(&tombstoned); err != nil {
+			jsonErrorCode(w, errCodeInternal, "read hosting runner session fence failed", http.StatusInternalServerError)
+			return
+		}
+		if tombstoned != 0 {
+			retained, err := supersededHostingSessionRetention(r.Context(), conn, runner.ID, now)
+			if err != nil {
+				jsonErrorCode(w, errCodeInternal, "list superseded session retention failed", http.StatusInternalServerError)
+				return
+			}
+			writeSupersededHostingSessionResponse(w, retained)
+			return
+		}
+	}
+	legacySessionLive := activeSession == "" && runnerStatus == "online" && lastSeen.Valid &&
+		!parseSQLiteTime(lastSeen.String).Before(now.Add(-hostingRunnerSessionTakeoverAfter))
+	if hasRuntimeInventory && legacySessionLive {
+		jsonErrorCode(w, errCodeConflict, "a legacy hosting runner session is still live", http.StatusConflict)
+		return
+	}
+	if hasRuntimeInventory && activeSession != "" {
+		if activeSession == input.SessionID {
+			if input.Sequence <= lastSequence {
+				jsonErrorCode(w, errCodeConflict, "hosting runner heartbeat sequence is stale", http.StatusConflict)
+				return
+			}
+		} else {
+			live := runnerStatus == "online" && lastSeen.Valid &&
+				!parseSQLiteTime(lastSeen.String).Before(now.Add(-hostingRunnerSessionTakeoverAfter))
+			if live {
+				jsonErrorCode(w, errCodeRunnerSessionSuperseded, "another hosting runner session is active", http.StatusConflict)
+				return
+			}
+		}
+	}
+	if hasRuntimeInventory && activeSession != "" && activeSession != input.SessionID {
+		if _, err := conn.ExecContext(r.Context(), `INSERT INTO hosting_runner_superseded_sessions
+			(hosting_runner_id, session_id, superseded_at) VALUES (?, ?, ?)
+			ON CONFLICT(hosting_runner_id, session_id) DO NOTHING`, runner.ID, activeSession,
+			formatSQLiteTime(now)); err != nil {
+			jsonErrorCode(w, errCodeInternal, "persist hosting runner session handoff failed", http.StatusInternalServerError)
+			return
+		}
+	}
+	sessionID := activeSession
+	sequence := lastSequence
+	newInventorySession := false
+	if hasRuntimeInventory {
+		newInventorySession = activeSession != input.SessionID
+		sessionID = input.SessionID
+		sequence = input.Sequence
+	}
 	result, err := conn.ExecContext(r.Context(), `UPDATE hosting_runners SET
 		reported_free_cpu_millis=MIN(capacity_cpu_millis, ?), reported_free_ram_bytes=MIN(capacity_ram_bytes, ?),
 		reported_free_disk_bytes=MIN(capacity_disk_bytes, ?), reported_free_pids=MIN(capacity_pids, ?),
-		draining=?, protocol_version=?, manifest_versions_json=?, runtime_versions_json=?, operation_capabilities_json=?, status='online', last_seen=? WHERE id=?`,
+		draining=?, protocol_version=?, manifest_versions_json=?, runtime_versions_json=?, operation_capabilities_json=?,
+		active_session_id=?, last_heartbeat_sequence=?, status='online', last_seen=? WHERE id=?`,
 		input.Free.CPUMillis, input.Free.RAMBytes, input.Free.DiskBytes, input.Free.PIDs, input.Draining,
-		input.ProtocolVersion, string(manifests), string(runtimes), string(operations), formatSQLiteTime(now), runner.ID)
+		input.ProtocolVersion, string(manifests), string(runtimes), string(operations), sessionID, sequence,
+		formatSQLiteTime(now), runner.ID)
 	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "update hosting runner heartbeat failed", http.StatusInternalServerError)
 		return
@@ -372,6 +485,22 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if err := recomputeHostingRunnerCapacity(r.Context(), conn, runner.ID); err != nil {
 		jsonErrorCode(w, errCodeInternal, "reconcile hosting runner capacity failed", http.StatusInternalServerError)
 		return
+	}
+	if hasRuntimeInventory {
+		if !newInventorySession {
+			if err := queueMissingHostingRuntimes(r.Context(), conn, runner.ID, runtimeInventory, now); err != nil {
+				jsonErrorCode(w, errCodeInternal, "reconcile hosting runtime inventory failed", http.StatusInternalServerError)
+				return
+			}
+		}
+		if err := recordHostingRuntimeObservations(r.Context(), conn, runner.ID, input.SessionID, runtimeInventory, now); err != nil {
+			jsonErrorCode(w, errCodeInternal, "record hosting runtime observations failed", http.StatusInternalServerError)
+			return
+		}
+		if err := placeHostingRuntimeRecoveries(r.Context(), conn, now); err != nil {
+			jsonErrorCode(w, errCodeInternal, "place hosting runtime recovery failed", http.StatusInternalServerError)
+			return
+		}
 	}
 	rows, err := conn.QueryContext(r.Context(), `SELECT DISTINCT rel.release_digest, p.external_project_id,
 			d.external_deployment_id,
@@ -395,8 +524,9 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			AND recovery.hosting_runner_id=? AND recovery.status='running'
 		LEFT JOIN hosting_proxy_operations recovery_op ON recovery_op.hosting_runtime_recovery_id=recovery.id
 			AND recovery_op.operation_type='recover' AND recovery_op.status IN ('pending','applied')
-		WHERE (rel.runtime_runner_id=? AND rel.status IN ('healthy','active','inactive'))
-		   OR (job.hosting_runner_id=? AND rel.status='healthy' AND activation.id IS NOT NULL)
+		WHERE (rel.runtime_failure_code='' AND (
+		      (rel.runtime_runner_id=? AND rel.status IN ('healthy','active','inactive'))
+		   OR (job.hosting_runner_id=? AND rel.status='healthy' AND activation.id IS NOT NULL)))
 		   OR (recovery.runtime_endpoint<>'' AND recovery_op.id IS NOT NULL)
 		ORDER BY rel.id`, runner.ID, runner.ID, runner.ID, runner.ID, runner.ID)
 	if err != nil {
@@ -405,6 +535,7 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	response := hostingHeartbeatResponse{RetainedReleases: make([]hostingRetainedRelease, 0)}
+	retainedIdentities := make(map[string]struct{})
 	for rows.Next() {
 		var release hostingRetainedRelease
 		if err := rows.Scan(&release.ReleaseDigest, &release.ExternalProjectID, &release.ExternalDeploymentID,
@@ -413,6 +544,13 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		response.RetainedReleases = append(response.RetainedReleases, release)
+		if len(response.RetainedReleases) > hostingMaxRuntimeInventoryEntries {
+			jsonErrorCode(w, errCodeInternal, "hosting runner retention exceeds protocol limit", http.StatusInternalServerError)
+			return
+		}
+		retainedIdentities[hostingObservedRuntimeIdentity(hostingObservedRuntime{ReleaseDigest: release.ReleaseDigest,
+			ExternalProjectID: release.ExternalProjectID, ExternalDeploymentID: release.ExternalDeploymentID,
+			RuntimeInstanceID: release.RuntimeInstanceID})] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
 		jsonErrorCode(w, errCodeInternal, "list retained hosting releases failed", http.StatusInternalServerError)
@@ -422,12 +560,277 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		jsonErrorCode(w, errCodeInternal, "close retained hosting releases failed", http.StatusInternalServerError)
 		return
 	}
+	if hasRuntimeInventory {
+		inflightRows, err := conn.QueryContext(r.Context(), `SELECT project.external_project_id,
+			deployment.external_deployment_id, 'build-' || job.id || '-' || job.lease_generation, 'healthy'
+			FROM hosting_jobs job
+			JOIN hosting_deployments deployment ON deployment.id=job.hosting_deployment_id
+			JOIN hosting_projects project ON project.id=deployment.hosting_project_id
+			WHERE job.hosting_runner_id=? AND job.status IN ('leased','running') AND job.lease_expires_at>?
+			UNION ALL
+			SELECT project.external_project_id, deployment.external_deployment_id,
+				'restore-' || recovery.id || '-' || recovery.lease_generation, 'active'
+			FROM hosting_runtime_recoveries recovery
+			JOIN hosting_releases release ON release.id=recovery.hosting_release_id
+			JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+			JOIN hosting_projects project ON project.id=release.hosting_project_id
+			WHERE recovery.hosting_runner_id=? AND recovery.status IN ('leased','running')
+			  AND recovery.lease_expires_at>?`, runner.ID, formatSQLiteTime(now), runner.ID, formatSQLiteTime(now))
+		if err != nil {
+			jsonErrorCode(w, errCodeInternal, "list in-flight hosting runtimes failed", http.StatusInternalServerError)
+			return
+		}
+		inflight := make(map[string]string)
+		for inflightRows.Next() {
+			var projectID, deploymentID, instanceID, status string
+			if err := inflightRows.Scan(&projectID, &deploymentID, &instanceID, &status); err != nil {
+				inflightRows.Close()
+				jsonErrorCode(w, errCodeInternal, "read in-flight hosting runtime failed", http.StatusInternalServerError)
+				return
+			}
+			inflight[projectID+"\x00"+deploymentID+"\x00"+instanceID] = status
+		}
+		if err := inflightRows.Close(); err != nil {
+			jsonErrorCode(w, errCodeInternal, "close in-flight hosting runtimes failed", http.StatusInternalServerError)
+			return
+		}
+		for _, runtime := range runtimeInventory {
+			if runtime.State != "running" {
+				continue
+			}
+			status, allowed := inflight[runtime.ExternalProjectID+"\x00"+runtime.ExternalDeploymentID+"\x00"+runtime.RuntimeInstanceID]
+			identity := hostingObservedRuntimeIdentity(runtime)
+			if !allowed {
+				continue
+			}
+			if _, retained := retainedIdentities[identity]; retained {
+				continue
+			}
+			response.RetainedReleases = append(response.RetainedReleases, hostingRetainedRelease{
+				ReleaseDigest: runtime.ReleaseDigest, ExternalProjectID: runtime.ExternalProjectID,
+				ExternalDeploymentID: runtime.ExternalDeploymentID, RuntimeInstanceID: runtime.RuntimeInstanceID,
+				Status: status,
+			})
+			if len(response.RetainedReleases) > hostingMaxRuntimeInventoryEntries {
+				jsonErrorCode(w, errCodeInternal, "hosting runner retention exceeds protocol limit", http.StatusInternalServerError)
+				return
+			}
+			retainedIdentities[identity] = struct{}{}
+		}
+	}
 	if _, err := conn.ExecContext(r.Context(), `COMMIT`); err != nil {
 		jsonErrorCode(w, errCodeInternal, "commit hosting runner heartbeat failed", http.StatusInternalServerError)
 		return
 	}
 	committed = true
 	jsonResponse(w, response)
+}
+
+func writeSupersededHostingSessionResponse(w http.ResponseWriter, retained []hostingRetainedRelease) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(hostingSupersededSessionError{Error: "hosting runner session was superseded",
+		Code: errCodeRunnerSessionSuperseded, CleanupAuthorized: true, RetainedReleases: retained})
+}
+
+func handleHostingAgentSessionRetention(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) || !requireJSONContentType(w, r) {
+		return
+	}
+	var input hostingSessionRetentionRequest
+	if !decodeInternalJSON(w, r, 4<<10, &input) {
+		return
+	}
+	if !validHostingRunnerSessionID(input.SessionID) {
+		jsonErrorCode(w, errCodeValidation, "valid superseded session_id is required", http.StatusBadRequest)
+		return
+	}
+	runner := r.Context().Value(hostingRunnerContextKey{}).(*HostingRunner)
+	conn, err := db.Conn(r.Context())
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "open hosting session retention query failed", http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close()
+	var tombstoned int
+	if err := conn.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM hosting_runner_superseded_sessions
+		WHERE hosting_runner_id=? AND session_id=?`, runner.ID, input.SessionID).Scan(&tombstoned); err != nil {
+		jsonErrorCode(w, errCodeInternal, "read hosting session retention fence failed", http.StatusInternalServerError)
+		return
+	}
+	if tombstoned == 0 {
+		jsonErrorCode(w, errCodeNotFound, "superseded hosting runner session not found", http.StatusNotFound)
+		return
+	}
+	retained, err := supersededHostingSessionRetention(r.Context(), conn, runner.ID, time.Now().UTC())
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "list superseded session retention failed", http.StatusInternalServerError)
+		return
+	}
+	jsonResponse(w, hostingHeartbeatResponse{RetainedReleases: retained})
+}
+
+func supersededHostingSessionRetention(ctx context.Context, querier *sql.Conn,
+	runnerID int64, now time.Time) ([]hostingRetainedRelease, error) {
+	rows, err := querier.QueryContext(ctx, `SELECT release.release_digest, project.external_project_id,
+		deployment.external_deployment_id, release.runtime_instance_id, release.status
+		FROM hosting_releases release
+		JOIN hosting_projects project ON project.id=release.hosting_project_id
+		JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+		WHERE release.runtime_runner_id=?
+		  AND (release.status='active' OR
+		    (release.runtime_failure_code='' AND release.status IN ('healthy','inactive')))
+		UNION
+		SELECT release.release_digest, project.external_project_id, deployment.external_deployment_id,
+		  'restore-' || recovery.id || '-' || recovery.lease_generation, 'active'
+		FROM hosting_runtime_recoveries recovery
+		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
+		JOIN hosting_projects project ON project.id=release.hosting_project_id
+		JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+		WHERE recovery.hosting_runner_id=? AND recovery.status IN ('leased','running')
+		  AND recovery.lease_expires_at>?
+		ORDER BY 2, 3, 1, 4`, runnerID, runnerID, formatSQLiteTime(now))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	retained := make([]hostingRetainedRelease, 0)
+	for rows.Next() {
+		var release hostingRetainedRelease
+		if err := rows.Scan(&release.ReleaseDigest, &release.ExternalProjectID,
+			&release.ExternalDeploymentID, &release.RuntimeInstanceID, &release.Status); err != nil {
+			return nil, err
+		}
+		retained = append(retained, release)
+		if len(retained) > hostingMaxRuntimeInventoryEntries {
+			return nil, fmt.Errorf("superseded session retention exceeds %d entries", hostingMaxRuntimeInventoryEntries)
+		}
+	}
+	return retained, rows.Err()
+}
+
+func validateHostingRuntimeInventory(inventory []hostingObservedRuntime) error {
+	if len(inventory) > hostingMaxRuntimeInventoryEntries {
+		return fmt.Errorf("runtime_inventory exceeds %d entries", hostingMaxRuntimeInventoryEntries)
+	}
+	seen := make(map[string]struct{}, len(inventory))
+	for _, runtime := range inventory {
+		if !validSHA256Digest(runtime.ReleaseDigest) || !externalIDPattern.MatchString(runtime.ExternalProjectID) ||
+			!externalIDPattern.MatchString(runtime.ExternalDeploymentID) ||
+			(runtime.RuntimeInstanceID != "" && !hostingSecretInstancePattern.MatchString(runtime.RuntimeInstanceID)) {
+			return fmt.Errorf("runtime_inventory contains an invalid runtime identity")
+		}
+		switch runtime.State {
+		case "created", "restarting", "running", "removing", "paused", "exited", "dead":
+		default:
+			return fmt.Errorf("runtime_inventory contains an unsupported container state")
+		}
+		identity := hostingObservedRuntimeIdentity(runtime)
+		if _, duplicate := seen[identity]; duplicate {
+			return fmt.Errorf("runtime_inventory contains a duplicate runtime identity")
+		}
+		seen[identity] = struct{}{}
+	}
+	return nil
+}
+
+func hostingObservedRuntimeIdentity(runtime hostingObservedRuntime) string {
+	return runtime.ExternalProjectID + "\x00" + runtime.ExternalDeploymentID + "\x00" + runtime.ReleaseDigest + "\x00" + runtime.RuntimeInstanceID
+}
+
+func parseHostingRuntimeInstanceID(value string) (operation string, workID, generation int64, ok bool) {
+	parts := strings.Split(value, "-")
+	if len(parts) != 3 || (parts[0] != "build" && parts[0] != "restore") {
+		return "", 0, 0, false
+	}
+	workID, workErr := strconv.ParseInt(parts[1], 10, 64)
+	generation, generationErr := strconv.ParseInt(parts[2], 10, 64)
+	if workErr != nil || generationErr != nil || workID <= 0 || generation <= 0 {
+		return "", 0, 0, false
+	}
+	return parts[0], workID, generation, true
+}
+
+func recordHostingRuntimeObservations(ctx context.Context, conn *sql.Conn, runnerID int64, sessionID string,
+	inventory []hostingObservedRuntime, now time.Time) error {
+	// Every inventory heartbeat is a complete snapshot. Clear the prior
+	// in-flight evidence first, then restore only exact instances reported as
+	// running below. This prevents a recently observed candidate from staying
+	// eligible after a later authoritative omission.
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET runtime_observed_at=NULL,
+		runtime_observed_session_id='', runtime_observed_release_digest='', runtime_observed_instance_id=''
+		WHERE hosting_runner_id=? AND status IN ('leased','running')`, runnerID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET runtime_observed_at=NULL,
+		runtime_observed_session_id='', runtime_observed_release_digest='', runtime_observed_instance_id=''
+		WHERE hosting_runner_id=? AND status IN ('leased','running')`, runnerID); err != nil {
+		return err
+	}
+	for _, runtime := range inventory {
+		if runtime.State != "running" {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_observed_at=?,
+			runtime_observed_session_id=?
+			WHERE runtime_runner_id=? AND release_digest=? AND runtime_instance_id=?
+			  AND status IN ('healthy','active','inactive')
+			  AND EXISTS (SELECT 1 FROM hosting_deployments deployment
+			    JOIN hosting_projects project ON project.id=deployment.hosting_project_id
+			    WHERE deployment.id=hosting_releases.hosting_deployment_id
+			      AND project.external_project_id=? AND deployment.external_deployment_id=?)`,
+			formatSQLiteTime(now), sessionID, runnerID, runtime.ReleaseDigest, runtime.RuntimeInstanceID,
+			runtime.ExternalProjectID, runtime.ExternalDeploymentID); err != nil {
+			return err
+		}
+		operation, workID, generation, ok := parseHostingRuntimeInstanceID(runtime.RuntimeInstanceID)
+		if !ok {
+			continue
+		}
+		switch operation {
+		case "build":
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET runtime_observed_at=?,
+				runtime_observed_session_id=?, runtime_observed_release_digest=?, runtime_observed_instance_id=?
+				WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND status IN ('leased','running')
+				  AND lease_expires_at>? AND EXISTS (SELECT 1 FROM hosting_deployments deployment
+				    JOIN hosting_projects project ON project.id=deployment.hosting_project_id
+				    WHERE deployment.id=hosting_jobs.hosting_deployment_id
+				      AND project.external_project_id=? AND deployment.external_deployment_id=?)`,
+				formatSQLiteTime(now), sessionID, runtime.ReleaseDigest, runtime.RuntimeInstanceID,
+				workID, runnerID, generation, formatSQLiteTime(now), runtime.ExternalProjectID,
+				runtime.ExternalDeploymentID); err != nil {
+				return err
+			}
+		case "restore":
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET runtime_observed_at=?,
+				runtime_observed_session_id=?, runtime_observed_release_digest=?, runtime_observed_instance_id=?
+				WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND status IN ('leased','running')
+				  AND lease_expires_at>? AND EXISTS (SELECT 1 FROM hosting_releases release
+				    JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+				    JOIN hosting_projects project ON project.id=release.hosting_project_id
+				    WHERE release.id=hosting_runtime_recoveries.hosting_release_id
+				      AND release.release_digest=? AND project.external_project_id=?
+				      AND deployment.external_deployment_id=?)`, formatSQLiteTime(now), sessionID,
+				runtime.ReleaseDigest, runtime.RuntimeInstanceID, workID, runnerID, generation,
+				formatSQLiteTime(now), runtime.ReleaseDigest, runtime.ExternalProjectID,
+				runtime.ExternalDeploymentID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validHostingRunnerSessionID(value string) bool {
+	if len(value) != 48 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func recomputeHostingRunnerCapacity(ctx context.Context, conn *sql.Conn, runnerID int64) error {
@@ -809,7 +1212,8 @@ func handleHostingJobLeaseHeartbeat(w http.ResponseWriter, r *http.Request, jobI
 		jsonErrorCode(w, errCodeJobForbidden, "valid job lease is required", http.StatusForbidden)
 		return
 	}
-	if _, err := db.ExecContext(r.Context(), `UPDATE hosting_runners SET status='online', last_seen=? WHERE id=?`, formatSQLiteTime(time.Now().UTC()), runner.ID); err != nil {
+	if _, err := db.ExecContext(r.Context(), `UPDATE hosting_runners SET status='online', last_seen=?
+		WHERE id=? AND active_session_id=''`, formatSQLiteTime(time.Now().UTC()), runner.ID); err != nil {
 		jsonErrorCode(w, errCodeInternal, "update hosting runner liveness failed", http.StatusInternalServerError)
 		return
 	}

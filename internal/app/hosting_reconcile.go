@@ -15,6 +15,8 @@ const (
 	hostingMaxJobAttempts    = 3
 )
 
+var hostingActivationReconcileHealthTimeout = 30 * time.Second
+
 func runHostingReconciler(ctx context.Context) {
 	if err := reconcileHostingState(ctx, time.Now().UTC()); err != nil {
 		logOperationalError("reconcile hosting state", err)
@@ -183,23 +185,27 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 func reconcileHostingCompensationOperations(ctx context.Context) error {
 	rows, err := db.QueryContext(ctx, `SELECT operation.operation_id, operation.hosting_project_id,
 		operation.hosting_deployment_id, project.external_project_id,
-		operation.expected_previous_release_digest, operation.release_digest, operation.runtime_endpoint
+		operation.expected_previous_release_digest, operation.release_digest, operation.runtime_endpoint,
+		operation.desired_state
 		FROM hosting_proxy_operations operation JOIN hosting_projects project ON project.id=operation.hosting_project_id
-		WHERE operation.operation_type='compensate' AND operation.status='pending' ORDER BY operation.id`)
+		WHERE operation.operation_type='compensate'
+		  AND (operation.status='pending' OR
+		    (operation.status='committed' AND operation.desired_state='resume_after_runtime'))
+		ORDER BY operation.id`)
 	if err != nil {
 		return err
 	}
 	type compensation struct {
-		operationID, externalProjectID, candidateDigest, previousDigest, previousEndpoint string
-		projectID                                                                         int64
-		deploymentID                                                                      sql.NullInt64
+		operationID, externalProjectID, candidateDigest, previousDigest, previousEndpoint, desiredState string
+		projectID                                                                                       int64
+		deploymentID                                                                                    sql.NullInt64
 	}
 	var operations []compensation
 	for rows.Next() {
 		var operation compensation
 		if err := rows.Scan(&operation.operationID, &operation.projectID, &operation.deploymentID,
 			&operation.externalProjectID, &operation.candidateDigest, &operation.previousDigest,
-			&operation.previousEndpoint); err != nil {
+			&operation.previousEndpoint, &operation.desiredState); err != nil {
 			rows.Close()
 			return err
 		}
@@ -214,10 +220,15 @@ func reconcileHostingCompensationOperations(ctx context.Context) error {
 			_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
 			continue
 		}
-		if err := executeHostingCompensation(ctx, proxy, operation.operationID, operation.projectID,
+		if err := executeHostingCompensation(ctx, proxy, operation.operationID, "", operation.projectID,
 			operation.deploymentID.Int64, operation.externalProjectID, operation.candidateDigest,
 			operation.previousDigest, operation.previousEndpoint); err != nil {
 			continue
+		}
+		if operation.desiredState == "resume_after_runtime" {
+			if err := stageHostingResumeRetry(ctx, operation.projectID, operation.operationID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -227,7 +238,9 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.status, op.release_digest,
 		op.runtime_endpoint, op.expected_previous_release_digest, op.route_revision, op.route_generation, p.route_generation,
 		op.hosting_project_id, op.hosting_deployment_id, p.external_project_id,
-		d.external_deployment_id, target.runtime_manifest_json, op.expected_previous_runtime_endpoint
+		d.external_deployment_id, target.runtime_manifest_json, op.expected_previous_runtime_endpoint,
+		op.target_runtime_runner_id, op.target_runtime_instance_id, op.target_runtime_session_id, target.runtime_runner_id,
+		target.runtime_instance_id, target.runtime_failure_code
 		FROM hosting_proxy_operations op
 		JOIN hosting_projects p ON p.id=op.hosting_project_id
 		JOIN hosting_releases target ON target.hosting_project_id=op.hosting_project_id
@@ -242,6 +255,8 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 		operationID, status, digest, endpoint, previous, routeRevision          string
 		projectID, deploymentID, routeGeneration, currentGeneration             int64
 		externalProjectID, externalDeploymentID, manifestJSON, previousEndpoint string
+		targetRunnerID, currentRunnerID                                         sql.NullInt64
+		targetInstance, targetSession, currentInstance, runtimeFailureCode      string
 	}
 	var operations []rollbackOperation
 	for rows.Next() {
@@ -251,7 +266,8 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 			&operation.currentGeneration,
 			&operation.projectID, &operation.deploymentID,
 			&operation.externalProjectID, &operation.externalDeploymentID, &operation.manifestJSON,
-			&operation.previousEndpoint); err != nil {
+			&operation.previousEndpoint, &operation.targetRunnerID, &operation.targetInstance, &operation.targetSession,
+			&operation.currentRunnerID, &operation.currentInstance, &operation.runtimeFailureCode); err != nil {
 			rows.Close()
 			return err
 		}
@@ -279,11 +295,26 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 		state := &hostingCompletionState{ProjectID: operation.projectID,
 			ExternalProjectID: operation.externalProjectID, ExternalDeploymentID: operation.externalDeploymentID,
 			PreviousReleaseDigest: operation.previous, PreviousRuntimeEndpoint: operation.previousEndpoint}
+		fence, runtimeCurrent, fenceErr := currentHostingReleaseRuntimeFence(ctx, db, operation.projectID,
+			operation.digest, operation.endpoint)
+		if fenceErr != nil {
+			return fenceErr
+		}
+		runtimeCurrent = runtimeCurrent && operation.targetRunnerID.Valid &&
+			fence.RunnerID == operation.targetRunnerID.Int64 && fence.InstanceID == operation.targetInstance &&
+			fence.SessionID == operation.targetSession
+		if !runtimeCurrent {
+			if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operation.operationID, state, operation.digest); err != nil {
+				return err
+			}
+			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeReleaseNotHealthy); err != nil {
+				return err
+			}
+			continue
+		}
 		if !allowed {
-			if operation.status == "applied" {
-				if err := compensateCancelledActivation(ctx, proxy, state, operation.digest); err != nil {
-					return err
-				}
+			if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operation.operationID, state, operation.digest); err != nil {
+				return err
 			}
 			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeProjectSuspended); err != nil {
 				return err
@@ -303,6 +334,9 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 			_, _, healthErr := checkHostingCandidateHealth(healthCtx, strings.TrimRight(operation.endpoint, "/")+healthPath)
 			cancel()
 			if healthErr != nil {
+				if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operation.operationID, state, operation.digest); err != nil {
+					return err
+				}
 				_ = markHostingProxyOperationFailed(ctx, operation.operationID, errCodeReleaseNotHealthy)
 				continue
 			}
@@ -342,8 +376,19 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 			result, updateErr := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?,
 				previous_release_digest=?, activated_at=?, deactivated_at=NULL
 				WHERE hosting_project_id=? AND hosting_deployment_id=? AND release_digest=?
-				AND status IN ('healthy','inactive','active')`, operation.routeRevision, operation.previous,
-				formatSQLiteTime(time.Now().UTC()), operation.projectID, operation.deploymentID, operation.digest)
+				AND status IN ('healthy','inactive','active') AND runtime_runner_id=?
+				AND runtime_instance_id=? AND runtime_failure_code='' AND runtime_missing_since IS NULL
+				AND COALESCE((SELECT active_session_id FROM hosting_runners WHERE id=?), '')=?
+				AND (?='' OR (runtime_observed_at>=? AND runtime_observed_session_id=?))
+				AND ?=(SELECT route_generation FROM hosting_projects WHERE id=?)
+				AND EXISTS (SELECT 1 FROM hosting_proxy_operations proxy_operation
+				  WHERE proxy_operation.operation_id=? AND proxy_operation.status='applied'
+				    AND proxy_operation.route_generation=?)`, operation.routeRevision, operation.previous,
+				formatSQLiteTime(time.Now().UTC()), operation.projectID, operation.deploymentID, operation.digest,
+				operation.targetRunnerID.Int64, operation.targetInstance, operation.targetRunnerID.Int64,
+				operation.targetSession, operation.targetSession,
+				formatSQLiteTime(time.Now().UTC().Add(-hostingRunnerStaleAfter)), operation.targetSession,
+				operation.routeGeneration, operation.projectID, operation.operationID, operation.routeGeneration)
 			err = updateErr
 			if err == nil {
 				if affected, _ := result.RowsAffected(); affected != 1 {
@@ -362,10 +407,19 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 		}
 		conn.Close()
 		if err != nil {
+			if errors.Is(err, errHostingStateConflict) {
+				if _, compensateErr := compensateHostingActivationIfCurrent(ctx, proxy, operation.operationID, state, operation.digest); compensateErr != nil {
+					return compensateErr
+				}
+				if markErr := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeReleaseNotHealthy); markErr != nil {
+					return markErr
+				}
+				continue
+			}
 			return err
 		}
 		if desired != "active" || kill != "" || global != 0 {
-			if err := compensateCancelledActivation(ctx, proxy, state, operation.digest); err != nil {
+			if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operation.operationID, state, operation.digest); err != nil {
 				return err
 			}
 			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeProjectSuspended); err != nil {
@@ -377,7 +431,7 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 }
 
 func reconcileHostingDesiredStateOperations(ctx context.Context) error {
-	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.operation_type, op.route_generation, op.desired_state,
+	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.hosting_project_id, op.operation_type, op.route_generation, op.desired_state,
 		p.external_project_id, p.route_generation, p.desired_state
 		FROM hosting_proxy_operations op JOIN hosting_projects p ON p.id=op.hosting_project_id
 		WHERE op.operation_type IN ('suspend','resume') AND op.status='pending' ORDER BY op.id`)
@@ -386,13 +440,13 @@ func reconcileHostingDesiredStateOperations(ctx context.Context) error {
 	}
 	type desiredOperation struct {
 		operationID, operationType, operationDesiredState, externalProjectID string
-		routeGeneration, currentGeneration                                   int64
+		projectID, routeGeneration, currentGeneration                        int64
 		desiredState                                                         string
 	}
 	var operations []desiredOperation
 	for rows.Next() {
 		var operation desiredOperation
-		if err := rows.Scan(&operation.operationID, &operation.operationType, &operation.routeGeneration, &operation.operationDesiredState,
+		if err := rows.Scan(&operation.operationID, &operation.projectID, &operation.operationType, &operation.routeGeneration, &operation.operationDesiredState,
 			&operation.externalProjectID, &operation.currentGeneration, &operation.desiredState); err != nil {
 			rows.Close()
 			return err
@@ -414,6 +468,15 @@ func reconcileHostingDesiredStateOperations(ctx context.Context) error {
 			}
 			continue
 		}
+		if operation.operationType == "resume" {
+			available, err := hostingProjectRuntimeAvailable(ctx, operation.projectID)
+			if err != nil {
+				return err
+			}
+			if !available {
+				continue
+			}
+		}
 		proxy, err := hostingProxyClientFactory(appConfig)
 		if err != nil {
 			_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
@@ -434,6 +497,24 @@ func reconcileHostingDesiredStateOperations(ctx context.Context) error {
 			_ = markHostingProxyOperationError(ctx, operation.operationID, code)
 			continue
 		}
+		if operation.operationType == "resume" {
+			resumeState, commitErr := commitHostingResumeOperation(ctx, operation.projectID, operation.operationID)
+			if commitErr != nil {
+				return commitErr
+			}
+			if resumeState == hostingResumeUnavailable {
+				if err := fenceUnavailableHostingResume(ctx, proxy, operation.projectID,
+					operation.externalProjectID, operation.operationID); err != nil {
+					return err
+				}
+			}
+			if resumeState == hostingResumeSuperseded {
+				if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeConflict); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if err := markHostingProxyOperationCommitted(ctx, operation.operationID); err != nil {
 			return err
 		}
@@ -449,19 +530,26 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 		j.lease_generation, j.lease_token_hash, j.status, p.external_project_id,
 		d.external_deployment_id, d.commit_sha, d.artifact_digest, j.cancel_requested_at,
 		j.lease_expires_at, j.required_cpu_millis, j.required_ram_bytes,
-		j.required_disk_bytes, j.required_pids
+		j.required_disk_bytes, j.required_pids, runner.status, runner.last_seen,
+		runner.active_session_id, release.runtime_manifest_json, release.runtime_failure_code,
+		release.runtime_observed_at, release.runtime_observed_session_id, release.runtime_instance_id
 		FROM hosting_proxy_operations op
 		JOIN hosting_deployments d ON d.id=op.hosting_deployment_id
 		JOIN hosting_projects p ON p.id=d.hosting_project_id
 		JOIN hosting_jobs j ON j.hosting_deployment_id=d.id
+		JOIN hosting_runners runner ON runner.id=j.hosting_runner_id
+		JOIN hosting_releases release ON release.hosting_deployment_id=d.id AND release.release_digest=op.release_digest
 		WHERE op.operation_type='activate' AND op.status IN ('pending','applied') ORDER BY op.id`)
 	if err != nil {
 		return err
 	}
 	type pendingActivation struct {
-		operationID, status, releaseDigest, runtimeEndpoint, routeRevision string
-		state                                                              hostingCompletionState
-		currentGeneration                                                  int64
+		operationID, status, releaseDigest, runtimeEndpoint, routeRevision   string
+		state                                                                hostingCompletionState
+		currentGeneration                                                    int64
+		runnerStatus, activeSession, runtimeManifestJSON, runtimeFailureCode string
+		observedSession, runtimeInstanceID                                   string
+		runnerLastSeen, observedAt                                           sql.NullString
 	}
 	var operations []pendingActivation
 	for rows.Next() {
@@ -476,7 +564,9 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 			&operation.state.ArtifactDigest, &operation.state.CancelRequestedAt,
 			&operation.state.LeaseExpiresAt, &operation.state.Limits.CPUMillis,
 			&operation.state.Limits.RAMBytes, &operation.state.Limits.DiskBytes,
-			&operation.state.Limits.PIDs); err != nil {
+			&operation.state.Limits.PIDs, &operation.runnerStatus, &operation.runnerLastSeen,
+			&operation.activeSession, &operation.runtimeManifestJSON, &operation.runtimeFailureCode,
+			&operation.observedAt, &operation.observedSession, &operation.runtimeInstanceID); err != nil {
 			rows.Close()
 			return err
 		}
@@ -499,6 +589,51 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 			}
 			continue
 		}
+		var runtimeManifest HostingRuntimeManifest
+		if err := json.Unmarshal([]byte(operation.runtimeManifestJSON), &runtimeManifest); err != nil {
+			return err
+		}
+		runnerLive := operation.runnerStatus == "online" && operation.runnerLastSeen.Valid &&
+			!parseSQLiteTime(operation.runnerLastSeen.String).Before(time.Now().UTC().Add(-hostingRunnerStaleAfter))
+		expectedInstance := fmt.Sprintf("build-%d-%d", operation.state.JobID, operation.state.LeaseGeneration)
+		exactRuntimeLive := operation.runtimeFailureCode == "" && operation.runtimeInstanceID == expectedInstance
+		if operation.activeSession != "" {
+			exactRuntimeLive = exactRuntimeLive && operation.observedAt.Valid &&
+				!parseSQLiteTime(operation.observedAt.String).Before(time.Now().UTC().Add(-hostingRunnerStaleAfter)) &&
+				operation.observedSession == operation.activeSession
+		}
+		healthPath := runtimeManifest.HealthPath
+		if healthPath == "" {
+			healthPath = "/"
+		}
+		var healthErr error
+		if runnerLive && exactRuntimeLive {
+			healthCtx, cancelHealth := context.WithTimeout(ctx, hostingActivationReconcileHealthTimeout)
+			_, _, healthErr = checkHostingCandidateHealth(healthCtx,
+				strings.TrimRight(operation.runtimeEndpoint, "/")+healthPath)
+			cancelHealth()
+		} else {
+			healthErr = fmt.Errorf("candidate runner or exact runtime instance is no longer live")
+		}
+		if healthErr != nil {
+			proxy, err := hostingProxyClientFactory(appConfig)
+			if err != nil {
+				_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
+				continue
+			}
+			if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operation.operationID,
+				&operation.state, operation.releaseDigest); err != nil {
+				return err
+			}
+			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeReleaseNotHealthy); err != nil {
+				return err
+			}
+			if err := finishHostingJobTerminal(ctx, &operation.state, hostingStatusFailed,
+				hostingPhaseFailed, "health_check_failed", "candidate failed reconciliation health gate"); err != nil {
+				return err
+			}
+			continue
+		}
 		proxy, err := hostingProxyClientFactory(appConfig)
 		if err != nil {
 			_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
@@ -509,7 +644,8 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 			return err
 		}
 		if !allowed {
-			if err := compensateCancelledActivation(ctx, proxy, &operation.state, operation.releaseDigest); err != nil {
+			if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operation.operationID,
+				&operation.state, operation.releaseDigest); err != nil {
 				return err
 			}
 			if err := markHostingProxyOperationCommitted(ctx, operation.operationID); err != nil {
@@ -554,12 +690,24 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 		}
 		cancelled, err := activateHealthyHostingRelease(ctx, &operation.state, operation.releaseDigest, operation.routeRevision)
 		if err != nil {
-			return fmt.Errorf("commit reconciled proxy activation %s: %w", operation.operationID, err)
+			if _, compensateErr := compensateHostingActivationIfCurrent(ctx, proxy, operation.operationID,
+				&operation.state, operation.releaseDigest); compensateErr != nil {
+				return compensateErr
+			}
+			if markErr := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeReleaseNotHealthy); markErr != nil {
+				return markErr
+			}
+			if finishErr := finishHostingJobTerminal(ctx, &operation.state, hostingStatusFailed,
+				hostingPhaseFailed, "health_check_failed", "candidate identity changed before activation committed"); finishErr != nil {
+				return finishErr
+			}
+			continue
 		}
 		if !cancelled {
 			continue
 		}
-		if err := compensateCancelledActivation(ctx, proxy, &operation.state, operation.releaseDigest); err != nil {
+		if _, err := compensateHostingActivationIfCurrent(ctx, proxy, operation.operationID,
+			&operation.state, operation.releaseDigest); err != nil {
 			return err
 		}
 		if err := markHostingProxyOperationCommitted(ctx, operation.operationID); err != nil {

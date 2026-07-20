@@ -16,6 +16,14 @@
 - Add lease-bound 90-second workload identities and direct agent-to-secret-
   broker redemption, with exact reference-set binding, tmpfs-backed read-only
   Node secret files, and fresh redemption during retained-runtime recovery.
+- Add session-fenced, namespace-scoped runtime inventory heartbeats with
+  durable missing-instance confirmation, same-runner recovery, exact capacity
+  transfer, safe legacy adoption, bounded scheduling headroom, exact
+  current-session activation evidence, rollback compensation, and
+  availability-gated resume.
+- Tombstone superseded runner sessions and let former owners finish bounded,
+  authenticated container and secret cleanup through a non-owning retention
+  endpoint, including after an agent restart.
 - Add the dedicated `hosting-agent` protocol and executable with generated
   static/Node recipes, safe archive extraction, private ports, workload limits,
   lease fencing, cancellation, health evidence, and retained-release cleanup.

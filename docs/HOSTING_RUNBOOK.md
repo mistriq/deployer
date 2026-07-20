@@ -185,8 +185,11 @@ Restore support is negotiated independently from protocol v1. Older agents
 that omit `operations` remain build-only. Upgrade agents first, verify that
 `restore` is reported by `/api/internal/v1/runners`, and only then rely on
 runtime recovery. Poll `runtime_status` on the original deployment:
-`recovering` identifies an active recovery lease and `unavailable` means the
-retained runtime could not be restored and adapter suspension was staged.
+`checking` is the durable two-observation absence grace period, `recovering`
+identifies an active recovery lease, and `unavailable` means routing is not
+currently safe because the project is suspended/disabled, its runner is stale,
+or recovery terminated without a usable runtime. The latest recovery ID and
+status remain visible after terminal attempts for polling reconciliation.
 
 Secret-bearing runtime recovery never reuses plaintext from the lost runner.
 The recovery lease mints a new 90-second workload identity and the replacement
@@ -203,10 +206,68 @@ An identity is never valid beyond its current Deployer lease and is capped at
 before a later cancellation remains usable only for that bounded lifetime, so
 the broker must enforce expiry and atomic one-time token consumption.
 
-Recovery currently detects whole-runner liveness loss. The heartbeat response
-describes what the agent must retain, but the agent does not yet report an
-observed runtime inventory back to Deployer. A missing or crashed container on
-an otherwise online runner therefore remains an open production-path gap.
+Agents negotiate `runtime-inventory-v1` and report a complete Docker snapshot
+scoped by the canonical work-root namespace. Each boot uses a random session
+ID and strictly increasing sequence; Deployer rejects a second live session,
+stale snapshots, and capability downgrade after inventory fencing is active.
+Omitted inventory from a legacy agent is non-authoritative, while `[]` is an
+authoritative empty snapshot. If Docker inventory cannot be collected, the
+agent does not heartbeat and normal runner-staleness recovery takes over.
+The first accepted snapshot from a new session enrolls the session and records
+positive observations, but does not count inherited runtimes as absent;
+absence proof starts with the next accepted snapshot from that same session.
+The request body is capped at 512 KiB and 1,024 unique exact namespaced
+identities; placement stops at 1,000 expected entries to retain cleanup
+headroom. A runner at the scheduling limit remains healthy but receives no new
+build or restore reservation until inventory drops below the limit. Global
+unnamespaced legacy containers are excluded until their exact identity occurs
+in the control plane's authoritative retention response. The agent then records
+the adoption in its work root and includes that exact legacy container in later
+complete snapshots; unrelated shared-engine containers cannot exhaust the
+protocol limit.
+
+For a rolling agent restart, stop the old process without deleting its work
+root or containers, then start the replacement with that same work root. The
+replacement retries while the prior accepted session is inside the 45-second
+session-takeover fence (shorter than the 60-second runner-loss threshold). Job
+execution publishes runner inventory every 10 seconds, so a healthy prior
+session continuously renews the fence. The replacement must not prune inherited containers before its first
+accepted heartbeat. Once accepted, it adopts exact legacy containers only when
+the control plane returns the same project, deployment, release, and instance
+in the retention set; pre-inventory rows and containers may use an empty
+instance ID, and adoption is recorded in `runtime-adoptions.json` before later
+cleanup is permitted. An already-accepted old process that heartbeats after
+takeover receives `runner_session_superseded` with an authenticated retention
+set. It preserves retained local runtimes, retries through route/recovery
+handoff, and autonomously removes unretained containers and secret directories
+before exiting. The control plane durably tombstones the former session, so it
+cannot reclaim ownership if the replacement becomes stale. A restarted former
+owner reads its `0600` work-root session marker and uses the non-owning
+session-retention endpoint to finish cleanup. Never run two processes against the same work root; the
+agent's exclusive lock rejects that configuration.
+
+An exact instance absent or non-running in a complete snapshot enters a durable
+`checking` state. Two observations spanning at least 15 seconds confirm
+`runtime_instance_lost`, queue recovery, and transfer the phantom capacity
+reservation exactly once. Proven absence permits restoration on the same
+runner, which keeps single-runner installations recoverable. If the original
+exact instance returns before a recovery lease is claimed, the queued recovery
+is cancelled and its reservation restored; after claim, the move remains
+authoritative and the old instance is removed by the retention response.
+Missing inactive instances are detached and stop consuming capacity; their
+immutable release metadata/artifact remains, but rollback requires a live
+retained runtime and rejects that instance until restore-on-demand exists.
+Polling reports `runtime_status`, a separate `runtime_failure_code`, and the
+latest recovery ID/status.
+
+The agent publishes the exact build/restore instance after its local health
+gate. For inventory sessions, completion, delayed completion reconciliation,
+recovery, and rollback require a recent observation from the current session
+and a fresh control-plane health check before proxy activation. Exact runner
+and instance ownership is checked again when activation commits; a racing loss
+is compensated to the last live route or to suspension. A resume request made
+while the active runtime is checking, recovering, or unavailable remains a
+durable pending intent and does not unsuspend a dead endpoint.
 
 For an intentional drain, mark the runner draining through its heartbeat
 configuration, wait for current leases to finish, then stop it. For an
@@ -270,10 +331,14 @@ Cleanup runs at startup and every six hours:
 Each period is configurable; zero disables that deletion. Active releases are
 never aged out. Runner heartbeat returns authoritative project/deployment
 release-instance identities. The agent removes only containers carrying the
-platform-managed label whose exact instance is no longer retained, and then
+platform-managed label and either its exact canonical-work-root namespace or
+an exact unnamespaced legacy identity in its durable adoption registry whose
+instance is no longer retained, and then
 best-effort removes the unused image. Immutable image archives are stored
 content-addressably in Deployer artifact storage; back up that storage with the
-database. Never add the platform-managed label to operator containers.
+database. Never add the platform-managed or agent-namespace labels to operator
+containers. Namespace filtering plus exact durable legacy adoption prevents
+agents sharing a Docker engine from pruning one another's containers.
 
 ## Required staging acceptance
 
