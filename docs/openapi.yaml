@@ -1500,6 +1500,7 @@ paths:
         "204": {description: Completion committed or identical terminal completion replayed.}
         "400": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
 
   /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/artifact:
     get:

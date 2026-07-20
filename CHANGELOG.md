@@ -12,6 +12,9 @@
 - Add the dedicated `hosting-agent` protocol and executable with generated
   static/Node recipes, safe archive extraction, private ports, workload limits,
   lease fencing, cancellation, health evidence, and retained-release cleanup.
+- Fence normal hosting-job completion with a durable payload fingerprint so a
+  conflicting terminal report cannot race candidate activation or replay as
+  success.
 - Add immutable health-gated activation through the private versioned proxy
   adapter client, selected-release rollback, suspend/resume, and compensation
   when cancellation races activation.

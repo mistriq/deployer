@@ -47,6 +47,7 @@ type hostingCompletionState struct {
 	ReleaseUploadRelease    string
 	ReleaseUploadPath       string
 	ReleaseUploadSize       int64
+	CompletionFingerprint   string
 }
 
 func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, leaseToken string, input hostingCompletionRequest) error {
@@ -57,39 +58,74 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 	if err != nil {
 		return err
 	}
+	input.Status = strings.TrimSpace(input.Status)
+	input.FailureCode = strings.TrimSpace(input.FailureCode)
+	input.FailureMessage = redactSecrets(strings.TrimSpace(input.FailureMessage))
+	input.ReleaseDigest = strings.ToLower(strings.TrimSpace(input.ReleaseDigest))
+	input.ReleaseArtifactDigest = strings.ToLower(strings.TrimSpace(input.ReleaseArtifactDigest))
+	input.RuntimeEndpoint = strings.TrimSpace(input.RuntimeEndpoint)
+	if state.CancelRequestedAt.Valid {
+		input = hostingCompletionRequest{Status: "cancelled", FailureCode: "cancelled", FailureMessage: "cancelled by control plane"}
+	}
+	switch input.Status {
+	case "cancelled":
+	case "failed":
+		if _, ok := allowedHostingFailureCodes[input.FailureCode]; !ok || input.FailureCode == "cancelled" {
+			return &hostingAPIError{Code: errCodeInvalidDeployment, Message: "runner returned an unsupported failure_code", StatusCode: http.StatusBadRequest}
+		}
+	case "success":
+		if !validSHA256Digest(input.ReleaseDigest) {
+			return &hostingAPIError{Code: errCodeInvalidDeployment, Message: "release_digest must be a sha256 digest", StatusCode: http.StatusBadRequest}
+		}
+		if !validSHA256Digest(input.ReleaseArtifactDigest) || input.ReleaseArtifactDigest != state.ReleaseUploadDigest ||
+			input.ReleaseDigest != state.ReleaseUploadRelease || state.ReleaseUploadSize <= 0 || !isManagedArtifactPath(state.ReleaseUploadPath) {
+			return &hostingAPIError{Code: errCodeArtifactDigestMismatch, Message: "completion does not match the persisted release artifact", StatusCode: http.StatusConflict}
+		}
+		if err := validateRuntimeEndpoint(input.RuntimeEndpoint); err != nil {
+			return &hostingAPIError{Code: errCodeInvalidDeployment, Message: err.Error(), StatusCode: http.StatusBadRequest}
+		}
+	default:
+		return &hostingAPIError{Code: errCodeInvalidDeployment, Message: "completion status must be success, failed, or cancelled", StatusCode: http.StatusBadRequest}
+	}
+	encodedCompletion, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	completionFingerprint := hashHostingOperation("hosting.job.complete", string(encodedCompletion))
 	if state.JobStatus == "succeeded" || state.JobStatus == "failed" || state.JobStatus == "cancelled" {
-		return nil
+		return validateTerminalHostingJobReplay(state, input.Status, completionFingerprint)
 	}
 	if !state.LeaseExpiresAt.Valid || !parseSQLiteTime(state.LeaseExpiresAt.String).After(time.Now().UTC()) {
 		return &hostingAPIError{Code: errCodeJobForbidden, Message: "hosting job lease has expired", StatusCode: http.StatusForbidden}
 	}
-	input.Status = strings.TrimSpace(input.Status)
-	input.FailureCode = strings.TrimSpace(input.FailureCode)
-	input.FailureMessage = redactSecrets(strings.TrimSpace(input.FailureMessage))
-	if state.CancelRequestedAt.Valid || input.Status == "cancelled" {
-		return finishHostingJobTerminal(ctx, state, hostingStatusCancelled, hostingPhaseCancelled, "cancelled", "cancelled by control plane")
+	result, err := db.ExecContext(ctx, `UPDATE hosting_jobs SET completion_fingerprint=?
+		WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?
+		AND status IN ('leased','running') AND lease_expires_at>?
+		AND (completion_fingerprint='' OR completion_fingerprint=?)`, completionFingerprint,
+		state.JobID, state.RunnerID, state.LeaseGeneration, state.LeaseTokenHash,
+		formatSQLiteTime(time.Now().UTC()), completionFingerprint)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		latest, latestErr := getHostingCompletionState(ctx, runnerID, jobID, generation, leaseToken)
+		if latestErr != nil {
+			return &hostingAPIError{Code: errCodeJobForbidden, Message: "valid current hosting job lease is required", StatusCode: http.StatusForbidden, Err: latestErr}
+		}
+		if latest.JobStatus == "succeeded" || latest.JobStatus == "failed" || latest.JobStatus == "cancelled" {
+			return validateTerminalHostingJobReplay(latest, input.Status, completionFingerprint)
+		}
+		if latest.CompletionFingerprint != "" && latest.CompletionFingerprint != completionFingerprint {
+			return &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "job completion conflicts with the durable completion intent", StatusCode: http.StatusConflict}
+		}
+		return &hostingAPIError{Code: errCodeJobForbidden, Message: "hosting job lease is no longer current", StatusCode: http.StatusForbidden}
+	}
+	state.CompletionFingerprint = completionFingerprint
+	if input.Status == "cancelled" {
+		return finishHostingJobTerminal(ctx, state, hostingStatusCancelled, hostingPhaseCancelled, "cancelled", input.FailureMessage)
 	}
 	if input.Status == "failed" {
-		if _, ok := allowedHostingFailureCodes[input.FailureCode]; !ok || input.FailureCode == "cancelled" {
-			return &hostingAPIError{Code: errCodeInvalidDeployment, Message: "runner returned an unsupported failure_code", StatusCode: http.StatusBadRequest}
-		}
 		return finishHostingJobTerminal(ctx, state, hostingStatusFailed, hostingPhaseFailed, input.FailureCode, input.FailureMessage)
-	}
-	if input.Status != "success" {
-		return &hostingAPIError{Code: errCodeInvalidDeployment, Message: "completion status must be success, failed, or cancelled", StatusCode: http.StatusBadRequest}
-	}
-	input.ReleaseDigest = strings.ToLower(strings.TrimSpace(input.ReleaseDigest))
-	input.RuntimeEndpoint = strings.TrimSpace(input.RuntimeEndpoint)
-	if !validSHA256Digest(input.ReleaseDigest) {
-		return &hostingAPIError{Code: errCodeInvalidDeployment, Message: "release_digest must be a sha256 digest", StatusCode: http.StatusBadRequest}
-	}
-	input.ReleaseArtifactDigest = strings.ToLower(strings.TrimSpace(input.ReleaseArtifactDigest))
-	if !validSHA256Digest(input.ReleaseArtifactDigest) || input.ReleaseArtifactDigest != state.ReleaseUploadDigest ||
-		input.ReleaseDigest != state.ReleaseUploadRelease || state.ReleaseUploadSize <= 0 || !isManagedArtifactPath(state.ReleaseUploadPath) {
-		return &hostingAPIError{Code: errCodeArtifactDigestMismatch, Message: "completion does not match the persisted release artifact", StatusCode: http.StatusConflict}
-	}
-	if err := validateRuntimeEndpoint(input.RuntimeEndpoint); err != nil {
-		return &hostingAPIError{Code: errCodeInvalidDeployment, Message: err.Error(), StatusCode: http.StatusBadRequest}
 	}
 	if !validHealthEvidence(input.HealthEvidence) {
 		return finishHostingJobTerminal(ctx, state, hostingStatusFailed, hostingPhaseFailed, "health_check_failed", "candidate did not provide successful health evidence")
@@ -165,6 +201,19 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 	return finishHostingJobTerminal(ctx, state, hostingStatusCancelled, hostingPhaseCancelled, "cancelled", "cancelled during activation")
 }
 
+func validateTerminalHostingJobReplay(state *hostingCompletionState, inputStatus, completionFingerprint string) error {
+	if state.CompletionFingerprint != "" && state.CompletionFingerprint != completionFingerprint {
+		return &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "terminal job completion conflicts with the committed result", StatusCode: http.StatusConflict}
+	}
+	if state.CompletionFingerprint == "" {
+		expected := map[string]string{"succeeded": "success", "failed": "failed", "cancelled": "cancelled"}[state.JobStatus]
+		if inputStatus != expected {
+			return &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "terminal job completion conflicts with the committed result", StatusCode: http.StatusConflict}
+		}
+	}
+	return nil
+}
+
 func getHostingCompletionState(ctx context.Context, runnerID, jobID, generation int64, leaseToken string) (*hostingCompletionState, error) {
 	var state hostingCompletionState
 	err := db.QueryRowContext(ctx, `SELECT j.id, j.hosting_deployment_id, d.hosting_project_id,
@@ -172,7 +221,8 @@ func getHostingCompletionState(ctx context.Context, runnerID, jobID, generation 
 		p.external_project_id, d.external_deployment_id, d.commit_sha, d.artifact_digest,
 		j.cancel_requested_at, j.lease_expires_at,
 		j.required_cpu_millis, j.required_ram_bytes, j.required_disk_bytes, j.required_pids,
-		j.release_upload_digest, j.release_upload_release_digest, j.release_upload_path, j.release_upload_size
+		j.release_upload_digest, j.release_upload_release_digest, j.release_upload_path, j.release_upload_size,
+		j.completion_fingerprint
 		FROM hosting_jobs j
 		JOIN hosting_deployments d ON d.id=j.hosting_deployment_id
 		JOIN hosting_projects p ON p.id=d.hosting_project_id
@@ -183,7 +233,8 @@ func getHostingCompletionState(ctx context.Context, runnerID, jobID, generation 
 		&state.ExternalProjectID, &state.ExternalDeploymentID, &state.CommitSHA, &state.ArtifactDigest,
 		&state.CancelRequestedAt, &state.LeaseExpiresAt,
 		&state.Limits.CPUMillis, &state.Limits.RAMBytes, &state.Limits.DiskBytes, &state.Limits.PIDs,
-		&state.ReleaseUploadDigest, &state.ReleaseUploadRelease, &state.ReleaseUploadPath, &state.ReleaseUploadSize)
+		&state.ReleaseUploadDigest, &state.ReleaseUploadRelease, &state.ReleaseUploadPath, &state.ReleaseUploadSize,
+		&state.CompletionFingerprint)
 	if err != nil {
 		return nil, err
 	}

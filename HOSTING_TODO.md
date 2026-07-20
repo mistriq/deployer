@@ -30,6 +30,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [ ] Exact commit SHA and immutable artifact digest on every hosting deployment.
 - [ ] Atomic idempotency and one-active-deployment guard under concurrency.
 - [ ] Stable deployment phases and transition validation.
+- [x] Fence conflicting runner completion payloads before proxy activation.
 - [ ] Idempotent cancel for queued and running deployments.
 - [ ] Cancellation intent and recovery remain durable after process restart.
 - [ ] Immutable release persistence and selected-release rollback.

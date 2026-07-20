@@ -155,7 +155,7 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET status='queued', hosting_runner_id=NULL,
-			lease_token_hash='', lease_expires_at=NULL WHERE id=?`, job.jobID); err != nil {
+			lease_token_hash='', lease_expires_at=NULL, completion_fingerprint='' WHERE id=?`, job.jobID); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `UPDATE hosting_deployments SET phase='queued', failure_code='',

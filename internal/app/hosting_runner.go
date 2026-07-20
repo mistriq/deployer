@@ -555,7 +555,9 @@ func claimHostingJob(ctx context.Context, runnerID int64) (*hostingClaimedJob, e
 	expires := now.Add(hostingJobLeaseDuration)
 	generation++
 	result, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET status='leased', lease_generation=?, lease_token_hash=?,
-		lease_expires_at=?, attempts=attempts+1, started_at=COALESCE(started_at, ?) WHERE id=? AND status='queued'`, generation, hashToken(leaseToken), formatSQLiteTime(expires), formatSQLiteTime(now), jobID)
+		lease_expires_at=?, completion_fingerprint='', attempts=attempts+1,
+		started_at=COALESCE(started_at, ?) WHERE id=? AND status='queued'`, generation,
+		hashToken(leaseToken), formatSQLiteTime(expires), formatSQLiteTime(now), jobID)
 	if err != nil {
 		return nil, err
 	}

@@ -466,6 +466,12 @@ func applyHostingMigrations() error {
 				)`,
 			},
 		},
+		{
+			id: "032_hosting_job_completion_fingerprint",
+			statements: []string{
+				`ALTER TABLE hosting_jobs ADD COLUMN completion_fingerprint TEXT NOT NULL DEFAULT ''`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {

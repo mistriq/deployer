@@ -188,6 +188,58 @@ func TestHostingRunnerHealthyCandidateRetainsRuntimeCapacity(t *testing.T) {
 	}
 }
 
+func TestConflictingHostingJobCompletionsCannotRaceProxyActivation(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	fake.activateStarted = make(chan struct{})
+	fake.activateContinue = make(chan struct{})
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JCOMPFN", "deployment_01JCOMPFN")
+	releaseDigest := "sha256:" + strings.Repeat("c", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
+	success := hostingCompletionRequest{
+		Status:                "success",
+		ReleaseDigest:         releaseDigest,
+		ReleaseArtifactDigest: artifactDigest,
+		RuntimeEndpoint:       "http://127.0.0.1:4111",
+		HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)},
+	}
+	successResult := make(chan error, 1)
+	go func() {
+		successResult <- completeHostingJob(context.Background(), runnerID, job.JobID,
+			job.LeaseGeneration, job.LeaseToken, success)
+	}()
+	<-fake.activateStarted
+
+	conflict := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, hostingCompletionRequest{Status: "failed", FailureCode: "build_failed", FailureMessage: "late failure"})
+	var apiErr *hostingAPIError
+	if !errors.As(conflict, &apiErr) || apiErr.Code != errCodeIdempotencyConflict {
+		t.Fatalf("conflicting completion error=%v", conflict)
+	}
+	fake.activateContinue <- struct{}{}
+	if err := <-successResult; err != nil {
+		t.Fatalf("successful completion: %v", err)
+	}
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, success); err != nil {
+		t.Fatalf("identical terminal replay: %v", err)
+	}
+	conflict = completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, hostingCompletionRequest{Status: "cancelled"})
+	if !errors.As(conflict, &apiErr) || apiErr.Code != errCodeIdempotencyConflict {
+		t.Fatalf("terminal conflicting replay error=%v", conflict)
+	}
+	deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JCOMPFN")
+	if err != nil || deployment.Status != hostingStatusActive || deployment.ReleaseDigest != releaseDigest {
+		t.Fatalf("deployment after completion race=%+v err=%v", deployment, err)
+	}
+	fake.mu.Lock()
+	activationCount := len(fake.activations)
+	fake.mu.Unlock()
+	if activationCount != 1 {
+		t.Fatalf("proxy activations=%d, want 1", activationCount)
+	}
+}
+
 func TestHostingHeartbeatCannotEraseOutstandingReservations(t *testing.T) {
 	withTempDB(t)
 	project, token := provisionDeploymentTestProject(t, "project_01JHEARTB")
