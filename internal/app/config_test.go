@@ -32,6 +32,7 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	t.Setenv("DEPLOYER_HOSTING_SOURCE_BROKER_TOKEN", "source-token")
 	t.Setenv("DEPLOYER_HOSTING_SOURCE_BROKER_TIMEOUT", "4m")
 	t.Setenv("DEPLOYER_HOSTING_SOURCE_MAX_BYTES", "123456")
+	t.Setenv("DEPLOYER_HOSTING_WORKLOAD_IDENTITY_SECRET", "workload-identity-secret-at-least-32-bytes")
 	t.Setenv("DEPLOYER_PROXY_ADAPTER_URL", "https://proxy.internal.example/")
 	t.Setenv("DEPLOYER_PROXY_ADAPTER_TOKEN", "proxy-token")
 	t.Setenv("DEPLOYER_PROXY_ADAPTER_TIMEOUT", "9s")
@@ -71,7 +72,7 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 		t.Fatalf("unexpected hosting config: %+v", cfg)
 	}
 	if cfg.HostingSourceBrokerURL != "https://source.internal.example" || cfg.HostingSourceBrokerToken != "source-token" ||
-		cfg.HostingSourceBrokerTimeout != 4*time.Minute || cfg.HostingSourceMaxBytes != 123456 {
+		cfg.HostingSourceBrokerTimeout != 4*time.Minute || cfg.HostingSourceMaxBytes != 123456 || cfg.HostingWorkloadIdentitySecret == "" {
 		t.Fatalf("unexpected source broker config: %+v", cfg)
 	}
 	if cfg.ProxyAdapterURL != "https://proxy.internal.example" || cfg.ProxyAdapterToken != "proxy-token" || cfg.ProxyAdapterTimeout != 9*time.Second ||

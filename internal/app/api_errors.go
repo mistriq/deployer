@@ -23,6 +23,7 @@ const (
 	errCodeManifestDigestMismatch     = "manifest_digest_mismatch"
 	errCodeArtifactDigestMismatch     = "artifact_digest_mismatch"
 	errCodeSourceFetchFailed          = "source_fetch_failed"
+	errCodeSecretReferenceUnavailable = "secret_reference_unavailable"
 	errCodeProjectSuspended           = "project_suspended"
 	errCodeExecutionDisabled          = "execution_disabled"
 	errCodeRunnerCapacityUnavailable  = "runner_capacity_unavailable"

@@ -40,6 +40,29 @@ private network.
   versioned private activation/suspension API and never writes proxy config.
   The adapter must persist the highest `route_generation` per project and make
   lower-generation activation/suspension requests no-ops.
+- Configure `DEPLOYER_HOSTING_WORKLOAD_IDENTITY_SECRET` on Deployer as a
+  dedicated HMAC key of at least 32 random bytes. Configure each hosting agent's
+  fixed `DEPLOYER_HOSTING_SECRET_BROKER_URL`; HTTPS is mandatory except for
+  loopback tests. The broker contract is `docs/secret-broker-openapi.yaml`.
+  It validates the 90-second issuer/audience/lease/reference-digest claims,
+  atomically consumes each token ID, and returns the exact named set. The agent
+  accepts no redirect, non-JSON or oversize response and writes values only to
+  a work-root-specific namespace below `/dev/shm/deployer-hosting-secrets`,
+  which must be tmpfs. Node applications
+  read the read-only files below `DEPLOYER_SECRETS_DIR`; builds and static
+  workloads never receive runtime secrets. On startup the agent removes orphan
+  directories and reattaches deletion monitors for managed containers that
+  survived an agent-process restart.
+  Secret containers carry a work-root-derived namespace label; startup filters
+  on that label and verifies the exact read-only bind source before monitoring
+  it, so multiple agents on one Docker host cannot inspect or delete each
+  other's material.
+  `runtime-secrets-v1` appears in the runner operations only after this startup
+  validation; placement and claim paths require it for every secret-bearing
+  build or restore. Upgrade and heartbeat capable agents before admitting such
+  deployments. Broker 408/409/429/5xx, ambiguous network errors, and
+  truncated/invalid successful JSON results are retried with a newly minted
+  one-time identity rather than replaying a token ID.
 - Configure the HTTPS terminal callback URL and an independent HMAC key of at
   least 32 random bytes.
 - Register at least one dedicated hosting runner with capacity and reserve
@@ -47,6 +70,12 @@ private network.
   the Docker engine and host kernel patched. Set
   `DEPLOYER_HOSTING_AGENT_RUNTIME_BIND_ADDRESS` to a loopback or private IPv4
   address reachable by the proxy adapter; public bind addresses are rejected.
+  Give every local agent a distinct absolute work root. The agent holds a
+  non-blocking OS lock on that directory for its lifetime and refuses a second
+  process or symlink alias, protecting completion and tmpfs reconciliation. The
+  agent canonicalizes the work root before deriving its tmpfs namespace, so a
+  restart through the same directory's symlink alias finds the same containers
+  and secret directories.
 - Create a Docker network with `--internal` and label it
   `light-apps.hosting.restricted-egress=true`; connect only approved internal
   package mirrors, then set `DEPLOYER_HOSTING_AGENT_BUILD_NETWORK` to its name.
@@ -159,12 +188,20 @@ runtime recovery. Poll `runtime_status` on the original deployment:
 `recovering` identifies an active recovery lease and `unavailable` means the
 retained runtime could not be restored and adapter suspension was staged.
 
-Secret-bearing runtime recovery is not a completed production path. The
-original deployment contract persists opaque references, but there is no
-workload-identity redemption or renewal exchange; recovery therefore fails such
-a release closed before creating a restore lease. Keep the runtime-secret and
-overall runner-recovery TODO items open until that path is implemented and
-tested without plaintext persistence.
+Secret-bearing runtime recovery never reuses plaintext from the lost runner.
+The recovery lease mints a new 90-second workload identity and the replacement
+agent redeems the persisted opaque references directly. `expires_at` on a
+reference is checked when deployment is admitted; later authorization comes
+from the fresh lease-bound identity so an immutable release remains
+recoverable. Redemption failure is reported as
+`secret_reference_unavailable` and no container is started. Rotate the HMAC key
+by first adding the new broker verification key, restarting Deployer with the
+new signing key, retaining the previous broker key for at least 90 seconds, and
+then removing it. Never copy secret tmpfs directories between agents.
+An identity is never valid beyond its current Deployer lease and is capped at
+90 seconds; issuance rejects durable cancellation. An identity minted just
+before a later cancellation remains usable only for that bounded lifetime, so
+the broker must enforce expiry and atomic one-time token consumption.
 
 Recovery currently detects whole-runner liveness loss. The heartbeat response
 describes what the agent must retain, but the agent does not yet report an
@@ -248,7 +285,8 @@ dedicated runner, and colleague-owned staging adapter:
    signed terminal callback plus polling state.
 2. Node app: repeat with a private Node health endpoint and short-lived secret
    references; verify no plaintext appears in the database, logs, events,
-   callbacks, or errors.
+   callbacks, errors, Docker arguments, or image layers; verify the application
+   reads the named tmpfs files and a forced recovery performs fresh redemption.
 3. Deploy a second healthy Node release, roll back to the first selected digest,
    and verify adapter route revision and active/inactive release states.
 4. Verify a health failure leaves the previous route active, cancellation wins

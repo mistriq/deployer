@@ -28,7 +28,7 @@ command execution.
 - Keep runner tokens private and rotate them if they appear in logs, URLs, shell
   history, screenshots, or support bundles.
 - Keep legacy runner, dedicated hosting-runner (`htr_`), hosting control-plane
-  service (`dpl_`), source-broker, callback HMAC, and proxy-adapter credentials
+  service (`dpl_`), source-broker, workload-identity HMAC, callback HMAC, and proxy-adapter credentials
   separate; never reuse one value for another integration. The source broker
   must issue a credential scoped and audience-bound only to artifact redemption.
 - Expose `/api/internal/v1` only to the authenticated hosting control plane.
@@ -43,6 +43,14 @@ command execution.
 - Treat short-lived secret references as sensitive metadata even though
   Deployer never stores their plaintext values. Do not place plaintext secrets
   in manifests, idempotency keys, external IDs, audit reasons, or log messages.
+- Configure `DEPLOYER_HOSTING_WORKLOAD_IDENTITY_SECRET` as an independent key of
+  at least 32 random bytes. The secret broker validates issuer, audience,
+  lifetime, reference digest, lease identity, and one-time token ID. Rotate with
+  current/previous verification-key overlap of at least 90 seconds. Hosting
+  agents redeem directly over HTTPS and place plaintext only in a `0700`,
+  work-root-specific host tmpfs namespace mounted read-only into the Node container; applications read the
+  named files from `DEPLOYER_SECRETS_DIR`. Do not enable swap-backed or
+  disk-backed substitutes for that tmpfs.
 - Run the dedicated hosting agent under its own OS account with access to the
   Docker engine and an isolated absolute work root. The agent executes
   untrusted customer build code inside platform-generated containers; keep the

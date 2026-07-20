@@ -46,3 +46,44 @@ func TestDeployerInstanceLockEnforcesSingleDatabaseOwner(t *testing.T) {
 		t.Fatal("in-memory database was accepted without singleton ownership")
 	}
 }
+
+func TestHostingAgentInstanceLockSerializesWorkRootAliases(t *testing.T) {
+	root := t.TempDir()
+	first, err := acquireHostingAgentInstanceLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := acquireHostingAgentInstanceLock(root); err == nil {
+		t.Fatal("second hosting agent acquired the same work root")
+	}
+	symlink := filepath.Join(t.TempDir(), "agent-root")
+	if err := os.Symlink(root, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireHostingAgentInstanceLock(symlink); err == nil {
+		t.Fatal("work-root symlink bypassed the hosting-agent instance lock")
+	}
+}
+
+func TestCanonicalHostingAgentWorkRootPreservesSecretNamespaceAcrossSymlinkAlias(t *testing.T) {
+	root := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "agent-root")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Fatal(err)
+	}
+	canonicalRoot, err := canonicalHostingAgentWorkRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalAlias, err := canonicalHostingAgentWorkRoot(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonicalRoot != canonicalAlias {
+		t.Fatalf("work-root alias resolved to a different identity: %q != %q", canonicalRoot, canonicalAlias)
+	}
+	if hostingAgentSecretMemoryRoot(canonicalRoot) != hostingAgentSecretMemoryRoot(canonicalAlias) {
+		t.Fatal("work-root alias selected a different secret namespace")
+	}
+}

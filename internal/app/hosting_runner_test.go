@@ -870,10 +870,11 @@ func TestHostingRuntimeRecoveryHonorsDurableProjectSuspension(t *testing.T) {
 	}
 }
 
-func TestHostingRuntimeLossWithSecretReferencesFailsClosed(t *testing.T) {
+func TestHostingRuntimeLossWithSecretReferencesIssuesFreshRecoveryIdentity(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
-	_, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRECSEC", "deployment_01JRECSEC")
+	project, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRECSEC", "deployment_01JRECSEC")
+	appConfig.HostingWorkloadIdentitySecret = strings.Repeat("identity-secret-", 3)
 	releaseDigest := "sha256:" + strings.Repeat("c", 64)
 	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
 	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
@@ -884,7 +885,7 @@ func TestHostingRuntimeLossWithSecretReferencesFailsClosed(t *testing.T) {
 	}
 	secretReference := "opaque-reference-that-must-not-leak"
 	encodedSecrets, err := json.Marshal([]HostingSecretReference{{Provider: "control-plane",
-		Reference: secretReference, ExpiresAt: time.Now().UTC().Add(time.Minute)}})
+		Reference: secretReference, Name: "DATABASE_URL", ExpiresAt: time.Now().UTC().Add(time.Minute)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -895,39 +896,78 @@ func TestHostingRuntimeLossWithSecretReferencesFailsClosed(t *testing.T) {
 		formatSQLiteTime(time.Now().UTC().Add(-2*hostingRunnerStaleAfter)), lostRunnerID); err != nil {
 		t.Fatal(err)
 	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	recoveryRunnerID := insertHostingRunnerForTest(t, "secret-recovery-runner", limits)
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, recoveryRunnerID); err != nil {
+		t.Fatal(err)
+	}
 	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var incompatibleAssignment sql.NullInt64
+	if err := db.QueryRow(`SELECT hosting_runner_id FROM hosting_runtime_recoveries LIMIT 1`).Scan(&incompatibleAssignment); err != nil {
+		t.Fatal(err)
+	}
+	if incompatibleAssignment.Valid {
+		t.Fatalf("secret recovery assigned to legacy runner %d", incompatibleAssignment.Int64)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore","runtime-secrets-v1"]' WHERE id=?`, recoveryRunnerID); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	var releaseStatus string
-	var releaseRunner sql.NullInt64
 	if err := db.QueryRow(`SELECT status, runtime_runner_id FROM hosting_releases WHERE release_digest=?`,
-		releaseDigest).Scan(&releaseStatus, &releaseRunner); err != nil {
+		releaseDigest).Scan(&releaseStatus, new(sql.NullInt64)); err != nil {
 		t.Fatal(err)
 	}
 	var recoveryCount int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_runtime_recoveries`).Scan(&recoveryCount); err != nil {
 		t.Fatal(err)
 	}
-	var eventCode string
-	var eventMetadata string
-	if err := db.QueryRow(`SELECT failure_code, metadata_json FROM hosting_events
-		WHERE event_type='runtime_recovery_unavailable' ORDER BY id DESC LIMIT 1`).Scan(&eventCode, &eventMetadata); err != nil {
-		t.Fatal(err)
-	}
-	deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JRECSEC")
+	recovery, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if releaseStatus != "failed" || releaseRunner.Valid || recoveryCount != 0 ||
-		eventCode != "secret_reference_unavailable" || deployment.RuntimeStatus != "unavailable" {
-		t.Fatalf("release=%q runner=%v recoveries=%d event=%q deployment=%+v",
-			releaseStatus, releaseRunner, recoveryCount, eventCode, deployment)
+	request := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/recoveries/%d/workload-identity", recovery.JobID), nil)
+	request.Header.Set("X-Deployer-Lease-Generation", fmt.Sprint(recovery.LeaseGeneration))
+	request.Header.Set("X-Deployer-Lease-Token", recovery.LeaseToken)
+	recorder := httptest.NewRecorder()
+	handleHostingRecoveryWorkloadIdentity(recorder, request, &HostingRunner{ID: recoveryRunnerID}, recovery.JobID)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("identity response=%d body=%s", recorder.Code, recorder.Body.String())
 	}
-	if strings.Contains(eventMetadata, secretReference) || len(fake.suspensions) != 1 || !fake.suspensions[0].Suspended {
-		t.Fatalf("secret leaked or route remained active: metadata=%q suspensions=%#v", eventMetadata, fake.suspensions)
+	var identity hostingWorkloadIdentityResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&identity); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := parseHostingWorkloadIdentityForTest(identity.Token, appConfig.HostingWorkloadIdentitySecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if releaseStatus != "active" || recoveryCount != 1 || claims.Operation != "restore" ||
+		claims.RunnerID != recoveryRunnerID || claims.WorkID != recovery.JobID ||
+		strings.Contains(identity.Token, secretReference) || len(fake.suspensions) != 0 {
+		t.Fatalf("release=%q recoveries=%d claims=%+v suspensions=%#v", releaseStatus, recoveryCount, claims, fake.suspensions)
+	}
+	if err := completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, recovery.JobID,
+		recovery.LeaseGeneration, recovery.LeaseToken, hostingCompletionRequest{Status: "failed",
+			FailureCode: "secret_reference_unavailable", FailureMessage: "broker unavailable"}); err != nil {
+		t.Fatalf("commit secret redemption failure: %v", err)
+	}
+	var recoveryStatus, failureCode string
+	if err := db.QueryRow(`SELECT status FROM hosting_runtime_recoveries WHERE id=?`, recovery.JobID).Scan(&recoveryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT failure_code FROM hosting_events WHERE event_type='runtime_recovery_queued' ORDER BY id DESC LIMIT 1`).Scan(&failureCode); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryStatus != "queued" || failureCode != "secret_reference_unavailable" {
+		t.Fatalf("secret failure status=%q code=%q", recoveryStatus, failureCode)
 	}
 }
 

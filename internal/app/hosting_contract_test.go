@@ -33,11 +33,13 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"/api/hosting-agent/v1/poll:",
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/source:",
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/heartbeat:",
+		"/api/hosting-agent/v1/jobs/{hostingJobId}/workload-identity:",
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/phase:",
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/logs:",
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/complete:",
 		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/artifact:",
 		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/heartbeat:",
+		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/workload-identity:",
 		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/logs:",
 		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/complete:",
 		"Idempotency-Key", "X-Deployer-Lease-Generation", "X-Deployer-Lease-Token",
@@ -45,6 +47,8 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"HostingRestoreJobRecipe", "release_artifact_url", "artifact_unavailable",
 		"X-Deployer-Event-ID", "outside a five-minute window", "at-least-once",
 		"source-broker-openapi.yaml", "HostingSourceReference", "source_reference",
+		"secret-broker-openapi.yaml", "HostingWorkloadIdentity", "secret_reference_unavailable",
+		"runtime-secrets-v1",
 	}
 	for _, value := range required {
 		if !strings.Contains(document, value) {
@@ -58,6 +62,15 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 	for _, value := range []string{"/api/internal/v1/source-artifacts/redeem:", "sourceBrokerBearer", "Authorization", "application/x-tar", "Content-Length", sourceRepositoryInstallationHeader, sourceRepositoryIDHeader, sourceRepositoryNameHeader, sourceCommitSHAHeader, sourceArtifactDigestHeader} {
 		if !strings.Contains(string(brokerContract), value) {
 			t.Errorf("source broker OpenAPI is missing %q", value)
+		}
+	}
+	secretBrokerContract, err := os.ReadFile(filepath.Join("..", "..", "docs", "secret-broker-openapi.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"/api/internal/v1/workload-secrets/redeem:", "workloadIdentityBearer", "WorkloadIdentityClaims", "secret_references_digest", "lease_generation", "time.RFC3339Nano", "application/json", "wli_"} {
+		if !strings.Contains(string(secretBrokerContract), value) {
+			t.Errorf("secret broker OpenAPI is missing %q", value)
 		}
 	}
 }

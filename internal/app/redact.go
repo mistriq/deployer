@@ -15,7 +15,7 @@ var secretRedactors = []secretRedactionRule{
 	{regexp.MustCompile(`(?i)("(?:access_token|api_key|apikey|authorization|credential|database_url|password|private_key|secret|token)"\s*:\s*)"[^"]*"`), `${1}"[REDACTED]"`},
 	{regexp.MustCompile(`(?i)(\b(?:https?|postgres(?:ql)?|mysql|redis)://)[^/@\s:]+:[^/@\s]+@`), `${1}[REDACTED]@`},
 	{regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`), `[REDACTED PRIVATE KEY]`},
-	{regexp.MustCompile(`\b(?:dpl_|ghp_|gho_|ghu_|ghs_|github_pat_|sk_live_|xox[baprs]-)[A-Za-z0-9_-]{8,}\b`), `[REDACTED]`},
+	{regexp.MustCompile(`\b(?:dpl_|wli_|ghp_|gho_|ghu_|ghs_|github_pat_|sk_live_|xox[baprs]-)[A-Za-z0-9_.-]{8,}\b`), `[REDACTED]`},
 	{regexp.MustCompile(`\bAKIA[A-Z0-9]{16}\b`), `[REDACTED]`},
 }
 

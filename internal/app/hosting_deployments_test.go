@@ -24,7 +24,7 @@ func insertHostingRunnerForTest(t *testing.T, name string, free hostingWorkloadL
 		 reported_free_cpu_millis, reported_free_ram_bytes, reported_free_disk_bytes, reported_free_pids,
 		 reserve_cpu_millis, reserve_ram_bytes, reserve_disk_bytes, reserve_pids,
 		 draining, status, last_seen, created_at)
-		VALUES (?, ?, '["linux"]', 'v1', '["v1"]', '["20","22"]', '["build","restore"]',
+		VALUES (?, ?, '["linux"]', 'v1', '["v1"]', '["20","22"]', '["build","restore","runtime-secrets-v1"]',
 		 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 'online', ?, ?)`,
 		name, hashToken("runner-"+name), free.CPUMillis, free.RAMBytes, free.DiskBytes, free.PIDs,
 		free.CPUMillis, free.RAMBytes, free.DiskBytes, free.PIDs,
@@ -202,6 +202,186 @@ func TestHostingDeploymentRefusesCapacityWithoutPartialState(t *testing.T) {
 		if count != 0 {
 			t.Fatalf("%s contains partial state after refused placement", table)
 		}
+	}
+}
+
+func TestHostingDeploymentValidatesSecretNamesAndDuplicates(t *testing.T) {
+	base := validHostingDeploymentRequest("deployment_01JSECNAMES")
+	base.SecretReferences = []HostingSecretReference{{
+		Provider: "control-plane", Reference: "reference-database-url", Name: "DATABASE_URL", ExpiresAt: time.Now().Add(time.Minute),
+	}}
+	if err := validateHostingDeploymentRequest(&base); err != nil {
+		t.Fatalf("valid secret reference rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*hostingDeploymentCreateRequest){
+		"unsafe name": func(request *hostingDeploymentCreateRequest) {
+			request.SecretReferences[0].Name = "../DATABASE_URL"
+		},
+		"duplicate name": func(request *hostingDeploymentCreateRequest) {
+			request.SecretReferences = append(request.SecretReferences, HostingSecretReference{
+				Provider: "control-plane", Reference: "reference-other-secret", Name: "DATABASE_URL", ExpiresAt: time.Now().Add(time.Minute),
+			})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := base
+			request.SecretReferences = append([]HostingSecretReference(nil), base.SecretReferences...)
+			mutate(&request)
+			if err := validateHostingDeploymentRequest(&request); err == nil {
+				t.Fatal("invalid secret reference accepted")
+			}
+		})
+	}
+}
+
+func TestStaticHostingDeploymentRejectsSecretsBeforeSourceRedemption(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	project, _, _, err := upsertHostingProject(t.Context(), "project_01JSTATICSEC", validHostingManifest("static"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := createServiceToken("static-secret-writer", []string{serviceScopeDeploymentsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "static-secret-runner", limits)
+	brokerCalls := 0
+	oldPreparer := prepareHostingSource
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+		brokerCalls++
+		return "", "", errors.New("must not be called")
+	}
+	t.Cleanup(func() { prepareHostingSource = oldPreparer })
+	request := validHostingDeploymentRequest("deployment_01JSTATICSEC")
+	request.ManifestDigest = project.ManifestDigest
+	request.SecretReferences = []HostingSecretReference{{
+		Provider: "control-plane", Reference: "reference-database-url", Name: "DATABASE_URL", ExpiresAt: time.Now().Add(time.Minute),
+	}}
+	_, err = createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JSTATICSEC", request)
+	var apiErr *hostingAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeInvalidDeployment || brokerCalls != 0 {
+		t.Fatalf("static secret admission err=%v broker_calls=%d", err, brokerCalls)
+	}
+}
+
+func TestNodeHostingDeploymentRejectsSecretsWithoutIdentitySigningBeforeSourceRedemption(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	project, _, _, err := upsertHostingProject(t.Context(), "project_01JNODESEC", validHostingManifest("node"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := createServiceToken("node-secret-writer", []string{serviceScopeDeploymentsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "node-secret-runner", limits)
+	brokerCalls := 0
+	oldPreparer := prepareHostingSource
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+		brokerCalls++
+		return "", "", errors.New("must not be called")
+	}
+	t.Cleanup(func() { prepareHostingSource = oldPreparer })
+	appConfig.HostingWorkloadIdentitySecret = ""
+	request := validHostingDeploymentRequest("deployment_01JNODESEC")
+	request.ManifestDigest = project.ManifestDigest
+	request.SecretReferences = []HostingSecretReference{{
+		Provider: "control-plane", Reference: "reference-database-url", Name: "DATABASE_URL", ExpiresAt: time.Now().Add(time.Minute),
+	}}
+	_, err = createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JNODESEC", request)
+	var apiErr *hostingAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeSecretReferenceUnavailable || apiErr.StatusCode != http.StatusServiceUnavailable || brokerCalls != 0 {
+		t.Fatalf("missing signing configuration err=%v broker_calls=%d", err, brokerCalls)
+	}
+}
+
+func TestSecretHostingDeploymentRequiresSecretReadyRunnerBeforeSourceRedemption(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JSECCAP")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	runnerID := insertHostingRunnerForTest(t, "legacy-secret-runner", limits)
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	appConfig.HostingWorkloadIdentitySecret = strings.Repeat("identity-signing-key-", 2)
+	brokerCalls := 0
+	oldPreparer := prepareHostingSource
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+		brokerCalls++
+		return "", "", errors.New("must not be called")
+	}
+	t.Cleanup(func() { prepareHostingSource = oldPreparer })
+	request := validHostingDeploymentRequest("deployment_01JSECCAP")
+	request.ManifestDigest = project.ManifestDigest
+	request.SecretReferences = []HostingSecretReference{{
+		Provider: "control-plane", Reference: "reference-database-url", Name: "DATABASE_URL", ExpiresAt: time.Now().Add(time.Minute),
+	}}
+	_, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JSECCAP", request)
+	var apiErr *hostingAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeRunnerCapacityUnavailable || brokerCalls != 0 {
+		t.Fatalf("secret capability admission err=%v broker_calls=%d", err, brokerCalls)
+	}
+}
+
+func TestSecretHostingJobIsFencedAndReassignedAfterCapabilityRemoval(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JSECREASSIGN")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	firstRunnerID := insertHostingRunnerForTest(t, "secret-runner-first", limits)
+	appConfig.HostingWorkloadIdentitySecret = strings.Repeat("identity-signing-key-", 2)
+	request := validHostingDeploymentRequest("deployment_01JSECREASSIGN")
+	request.ManifestDigest = project.ManifestDigest
+	request.SecretReferences = []HostingSecretReference{{
+		Provider: "control-plane", Reference: "reference-database-url", Name: "DATABASE_URL", ExpiresAt: time.Now().Add(time.Minute),
+	}}
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JSECREASSIGN", request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, firstRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimHostingJob(t.Context(), firstRunnerID); !errors.Is(err, errNoHostingJob) {
+		t.Fatalf("legacy runner claimed secret job: %v", err)
+	}
+	secondRunnerID := insertHostingRunnerForTest(t, "secret-runner-second", limits)
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var assignedRunnerID int64
+	if err := db.QueryRow(`SELECT hosting_runner_id FROM hosting_jobs LIMIT 1`).Scan(&assignedRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if assignedRunnerID != secondRunnerID {
+		t.Fatalf("secret job assigned runner=%d want=%d", assignedRunnerID, secondRunnerID)
+	}
+}
+
+func TestLegacySecretReferenceNameDefaultsWithoutChangingRequestEncoding(t *testing.T) {
+	type legacyReference struct {
+		Provider  string    `json:"provider"`
+		Reference string    `json:"reference"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	expires := time.Now().UTC().Add(time.Minute)
+	legacy, err := json.Marshal(legacyReference{Provider: "control-plane", Reference: "reference-database-url", ExpiresAt: expires})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := HostingSecretReference{Provider: "control-plane", Reference: "reference-database-url", ExpiresAt: expires}
+	encoded, err := json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != string(legacy) {
+		t.Fatalf("legacy request encoding changed: legacy=%s current=%s", legacy, encoded)
+	}
+	refs := []HostingSecretReference{current}
+	if err := normalizeHostingSecretReferences(refs); err != nil || refs[0].Name != "SECRET_1" {
+		t.Fatalf("legacy secret name normalization=%+v err=%v", refs, err)
 	}
 }
 

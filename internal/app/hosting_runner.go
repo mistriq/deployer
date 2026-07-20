@@ -137,8 +137,8 @@ func createHostingRunner(ctx context.Context, input hostingRunnerInput, requestI
 	}
 	input.Operations = normalizeStringList(input.Operations)
 	for _, operation := range input.Operations {
-		if operation != "build" && operation != "restore" {
-			return nil, fmt.Errorf("runner operation must be build or restore")
+		if operation != "build" && operation != "restore" && operation != hostingRunnerSecretOperation {
+			return nil, fmt.Errorf("runner operation is unsupported")
 		}
 	}
 	if !hostingStringListContains(input.Operations, "build") {
@@ -325,8 +325,8 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	input.Operations = normalizeStringList(input.Operations)
 	for _, operation := range input.Operations {
-		if operation != "build" && operation != "restore" {
-			jsonErrorCode(w, errCodeValidation, "hosting runner operation must be build or restore", http.StatusBadRequest)
+		if operation != "build" && operation != "restore" && operation != hostingRunnerSecretOperation {
+			jsonErrorCode(w, errCodeValidation, "hosting runner operation is unsupported", http.StatusBadRequest)
 			return
 		}
 	}
@@ -540,7 +540,10 @@ func claimHostingJob(ctx context.Context, runnerID int64) (*hostingClaimedJob, e
 		JOIN hosting_settings s ON s.id=1
 		WHERE j.hosting_runner_id=? AND j.status='queued' AND j.cancel_requested_at IS NULL
 		  AND p.desired_state='active' AND p.kill_switch_reason='' AND s.global_kill_switch=0
-		  AND r.status='online' AND r.draining=0 ORDER BY j.id LIMIT 1`, runnerID).Scan(&jobID, &deploymentID, &projectID, &generation, &recipeJSON, &secretsJSON)
+		  AND r.status='online' AND r.draining=0
+		  AND (json_array_length(j.secret_refs_json)=0 OR EXISTS
+		    (SELECT 1 FROM json_each(r.operation_capabilities_json) WHERE value=?))
+		ORDER BY j.id LIMIT 1`, runnerID, hostingRunnerSecretOperation).Scan(&jobID, &deploymentID, &projectID, &generation, &recipeJSON, &secretsJSON)
 	if err == sql.ErrNoRows {
 		return nil, errNoHostingJob
 	}
@@ -590,6 +593,9 @@ func claimHostingJob(ctx context.Context, runnerID int64) (*hostingClaimedJob, e
 	if secrets == nil {
 		secrets = make([]HostingSecretReference, 0)
 	}
+	if err := normalizeHostingSecretReferences(secrets); err != nil {
+		return nil, err
+	}
 	return &hostingClaimedJob{JobID: jobID, LeaseGeneration: generation, LeaseToken: leaseToken, LeaseExpiresAt: expires, Recipe: recipe, SecretRefs: secrets}, nil
 }
 
@@ -602,6 +608,8 @@ func handleHostingAgentJob(w http.ResponseWriter, r *http.Request) {
 	switch suffix {
 	case "source":
 		handleHostingJobSource(w, r, jobID)
+	case "workload-identity":
+		handleHostingJobWorkloadIdentity(w, r, r.Context().Value(hostingRunnerContextKey{}).(*HostingRunner), jobID)
 	case "release-artifact":
 		handleHostingJobReleaseArtifact(w, r, jobID)
 	case "heartbeat":

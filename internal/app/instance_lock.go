@@ -30,6 +30,22 @@ func acquireDeployerInstanceLock(dbPath string) (*deployerInstanceLock, error) {
 	return &deployerInstanceLock{file: file}, nil
 }
 
+func acquireHostingAgentInstanceLock(workRoot string) (*deployerInstanceLock, error) {
+	absoluteRoot, err := filepath.Abs(workRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve hosting-agent work root for instance lock: %w", err)
+	}
+	file, err := os.Open(absoluteRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open hosting-agent work root for instance lock: %w", err)
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("another hosting-agent process already owns work root %s: %w", absoluteRoot, err)
+	}
+	return &deployerInstanceLock{file: file}, nil
+}
+
 func (lock *deployerInstanceLock) Close() error {
 	if lock == nil || lock.file == nil {
 		return nil

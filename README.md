@@ -100,6 +100,7 @@ URL through your authorization gateway.
 | `DEPLOYER_HOSTING_SOURCE_BROKER_TOKEN` | empty | Dedicated source-broker bearer credential. Never written to the database or logs. |
 | `DEPLOYER_HOSTING_SOURCE_BROKER_TIMEOUT` | `4m` | Exact-source download timeout; must remain shorter than the server write timeout. |
 | `DEPLOYER_HOSTING_SOURCE_MAX_BYTES` | `536870912` | Maximum accepted source tar size in bytes. |
+| `DEPLOYER_HOSTING_WORKLOAD_IDENTITY_SECRET` | empty | Server-side HMAC key used only for 90-second secret-broker workload identities; use at least 32 random bytes. |
 | `DEPLOYER_PROXY_ADAPTER_URL` | empty | Colleague-owned versioned reverse-proxy adapter URL. HTTPS is required except for loopback development. |
 | `DEPLOYER_PROXY_ADAPTER_TOKEN` | empty | Private adapter bearer credential. Never written to the database or logs. |
 | `DEPLOYER_PROXY_ADAPTER_TIMEOUT` | `15s` | Activation/suspension adapter request timeout. |
@@ -115,10 +116,12 @@ URL through your authorization gateway.
 | `DEPLOYER_HOSTING_AUDIT_RETENTION_DAYS` | `365` | Hosting and service-token audit retention. |
 | `DEPLOYER_AGENT_CONTROL_TIMEOUT` | `45s` | Agent heartbeat, poll, log, completion, and version-check HTTP timeout. Agent-side setting. |
 | `DEPLOYER_AGENT_ARTIFACT_TIMEOUT` | `30m` | Agent artifact download/upload/update HTTP timeout. Agent-side setting. |
-| `DEPLOYER_HOSTING_AGENT_WORK_ROOT` | `/tmp/deployer-hosting-agent` | Absolute dedicated hosting-agent work root. Agent-side setting. |
+| `DEPLOYER_HOSTING_AGENT_WORK_ROOT` | `/tmp/deployer-hosting-agent` | Absolute dedicated hosting-agent work root. One agent process exclusively locks each root. Agent-side setting. |
 | `DEPLOYER_HOSTING_AGENT_RUNTIME_BIND_ADDRESS` | `127.0.0.1` | Loopback or private IPv4 address reachable by the staging/production proxy adapter; public binds are rejected. |
 | `DEPLOYER_HOSTING_AGENT_BUILD_NETWORK` | required | Docker internal network labeled `light-apps.hosting.restricted-egress=true` and connected only to approved package mirrors. |
 | `DEPLOYER_HOSTING_AGENT_BUILD_TIMEOUT` | `15m` | Hard customer-build deadline; accepted range is 1–60 minutes. |
+| `DEPLOYER_HOSTING_SECRET_BROKER_URL` | empty | Agent-side fixed private workload-secret broker origin. HTTPS is required except for loopback tests; redirects are rejected. |
+| `DEPLOYER_HOSTING_SECRET_BROKER_TIMEOUT` | `15s` | Agent-side workload-secret redemption timeout; accepted range is greater than zero through one minute. |
 | `DEPLOYER_HOSTING_AGENT_DRAINING` | `false` | Advertise drain and stop claiming new hosting work. Agent-side setting. |
 
 One Deployer process exclusively owns each configured SQLite database. Startup
@@ -362,11 +365,25 @@ expires because they perform no new redemption. The exact broker request,
 response, authentication, and retry contract is in
 [`docs/source-broker-openapi.yaml`](docs/source-broker-openapi.yaml).
 
-Only opaque, short-lived `control-plane` secret references are persisted.
-Passing one is not yet secret delivery: no workload identity, redemption, or
-renewal exchange is implemented. That production gate remains open in
-`HOSTING_TODO.md`. Callers must branch on stable JSON `code`, `status`, `phase`,
-and `failure_code` values rather than human text.
+Only opaque `control-plane` secret references and their safe uppercase file
+names are persisted. Immediately before a Node runtime starts, the assigned
+agent obtains a 90-second identity bound to its current job or recovery lease
+and exact reference-set digest, then redeems those references directly against
+the fixed HTTPS secret broker. Plaintext bypasses the Deployer server,
+database, build storage, logs, callbacks, Docker arguments, and images; it is
+handled only by the control-plane secret-broker subsystem and the assigned
+dedicated agent/runtime. The agent writes the exact response set into an
+isolated host tmpfs namespace and mounts it
+read-only at `/run/secrets/deployer`. The application reads files by name from
+`DEPLOYER_SECRETS_DIR`. Static workloads cannot request secrets. A restore uses
+a newly minted identity and re-redemption, not cached plaintext. Agent startup
+reconciles leftover tmpfs directories with managed containers. If a reboot
+erases material for a retained secret container, the agent refuses to heartbeat
+so runner-loss recovery performs fresh redemption. The boundary
+contract and HMAC key-overlap procedure are in
+[`docs/secret-broker-openapi.yaml`](docs/secret-broker-openapi.yaml). Callers
+must branch on stable JSON `code`, `status`, `phase`, and `failure_code` values
+rather than human text.
 
 Terminal callbacks are delivered at least once. Their signature covers
 `<timestamp>.<event_id>.<raw body>`; receivers reject timestamps outside five
@@ -383,6 +400,7 @@ Dedicated hosting runner:
   --work-root /var/lib/deployer-hosting-agent \
   --runtime-bind-address 10.20.0.15 \
   --build-network hosting-build-egress \
+  --secret-broker https://hosting-control.internal.example \
   --build-timeout 15m
 ```
 
@@ -414,12 +432,21 @@ restore recipe. During a rolling upgrade, deploy the new agents and confirm
 `restore` appears in `/api/internal/v1/runners` before enabling reliance on
 active-runtime recovery. Deployment polling exposes `runtime_status` as
 `available`, `recovering`, or `unavailable`; it remains authoritative after the
-original deployment callback. Secret-bearing releases fail closed on runner
-loss until the separate workload-identity redemption/renewal contract exists.
-Recovery currently starts from whole-runner liveness loss. The heartbeat
+original deployment callback. Secret-bearing releases obtain a fresh
+restore-lease identity and redeem their references again after runner loss;
+plaintext is never copied from the prior runner. Recovery currently starts
+from whole-runner liveness loss. The heartbeat
 response is an authoritative retention set, not a runner-reported runtime
 inventory, so a missing container on an otherwise online runner is not yet
 detected and the overall runner-recovery TODO item remains open.
+
+Runtime-secret support is negotiated independently as the
+`runtime-secrets-v1` runner operation. The agent advertises it only when a fixed
+secret broker is configured and its work-root-specific tmpfs namespace passes
+startup reconciliation. Secret-bearing jobs and recoveries are never assigned
+or claimed without that capability. During rollout, update and heartbeat
+secret-ready agents before submitting secret-bearing deployments; older v1
+agents remain eligible only for work that has no runtime secrets.
 
 The local client, persistence and reconciliation paths are generation-fenced.
 Real staging acceptance must still prove that the colleague-owned adapter
@@ -438,8 +465,8 @@ Dedicated hosting-agent API:
 
 - `POST /api/hosting-agent/v1/heartbeat`
 - `POST /api/hosting-agent/v1/poll`
-- `/api/hosting-agent/v1/jobs/:jobId/{source,release-artifact,heartbeat,phase,logs,complete}`
-- `/api/hosting-agent/v1/recoveries/:recoveryId/{artifact,heartbeat,logs,complete}`
+- `/api/hosting-agent/v1/jobs/:jobId/{source,release-artifact,heartbeat,workload-identity,phase,logs,complete}`
+- `/api/hosting-agent/v1/recoveries/:recoveryId/{artifact,heartbeat,workload-identity,logs,complete}`
 
 Agent-accessible release endpoints:
 

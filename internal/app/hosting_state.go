@@ -76,7 +76,7 @@ func handleInternalCapabilities(w http.ResponseWriter, r *http.Request) {
 		RunnerProtocolVersions: []string{hostingRunnerProtocolVersion},
 		NodeVersions:           []string{"20", "22"},
 		RuntimeKinds:           []string{"static", "node"},
-		RunnerOperations:       []string{"build", "restore"},
+		RunnerOperations:       []string{"build", "restore", hostingRunnerSecretOperation},
 		ResourceProfiles:       map[string]hostingWorkloadLimits{"starter": starter, "standard": standard},
 		FailureCodes: []string{
 			"artifact_digest_mismatch", "artifact_unavailable", "build_failed", "build_timeout", "cancelled", "health_check_failed",

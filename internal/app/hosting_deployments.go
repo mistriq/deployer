@@ -17,6 +17,7 @@ import (
 
 const (
 	hostingRunnerProtocolVersion = "v1"
+	hostingRunnerSecretOperation = "runtime-secrets-v1"
 	hostingIdempotencyTTL        = 24 * time.Hour
 	hostingRunnerStaleAfter      = 60 * time.Second
 )
@@ -27,6 +28,7 @@ var hostingProjectAdmissionLocks [64]sync.Mutex
 type HostingSecretReference struct {
 	Provider  string    `json:"provider"`
 	Reference string    `json:"reference"`
+	Name      string    `json:"name,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
@@ -120,16 +122,44 @@ func validateHostingDeploymentRequestShape(request *hostingDeploymentCreateReque
 	if len(request.SecretReferences) > 64 {
 		return fmt.Errorf("at most 64 secret references are allowed")
 	}
+	seenSecretNames := make(map[string]struct{}, len(request.SecretReferences))
 	for i := range request.SecretReferences {
 		secret := &request.SecretReferences[i]
 		secret.Provider = strings.TrimSpace(secret.Provider)
 		secret.Reference = strings.TrimSpace(secret.Reference)
+		secret.Name = strings.TrimSpace(secret.Name)
 		if secret.Provider != "control-plane" {
 			return fmt.Errorf("secret reference %d uses an unsupported provider", i)
 		}
 		if len(secret.Reference) < 8 || len(secret.Reference) > 256 || !safeOpaqueReference(secret.Reference) {
 			return fmt.Errorf("secret reference %d is invalid", i)
 		}
+		if secret.Name != "" && !validHostingSecretName(secret.Name) {
+			return fmt.Errorf("secret reference %d name is invalid", i)
+		}
+		if _, duplicate := seenSecretNames[secret.Name]; secret.Name != "" && duplicate {
+			return fmt.Errorf("secret reference %d duplicates name %q", i, secret.Name)
+		}
+		if secret.Name != "" {
+			seenSecretNames[secret.Name] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func normalizeHostingSecretReferences(refs []HostingSecretReference) error {
+	seen := make(map[string]struct{}, len(refs))
+	for index := range refs {
+		if refs[index].Name == "" {
+			refs[index].Name = fmt.Sprintf("SECRET_%d", index+1)
+		}
+		if !validHostingSecretName(refs[index].Name) {
+			return fmt.Errorf("secret reference %d name is invalid", index)
+		}
+		if _, duplicate := seen[refs[index].Name]; duplicate {
+			return fmt.Errorf("secret reference %d duplicates name %q", index, refs[index].Name)
+		}
+		seen[refs[index].Name] = struct{}{}
 	}
 	return nil
 }
@@ -237,6 +267,9 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 		}
 		return &hostingCreateResult{Deployment: &deployment, StatusCode: http.StatusAccepted, Replayed: true}, nil
 	}
+	if err := normalizeHostingSecretReferences(request.SecretReferences); err != nil {
+		return nil, &hostingAPIError{Code: errCodeInvalidDeployment, Message: err.Error(), StatusCode: 400}
+	}
 	if err := validateHostingDeploymentReferenceExpiry(&request, time.Now()); err != nil {
 		return nil, &hostingAPIError{Code: errCodeInvalidDeployment, Message: err.Error(), StatusCode: 400}
 	}
@@ -250,7 +283,13 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 	if preflightProject.ManifestDigest != request.ManifestDigest {
 		return nil, &hostingAPIError{Code: errCodeManifestDigestMismatch, Message: "manifest_digest does not match the provisioned project", StatusCode: 409}
 	}
-	if err := preflightHostingDeploymentAdmission(ctx, preflightProject, request.ExternalDeploymentID); err != nil {
+	if len(request.SecretReferences) > 0 && preflightProject.RuntimeKind != "node" {
+		return nil, &hostingAPIError{Code: errCodeInvalidDeployment, Message: "secret references require a node runtime", StatusCode: 400}
+	}
+	if len(request.SecretReferences) > 0 && len(appConfig.HostingWorkloadIdentitySecret) < 32 {
+		return nil, &hostingAPIError{Code: errCodeSecretReferenceUnavailable, Message: "workload identity signing is not configured", StatusCode: http.StatusServiceUnavailable}
+	}
+	if err := preflightHostingDeploymentAdmission(ctx, preflightProject, request.ExternalDeploymentID, len(request.SecretReferences) > 0); err != nil {
 		return nil, err
 	}
 	artifactLifecycleMu.RLock()
@@ -324,7 +363,7 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 	if err != nil {
 		return nil, err
 	}
-	runnerID, err := reserveHostingRunner(ctx, conn, project, limits, "build", 0)
+	runnerID, err := reserveHostingRunner(ctx, conn, project, limits, "build", len(request.SecretReferences) > 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -437,7 +476,7 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 	return &hostingCreateResult{Deployment: deployment, StatusCode: 202}, nil
 }
 
-func preflightHostingDeploymentAdmission(ctx context.Context, project *HostingProject, externalDeploymentID string) error {
+func preflightHostingDeploymentAdmission(ctx context.Context, project *HostingProject, externalDeploymentID string, requireSecrets bool) error {
 	if project.DesiredState != "active" {
 		return &hostingAPIError{Code: errCodeProjectSuspended, Message: "project is suspended", StatusCode: 409}
 	}
@@ -469,7 +508,7 @@ func preflightHostingDeploymentAdmission(ctx context.Context, project *HostingPr
 	if err != nil {
 		return err
 	}
-	_, err = selectCompatibleHostingRunner(ctx, db, project.Manifest, limits, "build", 0)
+	_, err = selectCompatibleHostingRunner(ctx, db, project.Manifest, limits, "build", requireSecrets, 0)
 	return err
 }
 
@@ -531,7 +570,7 @@ type hostingRunnerQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func selectCompatibleHostingRunner(ctx context.Context, querier hostingRunnerQuerier, manifest HostingProjectManifest, limits hostingWorkloadLimits, operation string, excludedRunnerID int64) (int64, error) {
+func selectCompatibleHostingRunner(ctx context.Context, querier hostingRunnerQuerier, manifest HostingProjectManifest, limits hostingWorkloadLimits, operation string, requireSecrets bool, excludedRunnerID int64) (int64, error) {
 	cutoff := formatSQLiteTime(time.Now().UTC().Add(-hostingRunnerStaleAfter))
 	rows, err := querier.QueryContext(ctx, `SELECT id, manifest_versions_json, runtime_versions_json, operation_capabilities_json
 		FROM hosting_runners
@@ -554,7 +593,8 @@ func selectCompatibleHostingRunner(ctx context.Context, querier hostingRunnerQue
 		}
 		if jsonStringListContains(manifestsJSON, manifest.SchemaVersion) &&
 			jsonStringListContains(runtimesJSON, manifest.Runtime.NodeVersion) &&
-			jsonStringListContains(operationsJSON, operation) {
+			jsonStringListContains(operationsJSON, operation) &&
+			(!requireSecrets || jsonStringListContains(operationsJSON, hostingRunnerSecretOperation)) {
 			selected = id
 			break
 		}
@@ -568,8 +608,8 @@ func selectCompatibleHostingRunner(ctx context.Context, querier hostingRunnerQue
 	return selected, nil
 }
 
-func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingProjectState, limits hostingWorkloadLimits, operation string, excludedRunnerID int64) (int64, error) {
-	selected, err := selectCompatibleHostingRunner(ctx, conn, project.Manifest, limits, operation, excludedRunnerID)
+func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingProjectState, limits hostingWorkloadLimits, operation string, requireSecrets bool, excludedRunnerID int64) (int64, error) {
+	selected, err := selectCompatibleHostingRunner(ctx, conn, project.Manifest, limits, operation, requireSecrets, excludedRunnerID)
 	if err != nil {
 		return 0, err
 	}

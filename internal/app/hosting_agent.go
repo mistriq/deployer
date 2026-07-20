@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,13 +27,16 @@ import (
 )
 
 type hostingAgentConfig struct {
-	ServerURL          string
-	Token              string
-	WorkRoot           string
-	RuntimeBindAddress string
-	BuildNetwork       string
-	BuildTimeout       time.Duration
-	Draining           bool
+	ServerURL           string
+	Token               string
+	WorkRoot            string
+	RuntimeBindAddress  string
+	BuildNetwork        string
+	BuildTimeout        time.Duration
+	SecretBrokerURL     string
+	SecretBrokerTimeout time.Duration
+	SecretMemoryRoot    string
+	Draining            bool
 }
 
 func runHostingAgent() {
@@ -43,6 +47,8 @@ func runHostingAgent() {
 	runtimeBindAddress := flags.String("runtime-bind-address", getenvDefault("DEPLOYER_HOSTING_AGENT_RUNTIME_BIND_ADDRESS", "127.0.0.1"), "Private IPv4 address used for candidate ports")
 	buildNetwork := flags.String("build-network", os.Getenv("DEPLOYER_HOSTING_AGENT_BUILD_NETWORK"), "Docker network restricted to approved package mirrors")
 	buildTimeout := flags.Duration("build-timeout", getenvDurationDefault("DEPLOYER_HOSTING_AGENT_BUILD_TIMEOUT", 15*time.Minute), "Maximum customer build duration")
+	secretBrokerURL := flags.String("secret-broker", os.Getenv("DEPLOYER_HOSTING_SECRET_BROKER_URL"), "Private workload secret broker URL")
+	secretBrokerTimeout := flags.Duration("secret-broker-timeout", getenvDurationDefault("DEPLOYER_HOSTING_SECRET_BROKER_TIMEOUT", 15*time.Second), "Workload secret redemption timeout")
 	draining := flags.Bool("draining", getenvBoolDefault("DEPLOYER_HOSTING_AGENT_DRAINING", false), "Advertise drain state and do not claim new work")
 	flags.Parse(os.Args[2:])
 	if *serverURL == "" || *token == "" || !filepath.IsAbs(*workRoot) {
@@ -59,13 +65,34 @@ func runHostingAgent() {
 	if !validHostingDockerObjectName(*buildNetwork) || *buildTimeout < time.Minute || *buildTimeout > time.Hour {
 		logFatal("hosting_agent_config_error", "build network is required and build timeout must be between 1m and 1h", nil, nil)
 	}
+	*secretBrokerURL = strings.TrimRight(strings.TrimSpace(*secretBrokerURL), "/")
+	if *secretBrokerURL != "" {
+		parsed, err := url.Parse(*secretBrokerURL)
+		if err != nil || !validPrivateServiceURL(parsed) || (parsed.Path != "" && parsed.Path != "/") || *secretBrokerTimeout <= 0 || *secretBrokerTimeout > time.Minute {
+			logFatal("hosting_agent_config_error", "secret broker must use HTTPS (or loopback HTTP) and timeout must be at most one minute", err, nil)
+		}
+	}
 	if err := os.MkdirAll(*workRoot, 0750); err != nil {
 		logFatal("hosting_agent_config_error", "prepare work root", err, nil)
 	}
+	canonicalWorkRoot, err := canonicalHostingAgentWorkRoot(*workRoot)
+	if err != nil {
+		logFatal("hosting_agent_config_error", "resolve work root", err, nil)
+	}
+	agentLock, err := acquireHostingAgentInstanceLock(canonicalWorkRoot)
+	if err != nil {
+		logFatal("hosting_agent_config_error", "acquire exclusive work-root ownership", err, nil)
+	}
+	defer agentLock.Close()
 	if err := requireHostingContainerRuntime(*buildNetwork); err != nil {
 		logFatal("hosting_agent_runtime_error", "container runtime does not satisfy hosting policy", err, nil)
 	}
-	config := hostingAgentConfig{ServerURL: *serverURL, Token: *token, WorkRoot: filepath.Clean(*workRoot), RuntimeBindAddress: *runtimeBindAddress, BuildNetwork: *buildNetwork, BuildTimeout: *buildTimeout, Draining: *draining}
+	secretMemoryRoot := hostingAgentSecretMemoryRoot(canonicalWorkRoot)
+	if err := reconcileHostingSecretDirectories(secretMemoryRoot, *secretBrokerURL != ""); err != nil {
+		logFatal("hosting_agent_runtime_error", "reconcile runtime secret directories", err, nil)
+	}
+	config := hostingAgentConfig{ServerURL: *serverURL, Token: *token, WorkRoot: canonicalWorkRoot, RuntimeBindAddress: *runtimeBindAddress, BuildNetwork: *buildNetwork, BuildTimeout: *buildTimeout,
+		SecretBrokerURL: *secretBrokerURL, SecretBrokerTimeout: *secretBrokerTimeout, SecretMemoryRoot: secretMemoryRoot, Draining: *draining}
 	for {
 		if err := flushHostingAgentCompletions(context.Background(), config); err != nil {
 			logOperationalError("retry hosting job completions", err)
@@ -91,6 +118,35 @@ func runHostingAgent() {
 		}
 		executeHostingAgentJob(config, job)
 	}
+}
+
+func canonicalHostingAgentWorkRoot(workRoot string) (string, error) {
+	absoluteRoot, err := filepath.Abs(workRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute work root: %w", err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(absoluteRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve work-root symlinks: %w", err)
+	}
+	info, err := os.Stat(canonicalRoot)
+	if err != nil {
+		return "", fmt.Errorf("inspect work root: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("work root is not a directory")
+	}
+	return filepath.Clean(canonicalRoot), nil
+}
+
+func hostingAgentSecretMemoryRoot(workRoot string) string {
+	digest := sha256.Sum256([]byte(filepath.Clean(workRoot)))
+	return filepath.Join("/dev/shm/deployer-hosting-secrets", hex.EncodeToString(digest[:16]))
+}
+
+func hostingAgentSecretNamespace(secretRoot string) string {
+	digest := sha256.Sum256([]byte(filepath.Clean(secretRoot)))
+	return hex.EncodeToString(digest[:16])
 }
 
 func requireHostingContainerRuntime(buildNetwork string) error {
@@ -181,12 +237,20 @@ func sendHostingAgentHeartbeat(ctx context.Context, config hostingAgentConfig) e
 	}
 	payload := hostingHeartbeatRequest{Free: free, Draining: config.Draining, ProtocolVersion: hostingRunnerProtocolVersion,
 		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"20", "22"},
-		Operations: []string{"build", "restore"}}
+		Operations: hostingAgentOperations(config)}
 	var response hostingHeartbeatResponse
 	if err := hostingAgentJSON(ctx, config, http.MethodPost, "/api/hosting-agent/v1/heartbeat", payload, &response, nil); err != nil {
 		return err
 	}
 	return reconcileHostingAgentReleases(ctx, response.RetainedReleases)
+}
+
+func hostingAgentOperations(config hostingAgentConfig) []string {
+	operations := []string{"build", "restore"}
+	if config.SecretBrokerURL != "" {
+		operations = append(operations, hostingRunnerSecretOperation)
+	}
+	return operations
 }
 
 func pollHostingAgentJob(ctx context.Context, config hostingAgentConfig) (*hostingClaimedJob, error) {
@@ -536,6 +600,16 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 	if err := removeStaleHostingContainer(ctx, containerName, job.Recipe.ExternalProjectID, job.Recipe.ExternalDeploymentID, instanceID); err != nil {
 		return fail("workload_policy_violation", err)
 	}
+	secretDirectory, err := prepareHostingRuntimeSecrets(ctx, config, job, instanceID)
+	if err != nil {
+		return fail("secret_reference_unavailable", err)
+	}
+	keepContainer := false
+	defer func() {
+		if !keepContainer && secretDirectory != "" {
+			_ = removeHostingSecretDirectory(secretDirectory)
+		}
+	}()
 	containerPort := job.Recipe.Runtime.Port
 	if job.Recipe.Runtime.Kind == "static" {
 		containerPort = 8080
@@ -546,14 +620,15 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 		"--label", "light-apps.hosting.deployment=" + job.Recipe.ExternalDeploymentID,
 		"--label", "light-apps.hosting.instance=" + instanceID,
 		"--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit", strconv.FormatInt(job.Recipe.Limits.PIDs, 10), "--memory", strconv.FormatInt(job.Recipe.Limits.RAMBytes, 10), "--cpus", fmt.Sprintf("%.3f", float64(job.Recipe.Limits.CPUMillis)/1000), "--storage-opt", "size=" + strconv.FormatInt(job.Recipe.Limits.DiskBytes, 10), "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "-p", fmt.Sprintf("%s::%d", config.RuntimeBindAddress, containerPort)}
-	for index, reference := range job.SecretRefs {
-		runArgs = append(runArgs, "--env", fmt.Sprintf("DEPLOYER_SECRET_REF_%d=%s", index, reference.Reference), "--env", fmt.Sprintf("DEPLOYER_SECRET_PROVIDER_%d=%s", index, reference.Provider))
+	if secretDirectory != "" {
+		runArgs = append(runArgs, "--label", "light-apps.hosting.secrets=true",
+			"--label", "light-apps.hosting.secret-namespace="+hostingAgentSecretNamespace(filepath.Dir(secretDirectory)),
+			"--mount", "type=bind,source="+secretDirectory+",target=/run/secrets/deployer,readonly,bind-propagation=rprivate", "--env", "DEPLOYER_SECRETS_DIR=/run/secrets/deployer")
 	}
 	runArgs = append(runArgs, imageRef)
 	if err := runHostingCommand(ctx, config, job, "", "docker", runArgs...); err != nil {
 		return fail("runtime_start_failed", err)
 	}
-	keepContainer := false
 	defer func() {
 		if !keepContainer {
 			_ = exec.Command("docker", "rm", "-f", containerName).Run()
@@ -582,6 +657,9 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 		return hostingCompletionRequest{Status: "failed", FailureCode: "health_check_failed", FailureMessage: redactSecrets(err.Error()), HealthEvidence: map[string]any{"healthy": false, "attempts": attempts, "status_code": statusCode}}
 	}
 	keepContainer = true
+	if secretDirectory != "" {
+		go cleanupHostingSecretsAfterContainerExit(containerName, secretDirectory)
+	}
 	return hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: releaseArtifactDigest, RuntimeEndpoint: endpoint, HealthEvidence: map[string]any{"healthy": true, "attempts": attempts, "status_code": statusCode}}
 }
 

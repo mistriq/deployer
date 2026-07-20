@@ -29,6 +29,17 @@ x-outbound-contracts:
       fail before deployment state or runner capacity is created. Exact
       successful idempotency replays do not redeem again and remain valid after
       the source reference expires.
+  hostingSecretBroker:
+    contract: ./secret-broker-openapi.yaml
+    description: >
+      Immediately before a Node runtime starts, a secret-capable hosting agent
+      obtains a lease-bound identity valid for at most 90 seconds and redeems
+      the deployment's opaque references directly against the fixed broker
+      origin. It accepts one bounded application/json response, writes the exact
+      named set into host tmpfs, and mounts it read-only at
+      /run/secrets/deployer. The control-plane broker subsystem and assigned
+      agent/runtime handle plaintext; it bypasses the Deployer server, database,
+      build pipeline, logs, callbacks, Docker arguments, and images.
 
 tags:
   - name: capabilities
@@ -1072,6 +1083,7 @@ paths:
         "422": {$ref: "#/components/responses/Error"}
         "423": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/projects/{externalProjectId}/releases:
     get:
@@ -1425,6 +1437,33 @@ paths:
         "405": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
+  /api/hosting-agent/v1/jobs/{hostingJobId}/workload-identity:
+    post:
+      tags: [hosting-agent]
+      summary: Mint a short-lived secret-broker identity for the current job lease
+      operationId: mintHostingJobWorkloadIdentity
+      security: [{hostingAgentBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/HostingJobId"
+        - $ref: "#/components/parameters/LeaseGeneration"
+        - $ref: "#/components/parameters/LeaseToken"
+      responses:
+        "200":
+          description: Non-cacheable identity bound to this lease and the exact secret-reference digest.
+          headers:
+            Cache-Control:
+              required: true
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingWorkloadIdentity"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+
   /api/hosting-agent/v1/jobs/{hostingJobId}/release-artifact:
     put:
       tags: [hosting-agent]
@@ -1570,6 +1609,33 @@ paths:
         "403": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "405": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+
+  /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/workload-identity:
+    post:
+      tags: [hosting-agent]
+      summary: Mint a fresh secret-broker identity for the current recovery lease
+      operationId: mintHostingRecoveryWorkloadIdentity
+      security: [{hostingAgentBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/HostingRecoveryId"
+        - $ref: "#/components/parameters/LeaseGeneration"
+        - $ref: "#/components/parameters/LeaseToken"
+      responses:
+        "200":
+          description: Non-cacheable restore identity bound to this lease and the exact secret-reference digest.
+          headers:
+            Cache-Control:
+              required: true
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingWorkloadIdentity"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
   /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/logs:
@@ -2189,7 +2255,11 @@ components:
       type: object
       additionalProperties: false
       required: [provider, reference, expires_at]
-      description: Opaque short-lived workload identity reference; never plaintext secret material.
+      description: >
+        Opaque control-plane secret identifier plus its application file name;
+        never plaintext secret material. expires_at is admission freshness, not
+        runtime authorization: each build or restore obtains a fresh lease-bound
+        workload identity before redemption.
       properties:
         provider: {type: string, const: control-plane}
         reference:
@@ -2197,6 +2267,14 @@ components:
           minLength: 8
           maxLength: 256
           pattern: '^[A-Za-z0-9._:/-]+$'
+        name:
+          type: string
+          description: >
+            File name created below /run/secrets/deployer; unique within the
+            request. New callers should always supply it. For compatibility
+            with earlier v1 requests, an omitted value is normalized to
+            SECRET_<one-based array index> after idempotency replay lookup.
+          pattern: '^[A-Z][A-Z0-9_]{0,63}$'
         expires_at: {type: string, format: date-time}
 
     HostingSourceReference:
@@ -2235,6 +2313,7 @@ components:
         secret_references:
           type: array
           maxItems: 64
+          description: Runtime-only secrets; allowed only when the provisioned runtime kind is node.
           items: {$ref: "#/components/schemas/HostingSecretReference"}
 
     HostingDeployment:
@@ -2367,7 +2446,7 @@ components:
         protocol_version: {type: string, const: v1}
         manifest_versions: {type: array, items: {type: string}}
         runtime_versions: {type: array, items: {type: string, enum: ['20', '22']}}
-        operations: {type: array, items: {type: string, enum: [build, restore]}}
+        operations: {type: array, items: {type: string, enum: [build, restore, runtime-secrets-v1]}}
         capacity: {$ref: "#/components/schemas/Capacity"}
         free: {$ref: "#/components/schemas/Capacity"}
         reserve: {$ref: "#/components/schemas/Capacity"}
@@ -2388,7 +2467,7 @@ components:
         operations:
           type: array
           default: [build]
-          items: {type: string, enum: [build, restore]}
+          items: {type: string, enum: [build, restore, runtime-secrets-v1]}
         capacity: {$ref: "#/components/schemas/Capacity"}
         reserve: {$ref: "#/components/schemas/Capacity"}
 
@@ -2414,7 +2493,7 @@ components:
         runner_protocol_versions: {type: array, items: {type: string, const: v1}}
         node_versions: {type: array, items: {type: string, enum: ['20', '22']}}
         runtime_kinds: {type: array, items: {type: string, enum: [static, node]}}
-        runner_operations: {type: array, items: {type: string, enum: [build, restore]}}
+        runner_operations: {type: array, items: {type: string, enum: [build, restore, runtime-secrets-v1]}}
         resource_profiles:
           type: object
           additionalProperties: {$ref: "#/components/schemas/HostingWorkloadLimits"}
@@ -2432,8 +2511,12 @@ components:
         runtime_versions: {type: array, items: {type: string, enum: ['20', '22']}}
         operations:
           type: array
-          description: Omitted by legacy v1 agents, which are treated as build-only and never receive restore work.
-          items: {type: string, enum: [build, restore]}
+          description: >
+            Omitted by legacy v1 agents, which are treated as build-only.
+            runtime-secrets-v1 is advertised only after the agent validates its
+            fixed broker URL and isolated tmpfs namespace; secret-bearing build
+            and restore work requires it.
+          items: {type: string, enum: [build, restore, runtime-secrets-v1]}
 
     HostingRetainedRelease:
       type: object
@@ -2499,6 +2582,20 @@ components:
           type: array
           items: {$ref: "#/components/schemas/HostingSecretReference"}
 
+    HostingWorkloadIdentity:
+      type: object
+      additionalProperties: false
+      required: [token, expires_at]
+      properties:
+        token:
+          type: string
+          readOnly: true
+          pattern: '^wli_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
+          description: >
+            HMAC-SHA256 bearer token described by secret-broker-openapi.yaml;
+            valid for at most 90 seconds and sensitive in transit and logs.
+        expires_at: {type: string, format: date-time}
+
     HostingCompletion:
       type: object
       additionalProperties: false
@@ -2517,7 +2614,7 @@ components:
         status: {type: string, enum: [success, failed, cancelled]}
         failure_code:
           type: string
-          enum: [artifact_digest_mismatch, artifact_unavailable, build_failed, build_timeout, cancelled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, source_fetch_failed, workload_policy_violation]
+          enum: [artifact_digest_mismatch, artifact_unavailable, build_failed, build_timeout, cancelled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, secret_reference_unavailable, source_fetch_failed, workload_policy_violation]
         failure_message: {type: string}
         release_digest: {$ref: "#/components/schemas/SHA256Digest"}
         release_artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
@@ -2545,7 +2642,7 @@ components:
             status: {type: string, const: failed}
             failure_code:
               type: string
-              enum: [artifact_digest_mismatch, artifact_unavailable, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, workload_policy_violation]
+              enum: [artifact_digest_mismatch, artifact_unavailable, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, secret_reference_unavailable, workload_policy_violation]
         - required: [status]
           properties:
             status: {type: string, const: cancelled}
@@ -2554,7 +2651,7 @@ components:
         status: {type: string, enum: [success, failed, cancelled]}
         failure_code:
           type: string
-          enum: [artifact_digest_mismatch, artifact_unavailable, cancelled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, workload_policy_violation]
+          enum: [artifact_digest_mismatch, artifact_unavailable, cancelled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, secret_reference_unavailable, workload_policy_violation]
         failure_message: {type: string}
         release_digest: {$ref: "#/components/schemas/SHA256Digest"}
         release_artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}

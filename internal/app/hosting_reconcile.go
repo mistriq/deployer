@@ -580,10 +580,47 @@ func placeUnassignedHostingJobs(ctx context.Context, conn *sql.Conn, now time.Ti
 	if globallyDisabled != 0 {
 		return nil
 	}
+	incompatibleRows, err := conn.QueryContext(ctx, `SELECT j.id, j.hosting_runner_id,
+		j.required_cpu_millis, j.required_ram_bytes, j.required_disk_bytes, j.required_pids
+		FROM hosting_jobs j JOIN hosting_runners runner ON runner.id=j.hosting_runner_id
+		WHERE j.status='queued' AND json_array_length(j.secret_refs_json)>0
+		  AND NOT EXISTS (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value=?)`, hostingRunnerSecretOperation)
+	if err != nil {
+		return err
+	}
+	type incompatibleJob struct {
+		jobID, runnerID int64
+		limits          hostingWorkloadLimits
+	}
+	var incompatible []incompatibleJob
+	for incompatibleRows.Next() {
+		var job incompatibleJob
+		if err := incompatibleRows.Scan(&job.jobID, &job.runnerID, &job.limits.CPUMillis,
+			&job.limits.RAMBytes, &job.limits.DiskBytes, &job.limits.PIDs); err != nil {
+			incompatibleRows.Close()
+			return err
+		}
+		incompatible = append(incompatible, job)
+	}
+	if err := incompatibleRows.Close(); err != nil {
+		return err
+	}
+	for _, job := range incompatible {
+		result, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET hosting_runner_id=NULL
+			WHERE id=? AND status='queued' AND hosting_runner_id=?`, job.jobID, job.runnerID)
+		if err != nil {
+			return err
+		}
+		if affected, _ := result.RowsAffected(); affected == 1 {
+			if err := restoreHostingRunnerCapacity(ctx, conn, job.runnerID, job.limits); err != nil {
+				return err
+			}
+		}
+	}
 	rows, err := conn.QueryContext(ctx, `SELECT j.id, j.hosting_deployment_id, d.hosting_project_id,
 		p.external_project_id, p.manifest_json, p.manifest_digest, p.resource_profile, p.deploy_path,
 		p.desired_state, p.kill_switch_reason, j.required_cpu_millis, j.required_ram_bytes,
-		j.required_disk_bytes, j.required_pids
+		j.required_disk_bytes, j.required_pids, j.secret_refs_json
 		FROM hosting_jobs j
 		JOIN hosting_deployments d ON d.id=j.hosting_deployment_id
 		JOIN hosting_projects p ON p.id=d.hosting_project_id
@@ -598,15 +635,17 @@ func placeUnassignedHostingJobs(ctx context.Context, conn *sql.Conn, now time.Ti
 		project                        hostingProjectState
 		manifestJSON                   string
 		limits                         hostingWorkloadLimits
+		requireSecrets                 bool
 	}
 	var jobs []queuedJob
 	for rows.Next() {
 		var job queuedJob
+		var secretsJSON string
 		if err := rows.Scan(&job.jobID, &job.deploymentID, &job.projectID,
 			&job.project.ExternalProjectID, &job.manifestJSON, &job.project.ManifestDigest,
 			&job.project.ResourceProfile, &job.project.DeployPath, &job.project.DesiredState,
 			&job.project.KillSwitchReason, &job.limits.CPUMillis, &job.limits.RAMBytes,
-			&job.limits.DiskBytes, &job.limits.PIDs); err != nil {
+			&job.limits.DiskBytes, &job.limits.PIDs, &secretsJSON); err != nil {
 			rows.Close()
 			return err
 		}
@@ -615,13 +654,19 @@ func placeUnassignedHostingJobs(ctx context.Context, conn *sql.Conn, now time.Ti
 			rows.Close()
 			return err
 		}
+		var refs []HostingSecretReference
+		if err := json.Unmarshal([]byte(secretsJSON), &refs); err != nil {
+			rows.Close()
+			return err
+		}
+		job.requireSecrets = len(refs) > 0
 		jobs = append(jobs, job)
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
 	for _, job := range jobs {
-		runnerID, err := reserveHostingRunner(ctx, conn, &job.project, job.limits, "build", 0)
+		runnerID, err := reserveHostingRunner(ctx, conn, &job.project, job.limits, "build", job.requireSecrets, 0)
 		if err != nil {
 			var apiErr *hostingAPIError
 			if errors.As(err, &apiErr) && apiErr.Code == errCodeRunnerCapacityUnavailable {

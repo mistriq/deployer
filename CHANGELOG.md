@@ -13,6 +13,9 @@
   atomically reserving runner capacity or creating hosting work.
 - Enforce one active Deployer process per SQLite database so idempotent source
   admission and managed-artifact cleanup share a valid process-wide fence.
+- Add lease-bound 90-second workload identities and direct agent-to-secret-
+  broker redemption, with exact reference-set binding, tmpfs-backed read-only
+  Node secret files, and fresh redemption during retained-runtime recovery.
 - Add the dedicated `hosting-agent` protocol and executable with generated
   static/Node recipes, safe archive extraction, private ports, workload limits,
   lease fencing, cancellation, health evidence, and retained-release cleanup.

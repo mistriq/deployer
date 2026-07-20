@@ -42,14 +42,15 @@ type hostingRuntimeRecoveryState struct {
 }
 
 var allowedHostingRecoveryFailureCodes = map[string]struct{}{
-	"artifact_digest_mismatch":   {},
-	"artifact_unavailable":       {},
-	"health_check_failed":        {},
-	"proxy_activation_failed":    {},
-	"release_persistence_failed": {},
-	"runner_lost":                {},
-	"runtime_start_failed":       {},
-	"workload_policy_violation":  {},
+	"artifact_digest_mismatch":     {},
+	"artifact_unavailable":         {},
+	"health_check_failed":          {},
+	"proxy_activation_failed":      {},
+	"release_persistence_failed":   {},
+	"runner_lost":                  {},
+	"runtime_start_failed":         {},
+	"secret_reference_unavailable": {},
+	"workload_policy_violation":    {},
 }
 
 func claimHostingRuntimeRecovery(ctx context.Context, runnerID int64) (*hostingClaimedJob, error) {
@@ -90,7 +91,9 @@ func claimHostingRuntimeRecovery(ctx context.Context, runnerID int64) (*hostingC
 		  AND project.desired_state='active' AND project.kill_switch_reason=''
 		  AND settings.global_kill_switch=0 AND runner.status='online' AND runner.draining=0
 		  AND EXISTS (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value='restore')
-		ORDER BY recovery.id LIMIT 1`, runnerID).Scan(
+		  AND (json_array_length(job.secret_refs_json)=0 OR EXISTS
+		    (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value=?))
+		ORDER BY recovery.id LIMIT 1`, runnerID, hostingRunnerSecretOperation).Scan(
 		&state.ID, &state.ReleaseID, &state.DeploymentID, &state.ProjectID, &state.RuntimeOwnerRunnerID,
 		&state.LeaseGeneration,
 		&state.ExternalProjectID, &state.ExternalDeploymentID, &state.ReleaseDigest,
@@ -107,6 +110,9 @@ func claimHostingRuntimeRecovery(ctx context.Context, runnerID int64) (*hostingC
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(secretsJSON), &state.SecretRefs); err != nil {
+		return nil, err
+	}
+	if err := normalizeHostingSecretReferences(state.SecretRefs); err != nil {
 		return nil, err
 	}
 	if state.SecretRefs == nil {
@@ -161,6 +167,8 @@ func handleHostingAgentRecovery(w http.ResponseWriter, r *http.Request) {
 	switch suffix {
 	case "artifact":
 		handleHostingRecoveryArtifact(w, r, recoveryID)
+	case "workload-identity":
+		handleHostingRecoveryWorkloadIdentity(w, r, r.Context().Value(hostingRunnerContextKey{}).(*HostingRunner), recoveryID)
 	case "heartbeat":
 		handleHostingRecoveryHeartbeat(w, r, recoveryID)
 	case "logs":
@@ -346,7 +354,6 @@ func queueLostHostingRuntimes(ctx context.Context, conn *sql.Conn, now time.Time
 	rows, err := conn.QueryContext(ctx, `SELECT release.id, release.hosting_project_id,
 		release.hosting_deployment_id, release.runtime_runner_id, job.required_cpu_millis,
 			job.required_ram_bytes, job.required_disk_bytes, job.required_pids, release.release_artifact_digest
-			, job.secret_refs_json
 		FROM hosting_releases release
 		JOIN hosting_runners runner ON runner.id=release.runtime_runner_id
 		JOIN hosting_jobs job ON job.hosting_deployment_id=release.hosting_deployment_id
@@ -363,14 +370,13 @@ func queueLostHostingRuntimes(ctx context.Context, conn *sql.Conn, now time.Time
 		releaseID, projectID, deploymentID, runnerID int64
 		limits                                       hostingWorkloadLimits
 		artifactDigest                               sql.NullString
-		secretRefsJSON                               string
 	}
 	var lost []lostRuntime
 	for rows.Next() {
 		var runtime lostRuntime
 		if err := rows.Scan(&runtime.releaseID, &runtime.projectID, &runtime.deploymentID, &runtime.runnerID,
 			&runtime.limits.CPUMillis, &runtime.limits.RAMBytes, &runtime.limits.DiskBytes,
-			&runtime.limits.PIDs, &runtime.artifactDigest, &runtime.secretRefsJSON); err != nil {
+			&runtime.limits.PIDs, &runtime.artifactDigest); err != nil {
 			rows.Close()
 			return err
 		}
@@ -380,27 +386,6 @@ func queueLostHostingRuntimes(ctx context.Context, conn *sql.Conn, now time.Time
 		return err
 	}
 	for _, runtime := range lost {
-		var secretRefs []HostingSecretReference
-		if err := json.Unmarshal([]byte(runtime.secretRefsJSON), &secretRefs); err != nil {
-			return err
-		}
-		if len(secretRefs) > 0 {
-			if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='failed', runtime_runner_id=NULL WHERE id=?`, runtime.releaseID); err != nil {
-				return err
-			}
-			if err := stageHostingRuntimeUnavailable(ctx, conn, runtime.projectID, runtime.deploymentID,
-				runtime.releaseID, now); err != nil {
-				return err
-			}
-			if err := recordHostingEvent(ctx, conn, runtime.projectID, runtime.deploymentID,
-				"runtime_recovery_unavailable", hostingPhaseFailed, "secret_reference_unavailable", nil, now); err != nil {
-				return err
-			}
-			if err := recomputeHostingRunnerCapacity(ctx, conn, runtime.runnerID); err != nil {
-				return err
-			}
-			continue
-		}
 		if !runtime.artifactDigest.Valid || !validSHA256Digest(runtime.artifactDigest.String) {
 			if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='failed', runtime_runner_id=NULL WHERE id=?`, runtime.releaseID); err != nil {
 				return err
@@ -440,9 +425,13 @@ func placeHostingRuntimeRecoveries(ctx context.Context, conn *sql.Conn, now time
 		recovery.required_disk_bytes, recovery.required_pids
 		FROM hosting_runtime_recoveries recovery
 		JOIN hosting_runners runner ON runner.id=recovery.hosting_runner_id
+		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
+		JOIN hosting_jobs job ON job.hosting_deployment_id=release.hosting_deployment_id
 		WHERE recovery.status='queued' AND recovery.hosting_runner_id IS NOT NULL
 		  AND (runner.status<>'online' OR runner.draining<>0 OR runner.last_seen IS NULL OR runner.last_seen<?
-		    OR NOT EXISTS (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value='restore'))`, staleBefore)
+		    OR NOT EXISTS (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value='restore')
+		    OR (json_array_length(job.secret_refs_json)>0 AND NOT EXISTS
+		      (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value=?)))`, staleBefore, hostingRunnerSecretOperation)
 	if err != nil {
 		return err
 	}
@@ -482,9 +471,10 @@ func placeHostingRuntimeRecoveries(ctx context.Context, conn *sql.Conn, now time
 		project.external_project_id, project.manifest_json, project.manifest_digest,
 		project.resource_profile, project.deploy_path, project.desired_state, project.kill_switch_reason,
 		recovery.required_cpu_millis, recovery.required_ram_bytes, recovery.required_disk_bytes,
-			recovery.required_pids, release.runtime_runner_id
+		recovery.required_pids, release.runtime_runner_id, job.secret_refs_json
 		FROM hosting_runtime_recoveries recovery
 		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
+		JOIN hosting_jobs job ON job.hosting_deployment_id=release.hosting_deployment_id
 		JOIN hosting_projects project ON project.id=release.hosting_project_id
 		JOIN hosting_settings settings ON settings.id=1
 		WHERE recovery.status='queued' AND recovery.hosting_runner_id IS NULL
@@ -495,20 +485,22 @@ func placeHostingRuntimeRecoveries(ctx context.Context, conn *sql.Conn, now time
 		return err
 	}
 	type queuedRecovery struct {
-		id           int64
-		project      hostingProjectState
-		limits       hostingWorkloadLimits
-		manifestJSON string
-		ownerRunner  int64
+		id             int64
+		project        hostingProjectState
+		limits         hostingWorkloadLimits
+		manifestJSON   string
+		ownerRunner    int64
+		requireSecrets bool
 	}
 	var recoveries []queuedRecovery
 	for rows.Next() {
 		var recovery queuedRecovery
+		var secretsJSON string
 		if err := rows.Scan(&recovery.id, &recovery.project.ID, &recovery.project.ExternalProjectID,
 			&recovery.manifestJSON, &recovery.project.ManifestDigest, &recovery.project.ResourceProfile,
 			&recovery.project.DeployPath, &recovery.project.DesiredState, &recovery.project.KillSwitchReason,
 			&recovery.limits.CPUMillis, &recovery.limits.RAMBytes, &recovery.limits.DiskBytes,
-			&recovery.limits.PIDs, &recovery.ownerRunner); err != nil {
+			&recovery.limits.PIDs, &recovery.ownerRunner, &secretsJSON); err != nil {
 			rows.Close()
 			return err
 		}
@@ -516,13 +508,19 @@ func placeHostingRuntimeRecoveries(ctx context.Context, conn *sql.Conn, now time
 			rows.Close()
 			return err
 		}
+		var refs []HostingSecretReference
+		if err := json.Unmarshal([]byte(secretsJSON), &refs); err != nil {
+			rows.Close()
+			return err
+		}
+		recovery.requireSecrets = len(refs) > 0
 		recoveries = append(recoveries, recovery)
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
 	for _, recovery := range recoveries {
-		runnerID, err := reserveHostingRunner(ctx, conn, &recovery.project, recovery.limits, "restore", recovery.ownerRunner)
+		runnerID, err := reserveHostingRunner(ctx, conn, &recovery.project, recovery.limits, "restore", recovery.requireSecrets, recovery.ownerRunner)
 		if err != nil {
 			var apiErr *hostingAPIError
 			if errorsAsHosting(err, &apiErr) && apiErr.Code == errCodeRunnerCapacityUnavailable {
