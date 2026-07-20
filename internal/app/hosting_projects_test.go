@@ -51,7 +51,6 @@ func withHostingConfig(t *testing.T) {
 		artifactStorage = oldStorage
 	})
 	root := t.TempDir()
-	appConfig.HostingRepoRoot = filepath.Join(root, "repos")
 	appConfig.HostingDeployRoot = filepath.Join(root, "apps")
 	if artifactStorage == nil {
 		appConfig.ArtifactDir = filepath.Join(root, "artifacts")
@@ -256,8 +255,8 @@ func TestDeriveHostingPathRequiresSafeAbsoluteRoot(t *testing.T) {
 	if _, err := deriveHostingPath("/", "project_01JHOSTING"); err == nil {
 		t.Fatal("expected filesystem root to be rejected")
 	}
-	got, err := deriveHostingPath("/srv/deployer/hosting/repos", "project_01JHOSTING")
-	if err != nil || got != "/srv/deployer/hosting/repos/project_01JHOSTING" {
+	got, err := deriveHostingPath("/srv/deployer/hosting/apps", "project_01JHOSTING")
+	if err != nil || got != "/srv/deployer/hosting/apps/project_01JHOSTING" {
 		t.Fatalf("unexpected derived path %q err=%v", got, err)
 	}
 }

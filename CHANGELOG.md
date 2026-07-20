@@ -7,8 +7,12 @@
   idempotency, stable errors, and audit records.
 - Separate hosting projects, deployments, jobs, runners, releases, events,
   logs, callbacks, and capacity from the legacy trusted-admin deployment path.
-- Verify full Git commit identity and immutable source-artifact digests before
-  atomically reserving runner capacity and creating hosting work.
+- Redeem short-lived opaque source references through a fixed authenticated
+  HTTPS broker, bind its response to the provisioned repository, exact Git
+  commit, size and immutable artifact digest, and persist the source before
+  atomically reserving runner capacity or creating hosting work.
+- Enforce one active Deployer process per SQLite database so idempotent source
+  admission and managed-artifact cleanup share a valid process-wide fence.
 - Add the dedicated `hosting-agent` protocol and executable with generated
   static/Node recipes, safe archive extraction, private ports, workload limits,
   lease fencing, cancellation, health evidence, and retained-release cleanup.

@@ -24,8 +24,11 @@ type AppConfig struct {
 	SSHTimeout                   time.Duration
 	HealthCheckTimeout           time.Duration
 	DemoMode                     bool
-	HostingRepoRoot              string
 	HostingDeployRoot            string
+	HostingSourceBrokerURL       string
+	HostingSourceBrokerToken     string
+	HostingSourceBrokerTimeout   time.Duration
+	HostingSourceMaxBytes        int64
 	ProxyAdapterURL              string
 	ProxyAdapterToken            string
 	ProxyAdapterTimeout          time.Duration
@@ -72,8 +75,11 @@ func loadConfig() AppConfig {
 		SSHTimeout:                   getenvDurationDefault("DEPLOYER_SSH_TIMEOUT", 5*time.Minute),
 		HealthCheckTimeout:           getenvDurationDefault("DEPLOYER_HEALTH_CHECK_TIMEOUT", 60*time.Second),
 		DemoMode:                     getenvBoolDefault("DEPLOYER_DEMO_MODE", false),
-		HostingRepoRoot:              getenvDefault("DEPLOYER_HOSTING_REPO_ROOT", "/srv/deployer/hosting/repos"),
 		HostingDeployRoot:            getenvDefault("DEPLOYER_HOSTING_DEPLOY_ROOT", "/srv/deployer/hosting/apps"),
+		HostingSourceBrokerURL:       strings.TrimRight(os.Getenv("DEPLOYER_HOSTING_SOURCE_BROKER_URL"), "/"),
+		HostingSourceBrokerToken:     os.Getenv("DEPLOYER_HOSTING_SOURCE_BROKER_TOKEN"),
+		HostingSourceBrokerTimeout:   getenvDurationDefault("DEPLOYER_HOSTING_SOURCE_BROKER_TIMEOUT", 4*time.Minute),
+		HostingSourceMaxBytes:        int64(getenvIntDefault("DEPLOYER_HOSTING_SOURCE_MAX_BYTES", 512<<20)),
 		ProxyAdapterURL:              strings.TrimRight(os.Getenv("DEPLOYER_PROXY_ADAPTER_URL"), "/"),
 		ProxyAdapterToken:            os.Getenv("DEPLOYER_PROXY_ADAPTER_TOKEN"),
 		ProxyAdapterTimeout:          getenvDurationDefault("DEPLOYER_PROXY_ADAPTER_TIMEOUT", 15*time.Second),

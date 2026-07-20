@@ -14,6 +14,21 @@ servers:
     description: Example production URL
   - url: http://127.0.0.1:9090
     description: Default local URL
+x-outbound-contracts:
+  hostingSourceBroker:
+    contract: ./source-broker-openapi.yaml
+    description: >
+      Deployer redeems each opaque source reference with an authenticated POST
+      to the configured broker path /api/internal/v1/source-artifacts/redeem.
+      It sends and requires an exact response echo of
+      X-Deployer-Repository-Installation-Id, X-Deployer-Repository-Id,
+      X-Deployer-Repository-Full-Name, X-Deployer-Commit-Sha, and
+      X-Deployer-Artifact-Digest. A successful response is application/x-tar
+      with Content-Length. Redirects, identity disagreement, digest
+      disagreement, expired references, and configured size-limit violations
+      fail before deployment state or runner capacity is created. Exact
+      successful idempotency replays do not redeem again and remain valid after
+      the source reference expires.
 
 tags:
   - name: capabilities
@@ -1028,7 +1043,9 @@ paths:
       summary: Create an exact, immutable hosting deployment
       description: >
         Requires deployments:write. The commit must be a full Git SHA and the
-        artifact digest must match Deployer's archive of that exact commit.
+        artifact digest must match the exact tar returned by the configured
+        authenticated source broker for the provisioned repository identity
+        and short-lived opaque source reference.
         Placement, capacity reservation, deployment, job, event, and
         idempotency response are committed atomically. This endpoint accepts no
         shell, Dockerfile, Compose, host path, privileged option, or plaintext secret.
@@ -1052,6 +1069,7 @@ paths:
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
         "423": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/Error"}
 
@@ -2181,10 +2199,31 @@ components:
           pattern: '^[A-Za-z0-9._:/-]+$'
         expires_at: {type: string, format: date-time}
 
+    HostingSourceReference:
+      type: object
+      additionalProperties: false
+      required: [provider, reference, expires_at]
+      description: >
+        Opaque short-lived source-broker reference. It is redeemed only against
+        Deployer's configured broker origin and is never persisted. The broker
+        must permit identical redemptions until expiry so concurrent idempotent
+        deployment requests can converge on the same immutable artifact.
+      properties:
+        provider: {type: string, const: control-plane}
+        reference:
+          type: string
+          minLength: 8
+          maxLength: 256
+          pattern: '^[A-Za-z0-9._-]+$'
+        expires_at:
+          type: string
+          format: date-time
+          description: Must be in the future and no more than one hour from the request.
+
     HostingDeploymentInput:
       type: object
       additionalProperties: false
-      required: [external_deployment_id, commit_sha, manifest_digest, artifact_digest]
+      required: [external_deployment_id, commit_sha, manifest_digest, artifact_digest, source_reference]
       properties:
         external_deployment_id:
           type: string
@@ -2192,6 +2231,7 @@ components:
         commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
         manifest_digest: {$ref: "#/components/schemas/SHA256Digest"}
         artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        source_reference: {$ref: "#/components/schemas/HostingSourceReference"}
         secret_references:
           type: array
           maxItems: 64

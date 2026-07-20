@@ -28,12 +28,16 @@ command execution.
 - Keep runner tokens private and rotate them if they appear in logs, URLs, shell
   history, screenshots, or support bundles.
 - Keep legacy runner, dedicated hosting-runner (`htr_`), hosting control-plane
-  service (`dpl_`), callback HMAC, and proxy-adapter credentials separate. None
-  is valid in another credential class.
+  service (`dpl_`), source-broker, callback HMAC, and proxy-adapter credentials
+  separate; never reuse one value for another integration. The source broker
+  must issue a credential scoped and audience-bound only to artifact redemption.
 - Expose `/api/internal/v1` only to the authenticated hosting control plane.
   Customer browsers and hosted workloads must never call Deployer directly.
-- Configure the proxy adapter and callback receiver with HTTPS. Plain HTTP is
-  accepted only for loopback development endpoints.
+- Configure the source broker, proxy adapter, and callback receiver with HTTPS.
+  Plain HTTP is accepted only for loopback development endpoints. Source
+  references are opaque identifiers, not caller-selected URLs. Treat the
+  redemption JSON body as sensitive metadata and redact it, the Authorization
+  header, and identity headers from broker traces and request logs.
 - Grant the smallest service-token scopes possible. `hosting:admin` controls the
   global execution kill switch and should use a separate operational identity.
 - Treat short-lived secret references as sensitive metadata even though

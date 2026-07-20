@@ -95,8 +95,11 @@ URL through your authorization gateway.
 | `DEPLOYER_SSH_TIMEOUT` | `5m` | Remote SSH deploy timeout. |
 | `DEPLOYER_HEALTH_CHECK_TIMEOUT` | `60s` | Health-check timeout. |
 | `DEPLOYER_DEMO_MODE` | `false` | Seeds public-safe demo projects, runners, and builds into an empty database for screenshots. |
-| `DEPLOYER_HOSTING_REPO_ROOT` | `/srv/deployer/hosting/repos` | Base directory used to derive hosted-project checkout paths. The API never accepts an arbitrary checkout path. |
 | `DEPLOYER_HOSTING_DEPLOY_ROOT` | `/srv/deployer/hosting/apps` | Base directory used to derive hosted-project deploy paths. The API never accepts an arbitrary deploy path. |
+| `DEPLOYER_HOSTING_SOURCE_BROKER_URL` | empty | Fixed private source-broker origin. HTTPS is required except for loopback tests; redirects are rejected. |
+| `DEPLOYER_HOSTING_SOURCE_BROKER_TOKEN` | empty | Dedicated source-broker bearer credential. Never written to the database or logs. |
+| `DEPLOYER_HOSTING_SOURCE_BROKER_TIMEOUT` | `4m` | Exact-source download timeout; must remain shorter than the server write timeout. |
+| `DEPLOYER_HOSTING_SOURCE_MAX_BYTES` | `536870912` | Maximum accepted source tar size in bytes. |
 | `DEPLOYER_PROXY_ADAPTER_URL` | empty | Colleague-owned versioned reverse-proxy adapter URL. HTTPS is required except for loopback development. |
 | `DEPLOYER_PROXY_ADAPTER_TOKEN` | empty | Private adapter bearer credential. Never written to the database or logs. |
 | `DEPLOYER_PROXY_ADAPTER_TIMEOUT` | `15s` | Activation/suspension adapter request timeout. |
@@ -117,6 +120,12 @@ URL through your authorization gateway.
 | `DEPLOYER_HOSTING_AGENT_BUILD_NETWORK` | required | Docker internal network labeled `light-apps.hosting.restricted-egress=true` and connected only to approved package mirrors. |
 | `DEPLOYER_HOSTING_AGENT_BUILD_TIMEOUT` | `15m` | Hard customer-build deadline; accepted range is 1–60 minutes. |
 | `DEPLOYER_HOSTING_AGENT_DRAINING` | `false` | Advertise drain and stop claiming new hosting work. Agent-side setting. |
+
+One Deployer process exclusively owns each configured SQLite database. Startup
+takes an OS lock on `DEPLOYER_DB_PATH` itself and fails closed on contention,
+including symlink or hard-link aliases. In-memory server databases are rejected.
+Give that database dedicated artifact and snapshot directories; this invariant
+coordinates idempotent source acquisition with artifact cleanup.
 
 See `.env.example` for a starter environment file.
 
@@ -328,7 +337,7 @@ GitHub App installation/repository IDs, `static` or `node`, an allowlisted Node
 version and package manager, package.json script names, paths, port, health
 path, and a resource profile. It does not accept repository/deploy filesystem
 paths, SSH targets, Compose, build args, environment secrets, or shell hooks.
-The Deployer derives local paths from `external_project_id` and stores hosting
+Deployer derives runtime namespaces from `external_project_id` and stores hosting
 state separately from trusted admin projects/builds. Hosting jobs cannot enter
 the legacy builder, Compose, Dockerfile, SSH, or `post_deploy` paths.
 
@@ -340,21 +349,24 @@ and sent as `Content-Type: application/json`, signed using these headers:
 - `X-Deployer-Signature`: `sha256=<hex HMAC-SHA256>`, where the HMAC key is the
   service token and the signed bytes are `<timestamp>.<raw request body>`.
 
-Deployment creation verifies a full 40-character commit SHA, archives that
-exact Git object, verifies the caller's SHA-256 artifact digest, reserves a
-compatible runner without crossing its reserve, and creates the deployment,
-job, event, and original idempotent response in one transaction. Only opaque,
-short-lived `control-plane` secret references are persisted. Callers must branch
-on stable JSON `code`, `status`, `phase`, and `failure_code` values rather than
-human text.
+Deployment creation requires an opaque, short-lived `control-plane`
+`source_reference`. Deployer redeems it only against the fixed authenticated
+source broker, with the provisioned installation ID, repository ID/full name,
+full 40-character commit SHA, and expected SHA-256 digest in the request. It
+requires the broker response to echo that identity, rejects redirects,
+oversize bodies, malformed/unsafe tar entries, and digest mismatches, hashes
+the stream, and durably commits it to managed content-addressed storage before
+deployment state is created. Deployer never persists the broker credential or
+source reference. Completed idempotent replays remain valid after the reference
+expires because they perform no new redemption. The exact broker request,
+response, authentication, and retry contract is in
+[`docs/source-broker-openapi.yaml`](docs/source-broker-openapi.yaml).
 
-The exact-object check currently starts from a repository already populated
-under `DEPLOYER_HOSTING_REPO_ROOT`; Deployer does not yet perform an
-installation-authenticated clone/fetch or bind the local object database to the
-provisioned GitHub repository identity. Likewise, passing an opaque secret
-reference is not secret delivery: no workload identity, redemption, or renewal
-exchange is implemented yet. These production gates remain open in
-`HOSTING_TODO.md`.
+Only opaque, short-lived `control-plane` secret references are persisted.
+Passing one is not yet secret delivery: no workload identity, redemption, or
+renewal exchange is implemented. That production gate remains open in
+`HOSTING_TODO.md`. Callers must branch on stable JSON `code`, `status`, `phase`,
+and `failure_code` values rather than human text.
 
 Terminal callbacks are delivered at least once. Their signature covers
 `<timestamp>.<event_id>.<raw body>`; receivers reject timestamps outside five

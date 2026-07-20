@@ -44,10 +44,20 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"hosting:admin", "workload_policy_violation", "idempotency_conflict",
 		"HostingRestoreJobRecipe", "release_artifact_url", "artifact_unavailable",
 		"X-Deployer-Event-ID", "outside a five-minute window", "at-least-once",
+		"source-broker-openapi.yaml", "HostingSourceReference", "source_reference",
 	}
 	for _, value := range required {
 		if !strings.Contains(document, value) {
 			t.Errorf("OpenAPI is missing %q", value)
+		}
+	}
+	brokerContract, err := os.ReadFile(filepath.Join("..", "..", "docs", "source-broker-openapi.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"/api/internal/v1/source-artifacts/redeem:", "sourceBrokerBearer", "Authorization", "application/x-tar", "Content-Length", sourceRepositoryInstallationHeader, sourceRepositoryIDHeader, sourceRepositoryNameHeader, sourceCommitSHAHeader, sourceArtifactDigestHeader} {
+		if !strings.Contains(string(brokerContract), value) {
+			t.Errorf("source broker OpenAPI is missing %q", value)
 		}
 	}
 }

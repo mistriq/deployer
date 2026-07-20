@@ -26,10 +26,12 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	t.Setenv("DEPLOYER_SSH_TIMEOUT", "90s")
 	t.Setenv("DEPLOYER_HEALTH_CHECK_TIMEOUT", "15s")
 	t.Setenv("DEPLOYER_DEMO_MODE", "true")
-	hostingRepoRoot := filepath.Join(t.TempDir(), "hosting-repos")
 	hostingDeployRoot := filepath.Join(t.TempDir(), "hosting-apps")
-	t.Setenv("DEPLOYER_HOSTING_REPO_ROOT", hostingRepoRoot)
 	t.Setenv("DEPLOYER_HOSTING_DEPLOY_ROOT", hostingDeployRoot)
+	t.Setenv("DEPLOYER_HOSTING_SOURCE_BROKER_URL", "https://source.internal.example/")
+	t.Setenv("DEPLOYER_HOSTING_SOURCE_BROKER_TOKEN", "source-token")
+	t.Setenv("DEPLOYER_HOSTING_SOURCE_BROKER_TIMEOUT", "4m")
+	t.Setenv("DEPLOYER_HOSTING_SOURCE_MAX_BYTES", "123456")
 	t.Setenv("DEPLOYER_PROXY_ADAPTER_URL", "https://proxy.internal.example/")
 	t.Setenv("DEPLOYER_PROXY_ADAPTER_TOKEN", "proxy-token")
 	t.Setenv("DEPLOYER_PROXY_ADAPTER_TIMEOUT", "9s")
@@ -65,8 +67,12 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	if !cfg.DemoMode {
 		t.Fatal("expected demo mode to be enabled")
 	}
-	if cfg.HostingRepoRoot != hostingRepoRoot || cfg.HostingDeployRoot != hostingDeployRoot {
+	if cfg.HostingDeployRoot != hostingDeployRoot {
 		t.Fatalf("unexpected hosting config: %+v", cfg)
+	}
+	if cfg.HostingSourceBrokerURL != "https://source.internal.example" || cfg.HostingSourceBrokerToken != "source-token" ||
+		cfg.HostingSourceBrokerTimeout != 4*time.Minute || cfg.HostingSourceMaxBytes != 123456 {
+		t.Fatalf("unexpected source broker config: %+v", cfg)
 	}
 	if cfg.ProxyAdapterURL != "https://proxy.internal.example" || cfg.ProxyAdapterToken != "proxy-token" || cfg.ProxyAdapterTimeout != 9*time.Second ||
 		cfg.CallbackURL != "https://control.internal.example/callback" || cfg.CallbackSigningSecret == "" || cfg.CallbackTimeout != 11*time.Second || cfg.CallbackMaxAttempts != 7 ||

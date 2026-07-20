@@ -10,14 +10,31 @@ private network.
 - Put the Deployer admin surface behind the trusted authorization gateway and
   keep the server listener private.
 - Configure a writable SQLite volume, artifact directory, and dedicated
-  hosting-agent work root. Back up the database independently from artifacts.
-- Make exact Git objects available below `DEPLOYER_HOSTING_REPO_ROOT`. The
-  control plane provisions repository identity; Deployer derives the local path
-  from `external_project_id` and never accepts a caller-supplied host path. This
-  is currently an operator-provided handoff: Deployer does not yet perform an
-  installation-authenticated clone/fetch or prove that the local object belongs
-  to the provisioned repository identity. Do not mark the production source
-  handoff complete until that ownership and retry contract is implemented.
+  hosting-agent work root. Each database must own a dedicated artifact and
+  snapshot directory. Deployer takes a non-blocking OS lock on the database
+  file and refuses to start a second process for the same database; do not
+  bypass that ownership while Deployer is running. Back up the database
+  independently from artifacts. In-memory databases are rejected at server
+  startup because they cannot provide this ownership invariant.
+- Configure `DEPLOYER_HOSTING_SOURCE_BROKER_URL` and its dedicated bearer
+  credential. HTTPS is mandatory except for loopback tests. The broker redeems
+  short-lived opaque references at
+  `POST /api/internal/v1/source-artifacts/redeem` with a JSON `reference` and
+  must bind the artifact
+  to the request's `X-Deployer-Repository-Installation-Id`,
+  `X-Deployer-Repository-Id`, `X-Deployer-Repository-Full-Name`,
+  `X-Deployer-Commit-Sha`, and `X-Deployer-Artifact-Digest`. A successful
+  `application/x-tar` response echoes all five headers and supplies an exact
+  `Content-Length`. Deployer rejects redirects, identity disagreement,
+  digest disagreement, and bodies above `DEPLOYER_HOSTING_SOURCE_MAX_BYTES`.
+  The broker must allow identical redemptions until the reference expires;
+  Deployer can issue concurrent fetches while identical idempotent deployment
+  requests converge. Scope the broker-issued bearer credential only to this
+  route, use broker-side overlap during rotation, redact request bodies and
+  authentication/identity headers from access logs and traces, and restart
+  Deployer with the new credential before ending the overlap. Keep the broker
+  timeout below `DEPLOYER_SERVER_WRITE_TIMEOUT` (defaults: four and five
+  minutes respectively).
 - Configure `DEPLOYER_PROXY_ADAPTER_URL` and its bearer credential. HTTPS is
   mandatory except for loopback development. Deployer only calls the adapter's
   versioned private activation/suspension API and never writes proxy config.
@@ -71,7 +88,12 @@ be rejected.
    `<unix timestamp>.<exact raw body>` using the service token and send the
    hexadecimal HMAC-SHA256 in `X-Deployer-Signature`.
 2. Create a deployment with a unique `Idempotency-Key`, full 40-character Git
-   SHA, current manifest digest, and expected SHA-256 of the exact Git archive.
+   SHA, current manifest digest, expected SHA-256 of the exact Git archive, and
+   a `control-plane` source reference expiring within one hour. The reference
+   is redeemed before any deployment state or runner capacity is committed and
+   is not stored by Deployer after the source artifact is acquired. An exact
+   replay of an already accepted idempotency key returns the stored response
+   even after reference expiry and does not call the broker.
 3. Poll the returned `Location`. Structured `status`, `phase`, and
    `failure_code` are authoritative. Do not parse log or error text.
 4. Treat the terminal callback as at-least-once. Verify the HMAC over

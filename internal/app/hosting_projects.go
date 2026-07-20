@@ -277,10 +277,6 @@ func hostingProjectFromManifest(externalProjectID string, manifest HostingProjec
 	if err != nil {
 		return nil, err
 	}
-	repoPath, err := deriveHostingPath(appConfig.HostingRepoRoot, externalProjectID)
-	if err != nil {
-		return nil, fmt.Errorf("derive hosting repository path: %w", err)
-	}
 	deployPath, err := deriveHostingPath(appConfig.HostingDeployRoot, externalProjectID)
 	if err != nil {
 		return nil, fmt.Errorf("derive hosting deploy path: %w", err)
@@ -295,7 +291,7 @@ func hostingProjectFromManifest(externalProjectID string, manifest HostingProjec
 		RepositoryFullName:       manifest.Repository.FullName,
 		RuntimeKind:              manifest.Runtime.Kind,
 		ResourceProfile:          manifest.ResourceProfile,
-		RepoPath:                 repoPath,
+		RepoPath:                 "",
 		DeployPath:               deployPath,
 	}
 	return project, nil
@@ -372,8 +368,8 @@ func upsertHostingProjectAudited(ctx context.Context, externalProjectID string, 
 	default:
 		project.ID = existingID
 		manifestJSON, _, _ := manifestJSONAndDigest(project.Manifest)
-		_, err = conn.ExecContext(ctx, `UPDATE hosting_projects SET manifest_version=?, manifest_json=?, manifest_digest=?, repository_installation_id=?, repository_id=?, repository_full_name=?, runtime_kind=?, resource_profile=?, repo_path=?, deploy_path=?, runner_id=?, updated_at=? WHERE id=?`,
-			project.ManifestVersion, manifestJSON, project.ManifestDigest, project.RepositoryInstallationID, project.RepositoryID, project.RepositoryFullName, project.RuntimeKind, project.ResourceProfile, project.RepoPath, project.DeployPath, project.RunnerID, formatSQLiteTime(time.Now()), project.ID,
+		_, err = conn.ExecContext(ctx, `UPDATE hosting_projects SET manifest_version=?, manifest_json=?, manifest_digest=?, repository_installation_id=?, repository_id=?, repository_full_name=?, runtime_kind=?, resource_profile=?, deploy_path=?, runner_id=?, updated_at=? WHERE id=?`,
+			project.ManifestVersion, manifestJSON, project.ManifestDigest, project.RepositoryInstallationID, project.RepositoryID, project.RepositoryFullName, project.RuntimeKind, project.ResourceProfile, project.DeployPath, project.RunnerID, formatSQLiteTime(time.Now()), project.ID,
 		)
 		if err != nil {
 			return nil, false, false, err

@@ -9,8 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+var artifactLifecycleMu sync.RWMutex
 
 type readSeekCloser interface {
 	io.Reader
@@ -28,6 +31,8 @@ type ArtifactStorage interface {
 	Stat(path string) (os.FileInfo, error)
 	Open(path string) (readSeekCloser, error)
 	PrepareUpload(path string) (string, io.WriteCloser, error)
+	// CommitUpload atomically publishes the completed upload and must not return
+	// until the file and containing namespace are durable across process/host restart.
 	CommitUpload(tmpPath, path string) error
 	AbortUpload(tmpPath string)
 }
@@ -236,7 +241,7 @@ func (s localArtifactStorage) Stat(path string) (os.FileInfo, error) {
 	if !s.IsManagedPath(path) {
 		return nil, fmt.Errorf("artifact path is not managed")
 	}
-	return os.Stat(path)
+	return os.Lstat(path)
 }
 
 func serveManagedArtifact(w http.ResponseWriter, r *http.Request, path string) error {
@@ -295,7 +300,21 @@ func (s localArtifactStorage) CommitUpload(tmpPath, path string) error {
 	if !s.IsManagedPath(path) || !s.IsManagedPath(tmpPath) {
 		return fmt.Errorf("artifact path is not managed")
 	}
-	return os.Rename(tmpPath, path)
+	temporary, err := os.Open(tmpPath)
+	if err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }
 
 func abortManagedArtifactUpload(tmpPath string) {

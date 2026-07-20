@@ -41,6 +41,13 @@ func Run() {
 	}
 
 	appConfig = loadConfig()
+	instanceLock, err := acquireDeployerInstanceLock(appConfig.DBPath)
+	if err != nil {
+		logFatal("startup_error", "failed to acquire exclusive Deployer database ownership", err, map[string]interface{}{
+			"db_path": appConfig.DBPath,
+		})
+	}
+	defer instanceLock.Close()
 	configureArtifactStorage(appConfig)
 	if err := ensureRuntimeDirs(appConfig); err != nil {
 		logFatal("startup_error", "failed to prepare runtime directories", err, nil)
@@ -81,7 +88,7 @@ func Run() {
 	}()
 
 	// Parse templates
-	var err error
+	err = nil
 	tmpl, err = template.New("").Funcs(template.FuncMap{
 		"json": func(v interface{}) template.JS {
 			b, _ := json.Marshal(v)
@@ -251,11 +258,13 @@ func Run() {
 }
 
 func cleanupRuntimeState(cfg AppConfig) {
+	artifactLifecycleMu.Lock()
 	if err := protectActiveHostingArtifacts(); err != nil {
 		logOperationalError("protect active hosting artifacts", err)
 	} else {
 		cleanupStaleArtifacts(cfg)
 	}
+	artifactLifecycleMu.Unlock()
 	if cfg.LogRetentionDays > 0 {
 		affected, err := cleanupOldBuildLogs(cfg.LogRetentionDays)
 		if err != nil {

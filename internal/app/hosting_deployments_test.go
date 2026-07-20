@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -44,6 +45,11 @@ func validHostingDeploymentRequest(externalID string) hostingDeploymentCreateReq
 		CommitSHA:            strings.Repeat("a", 40),
 		ManifestDigest:       "sha256:" + strings.Repeat("b", 64),
 		ArtifactDigest:       "sha256:" + strings.Repeat("c", 64),
+		SourceReference: HostingSourceReference{
+			Provider:  "control-plane",
+			Reference: "source_01JTESTREFERENCE",
+			ExpiresAt: time.Now().UTC().Add(30 * time.Minute),
+		},
 	}
 }
 
@@ -51,7 +57,7 @@ func provisionDeploymentTestProject(t *testing.T, externalID string) (*HostingPr
 	t.Helper()
 	withHostingConfig(t)
 	oldPreparer := prepareHostingSource
-	prepareHostingSource = func(context.Context, *HostingProject, string) (string, string, error) {
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
 		return "/managed/test-source.tar", "sha256:" + strings.Repeat("c", 64), nil
 	}
 	t.Cleanup(func() { prepareHostingSource = oldPreparer })
@@ -217,6 +223,201 @@ func TestHostingDeploymentRejectsArtifactDigestMismatchWithoutState(t *testing.T
 		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil || count != 0 {
 			t.Fatalf("%s count=%d err=%v", table, count, err)
 		}
+	}
+}
+
+func TestHostingDeploymentRedeemsBoundSourceBeforeCreatingState(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	project, _, _, err := upsertHostingProject(t.Context(), "project_01JSOURCE", validHostingManifest("node"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := createServiceToken("source-deployment-writer", []string{serviceScopeDeploymentsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "source-runner", limits)
+	body := sourceBrokerTestArchive(t, "exact source from authenticated broker")
+	var brokerCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		brokerCalls++
+		writeSourceBrokerResponse(w, r, body)
+	}))
+	defer server.Close()
+	appConfig.HostingSourceBrokerURL = server.URL
+	appConfig.HostingSourceBrokerToken = "broker-token"
+	appConfig.HostingSourceBrokerTimeout = time.Second
+	appConfig.HostingSourceMaxBytes = 1 << 20
+
+	request := validHostingDeploymentRequest("deployment_01JSOURCE")
+	request.ManifestDigest = project.ManifestDigest
+	request.ArtifactDigest = sourceBrokerTestDigest(body)
+	result, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JSOURCE", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Deployment.ArtifactDigest != request.ArtifactDigest {
+		t.Fatalf("unexpected deployment result: %+v", result.Deployment)
+	}
+	var sourcePath, recipeJSON, secretJSON, responseJSON, auditJSON string
+	if err := db.QueryRow(`SELECT source_artifact_path, recipe_json, secret_refs_json FROM hosting_jobs`).Scan(&sourcePath, &recipeJSON, &secretJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT response_body FROM hosting_idempotency`).Scan(&responseJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT metadata_json FROM hosting_audit_events WHERE event_type='hosting_deployment_created'`).Scan(&auditJSON); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := os.ReadFile(sourcePath)
+	if err != nil || string(stored) != string(body) {
+		t.Fatalf("stored source=%q err=%v", stored, err)
+	}
+	for name, persisted := range map[string]string{"recipe": recipeJSON, "secret refs": secretJSON, "idempotency response": responseJSON, "audit": auditJSON} {
+		if strings.Contains(persisted, request.SourceReference.Reference) {
+			t.Fatalf("source reference leaked into %s", name)
+		}
+	}
+	if _, err := db.Exec(`UPDATE hosting_deployments SET status='failed', phase='failed' WHERE external_deployment_id=?`, request.ExternalDeploymentID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = createHostingDeployment(t.Context(), token, project.ExternalProjectID, "different_01JSOURCE", request)
+	var apiErr *hostingAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeExternalDeploymentConflict || brokerCalls != 1 {
+		t.Fatalf("existing identity preflight err=%v broker_calls=%d", err, brokerCalls)
+	}
+}
+
+func TestHostingDeploymentSourceBrokerFailureLeavesNoPartialStateOrCapacity(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	project, _, _, err := upsertHostingProject(t.Context(), "project_01JSRCFAIL", validHostingManifest("node"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := createServiceToken("source-failure-writer", []string{serviceScopeDeploymentsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	runnerID := insertHostingRunnerForTest(t, "source-failure-runner", limits)
+	brokerStatus := http.StatusForbidden
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "reference unavailable", brokerStatus)
+	}))
+	defer server.Close()
+	appConfig.HostingSourceBrokerURL = server.URL
+	appConfig.HostingSourceBrokerToken = "broker-token"
+	appConfig.HostingSourceBrokerTimeout = time.Second
+	appConfig.HostingSourceMaxBytes = 1 << 20
+
+	request := validHostingDeploymentRequest("deployment_01JSRCFAIL")
+	request.ManifestDigest = project.ManifestDigest
+	_, err = createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JSRCFAIL", request)
+	var apiErr *hostingAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeSourceFetchFailed || apiErr.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("source broker failure=%v", err)
+	}
+	brokerStatus = http.StatusServiceUnavailable
+	request.ExternalDeploymentID = "deployment_01JSRCTEMP"
+	request.SourceReference.Reference = "source_01JTEMPORARY"
+	_, err = createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JSRCTEMP", request)
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeSourceFetchFailed || apiErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("transient source broker failure=%v", err)
+	}
+	for _, table := range []string{"hosting_deployments", "hosting_jobs", "hosting_idempotency", "hosting_events"} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("%s count=%d err=%v", table, count, err)
+		}
+	}
+	var freeCPU int64
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, runnerID).Scan(&freeCPU); err != nil || freeCPU != limits.CPUMillis {
+		t.Fatalf("runner capacity changed after source failure: free=%d err=%v", freeCPU, err)
+	}
+}
+
+func TestHostingDeploymentConcurrentReplayCrossesSourceExpiryWithOneRedemption(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	project, _, _, err := upsertHostingProject(t.Context(), "project_01JSRCIDEM", validHostingManifest("node"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := createServiceToken("source-idempotency-writer", []string{serviceScopeDeploymentsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "source-idempotency-runner", limits)
+	body := sourceBrokerTestArchive(t, "concurrent immutable source")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		once.Do(func() { close(started) })
+		<-release
+		writeSourceBrokerResponse(w, r, body)
+	}))
+	defer server.Close()
+	appConfig.HostingSourceBrokerURL = server.URL
+	appConfig.HostingSourceBrokerToken = "broker-token"
+	appConfig.HostingSourceBrokerTimeout = time.Second
+	appConfig.HostingSourceMaxBytes = 1 << 20
+	appConfig.ArtifactRetentionHours = 1
+
+	request := validHostingDeploymentRequest("deployment_01JSRCIDEM")
+	request.ManifestDigest = project.ManifestDigest
+	request.ArtifactDigest = sourceBrokerTestDigest(body)
+	request.SourceReference.ExpiresAt = time.Now().UTC().Add(250 * time.Millisecond)
+	type outcome struct {
+		result *hostingCreateResult
+		err    error
+	}
+	outcomes := make(chan outcome, 2)
+	create := func() {
+		result, err := createHostingDeployment(context.Background(), token, project.ExternalProjectID, "create_01JSRCIDEM", request)
+		outcomes <- outcome{result: result, err: err}
+	}
+	go create()
+	<-started
+	go create()
+	cleanupDone := make(chan struct{})
+	go func() {
+		cleanupRuntimeState(appConfig)
+		close(cleanupDone)
+	}()
+	select {
+	case <-cleanupDone:
+		t.Fatal("artifact cleanup was not fenced while source publication was in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	time.Sleep(time.Until(request.SourceReference.ExpiresAt.Add(25 * time.Millisecond)))
+	close(release)
+	for i := 0; i < 2; i++ {
+		outcome := <-outcomes
+		if outcome.err != nil || outcome.result == nil || outcome.result.Deployment.ExternalDeploymentID != request.ExternalDeploymentID {
+			t.Fatalf("concurrent replay outcome=%+v", outcome)
+		}
+	}
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("artifact cleanup did not resume after deployment commit")
+	}
+	if calls != 1 {
+		t.Fatalf("source broker redemptions=%d, want 1", calls)
+	}
+	var path string
+	if err := db.QueryRow(`SELECT source_artifact_path FROM hosting_jobs`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("committed source artifact was lost during cleanup: %v", err)
 	}
 }
 

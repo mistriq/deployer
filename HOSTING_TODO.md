@@ -27,7 +27,7 @@ The primary agent owns this checklist and updates it only after implementation a
 
 - [ ] Idempotent hosting project provision/upsert endpoint.
 - [ ] Separate hosting projects/jobs/runners from trusted admin projects.
-- [ ] Exact commit SHA and immutable artifact digest on every hosting deployment.
+- [x] Exact commit SHA and immutable artifact digest on every hosting deployment.
 - [ ] Atomic idempotency and one-active-deployment guard under concurrency.
 - [ ] Stable deployment phases and transition validation.
 - [x] Fence conflicting runner completion payloads before proxy activation.
@@ -77,7 +77,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [ ] Auth, scope, rotation, revocation and audit tests.
 - [ ] Idempotency replay and concurrent duplicate tests.
 - [ ] Per-project deployment serialization tests.
-- [ ] Exact commit/artifact mismatch rejection tests.
+- [x] Exact commit/artifact mismatch rejection tests.
 - [ ] Callback signing, retry, replay and polling reconciliation tests.
 - [ ] Health failure preserves active release test.
 - [ ] Cancel, rollback, suspend/resume and restart recovery tests.

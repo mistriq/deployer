@@ -1,0 +1,136 @@
+openapi: 3.1.0
+info:
+  title: Light Apps Hosting Source Broker Contract
+  version: v1
+  description: >
+    Private outbound contract consumed by Deployer. The broker credential is a
+    broker-issued bearer scoped and audience-bound only to this redemption
+    operation. Broker credential rotation must provide enough overlap to restart
+    Deployer with the new value. Authorization, request bodies, and repository
+    identity headers are sensitive and must be redacted from logs and traces.
+servers:
+  - url: https://hosting-control.internal.example
+    description: Configured private source-broker origin
+paths:
+  /api/internal/v1/source-artifacts/redeem:
+    post:
+      summary: Redeem an opaque source reference for an exact repository archive
+      operationId: redeemHostingSourceArtifact
+      security: [{sourceBrokerBearer: []}]
+      parameters:
+        - {$ref: '#/components/parameters/AcceptTar'}
+        - {$ref: '#/components/parameters/RepositoryInstallationId'}
+        - {$ref: '#/components/parameters/RepositoryId'}
+        - {$ref: '#/components/parameters/RepositoryFullName'}
+        - {$ref: '#/components/parameters/CommitSha'}
+        - {$ref: '#/components/parameters/ArtifactDigest'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SourceRedemption'}
+      responses:
+        '200':
+          description: >
+            Exact tar archive. The broker must allow identical redemptions until
+            reference expiry so concurrent idempotent callers can converge.
+          headers:
+            Content-Length:
+              required: true
+              schema: {type: integer, format: int64, minimum: 1}
+            X-Deployer-Repository-Installation-Id: {$ref: '#/components/headers/RepositoryInstallationId'}
+            X-Deployer-Repository-Id: {$ref: '#/components/headers/RepositoryId'}
+            X-Deployer-Repository-Full-Name: {$ref: '#/components/headers/RepositoryFullName'}
+            X-Deployer-Commit-Sha: {$ref: '#/components/headers/CommitSha'}
+            X-Deployer-Artifact-Digest: {$ref: '#/components/headers/ArtifactDigest'}
+          content:
+            application/x-tar:
+              schema: {type: string, format: binary}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '410': {$ref: '#/components/responses/Error'}
+        '429': {$ref: '#/components/responses/Error'}
+        '500': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    sourceBrokerBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: broker-scoped opaque credential
+  parameters:
+    AcceptTar:
+      name: Accept
+      in: header
+      required: true
+      schema: {type: string, const: application/x-tar}
+    RepositoryInstallationId:
+      name: X-Deployer-Repository-Installation-Id
+      in: header
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    RepositoryId:
+      name: X-Deployer-Repository-Id
+      in: header
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    RepositoryFullName:
+      name: X-Deployer-Repository-Full-Name
+      in: header
+      required: true
+      schema: {type: string, pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'}
+    CommitSha:
+      name: X-Deployer-Commit-Sha
+      in: header
+      required: true
+      schema: {type: string, pattern: '^[a-f0-9]{40}$'}
+    ArtifactDigest:
+      name: X-Deployer-Artifact-Digest
+      in: header
+      required: true
+      schema: {$ref: '#/components/schemas/SHA256Digest'}
+  headers:
+    RepositoryInstallationId:
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    RepositoryId:
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    RepositoryFullName:
+      required: true
+      schema: {type: string, pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'}
+    CommitSha:
+      required: true
+      schema: {type: string, pattern: '^[a-f0-9]{40}$'}
+    ArtifactDigest:
+      required: true
+      schema: {$ref: '#/components/schemas/SHA256Digest'}
+  schemas:
+    SourceRedemption:
+      type: object
+      additionalProperties: false
+      required: [reference]
+      properties:
+        reference: {type: string, minLength: 8, maxLength: 256, pattern: '^[A-Za-z0-9._-]+$'}
+    SHA256Digest:
+      type: string
+      pattern: '^sha256:[a-f0-9]{64}$'
+    Error:
+      type: object
+      additionalProperties: true
+      required: [code]
+      properties:
+        code: {type: string}
+        error: {type: string}
+  responses:
+    Error:
+      description: >
+        Non-success. Deployer treats 429 and 5xx as transient HTTP 503
+        source_fetch_failed; other non-success responses become HTTP 422
+        source_fetch_failed.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
