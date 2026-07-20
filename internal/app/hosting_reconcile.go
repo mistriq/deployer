@@ -40,6 +40,9 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 	if err := reconcileHostingRollbackOperations(ctx); err != nil {
 		return err
 	}
+	if err := reconcileHostingRecoveryProxyOperations(ctx); err != nil {
+		return err
+	}
 	if err := reconcileHostingActivationOperations(ctx); err != nil {
 		return err
 	}
@@ -64,6 +67,15 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 	}
 	if _, err := conn.ExecContext(ctx, `UPDATE callback_outbox SET status='pending', locked_at=NULL, claim_token_hash=''
 		WHERE status='delivering' AND locked_at<?`, formatSQLiteTime(now.Add(-callbackLeaseTimeout))); err != nil {
+		return err
+	}
+	if err := reconcileExpiredHostingRecoveries(ctx, conn, now); err != nil {
+		return err
+	}
+	if err := queueLostHostingRuntimes(ctx, conn, now); err != nil {
+		return err
+	}
+	if err := placeHostingRuntimeRecoveries(ctx, conn, now); err != nil {
 		return err
 	}
 
@@ -517,7 +529,7 @@ func placeUnassignedHostingJobs(ctx context.Context, conn *sql.Conn, now time.Ti
 		return err
 	}
 	for _, job := range jobs {
-		runnerID, err := reserveHostingRunner(ctx, conn, &job.project, job.limits)
+		runnerID, err := reserveHostingRunner(ctx, conn, &job.project, job.limits, "build", 0)
 		if err != nil {
 			var apiErr *hostingAPIError
 			if errors.As(err, &apiErr) && apiErr.Code == errCodeRunnerCapacityUnavailable {

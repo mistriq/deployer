@@ -29,6 +29,7 @@ type HostingRunner struct {
 	ProtocolVersion  string      `json:"protocol_version"`
 	ManifestVersions []string    `json:"manifest_versions"`
 	RuntimeVersions  []string    `json:"runtime_versions"`
+	Operations       []string    `json:"operations"`
 	Capacity         capacityDTO `json:"capacity"`
 	Reserve          capacityDTO `json:"reserve"`
 	Draining         bool        `json:"draining"`
@@ -45,6 +46,7 @@ type hostingRunnerInput struct {
 	ProtocolVersion  string      `json:"protocol_version"`
 	ManifestVersions []string    `json:"manifest_versions"`
 	RuntimeVersions  []string    `json:"runtime_versions"`
+	Operations       []string    `json:"operations,omitempty"`
 	Capacity         capacityDTO `json:"capacity"`
 	Reserve          capacityDTO `json:"reserve"`
 }
@@ -130,12 +132,25 @@ func createHostingRunner(ctx context.Context, input hostingRunnerInput, requestI
 	if !hostingStringListContains(input.RuntimeVersions, "20") && !hostingStringListContains(input.RuntimeVersions, "22") {
 		return nil, fmt.Errorf("runner must support an allowlisted Node runtime")
 	}
+	if len(input.Operations) == 0 {
+		input.Operations = []string{"build"}
+	}
+	input.Operations = normalizeStringList(input.Operations)
+	for _, operation := range input.Operations {
+		if operation != "build" && operation != "restore" {
+			return nil, fmt.Errorf("runner operation must be build or restore")
+		}
+	}
+	if !hostingStringListContains(input.Operations, "build") {
+		return nil, fmt.Errorf("runner must support the build operation")
+	}
 	if err := validateCapacity(input.Capacity, input.Reserve); err != nil {
 		return nil, err
 	}
 	labels, _ := json.Marshal(normalizeStringList(input.Labels))
 	manifests, _ := json.Marshal(normalizeStringList(input.ManifestVersions))
 	runtimes, _ := json.Marshal(normalizeStringList(input.RuntimeVersions))
+	operations, _ := json.Marshal(input.Operations)
 	token := "htr_" + generateToken()
 	now := time.Now().UTC()
 	tx, err := db.BeginTx(ctx, nil)
@@ -144,13 +159,13 @@ func createHostingRunner(ctx context.Context, input hostingRunnerInput, requestI
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `INSERT INTO hosting_runners
-		(name, token_hash, labels_json, protocol_version, manifest_versions_json, runtime_versions_json,
+		(name, token_hash, labels_json, protocol_version, manifest_versions_json, runtime_versions_json, operation_capabilities_json,
 		 capacity_cpu_millis, capacity_ram_bytes, capacity_disk_bytes, capacity_pids,
 		 free_cpu_millis, free_ram_bytes, free_disk_bytes, free_pids,
 		 reported_free_cpu_millis, reported_free_ram_bytes, reported_free_disk_bytes, reported_free_pids,
 		 reserve_cpu_millis, reserve_ram_bytes, reserve_disk_bytes, reserve_pids, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		input.Name, hashToken(token), string(labels), input.ProtocolVersion, string(manifests), string(runtimes),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		input.Name, hashToken(token), string(labels), input.ProtocolVersion, string(manifests), string(runtimes), string(operations),
 		input.Capacity.CPUMillis, input.Capacity.RAMBytes, input.Capacity.DiskBytes, input.Capacity.PIDs,
 		input.Capacity.CPUMillis, input.Capacity.RAMBytes, input.Capacity.DiskBytes, input.Capacity.PIDs,
 		input.Capacity.CPUMillis, input.Capacity.RAMBytes, input.Capacity.DiskBytes, input.Capacity.PIDs,
@@ -171,7 +186,7 @@ func createHostingRunner(ctx context.Context, input hostingRunnerInput, requestI
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &HostingRunner{ID: id, Name: input.Name, Token: token, Labels: normalizeStringList(input.Labels), ProtocolVersion: input.ProtocolVersion, ManifestVersions: normalizeStringList(input.ManifestVersions), RuntimeVersions: normalizeStringList(input.RuntimeVersions), Capacity: input.Capacity, Reserve: input.Reserve, Status: "offline", CreatedAt: now}, nil
+	return &HostingRunner{ID: id, Name: input.Name, Token: token, Labels: normalizeStringList(input.Labels), ProtocolVersion: input.ProtocolVersion, ManifestVersions: normalizeStringList(input.ManifestVersions), RuntimeVersions: normalizeStringList(input.RuntimeVersions), Operations: input.Operations, Capacity: input.Capacity, Reserve: input.Reserve, Status: "offline", CreatedAt: now}, nil
 }
 
 func validateCapacity(capacity, reserve capacityDTO) error {
@@ -213,7 +228,7 @@ func hostingStringListContains(values []string, wanted string) bool {
 
 func listHostingRunners(ctx context.Context) ([]HostingRunner, error) {
 	rows, err := db.QueryContext(ctx, `SELECT id, name, labels_json, protocol_version, manifest_versions_json,
-		runtime_versions_json, capacity_cpu_millis, capacity_ram_bytes, capacity_disk_bytes, capacity_pids,
+		runtime_versions_json, operation_capabilities_json, capacity_cpu_millis, capacity_ram_bytes, capacity_disk_bytes, capacity_pids,
 		reserve_cpu_millis, reserve_ram_bytes, reserve_disk_bytes, reserve_pids, draining, status, last_seen, created_at
 		FROM hosting_runners ORDER BY name`)
 	if err != nil {
@@ -223,10 +238,10 @@ func listHostingRunners(ctx context.Context) ([]HostingRunner, error) {
 	result := make([]HostingRunner, 0)
 	for rows.Next() {
 		var runner HostingRunner
-		var labels, manifests, runtimes, created string
+		var labels, manifests, runtimes, operations, created string
 		var drain int
 		var seen sql.NullString
-		if err := rows.Scan(&runner.ID, &runner.Name, &labels, &runner.ProtocolVersion, &manifests, &runtimes,
+		if err := rows.Scan(&runner.ID, &runner.Name, &labels, &runner.ProtocolVersion, &manifests, &runtimes, &operations,
 			&runner.Capacity.CPUMillis, &runner.Capacity.RAMBytes, &runner.Capacity.DiskBytes, &runner.Capacity.PIDs,
 			&runner.Reserve.CPUMillis, &runner.Reserve.RAMBytes, &runner.Reserve.DiskBytes, &runner.Reserve.PIDs,
 			&drain, &runner.Status, &seen, &created); err != nil {
@@ -235,6 +250,7 @@ func listHostingRunners(ctx context.Context) ([]HostingRunner, error) {
 		_ = json.Unmarshal([]byte(labels), &runner.Labels)
 		_ = json.Unmarshal([]byte(manifests), &runner.ManifestVersions)
 		_ = json.Unmarshal([]byte(runtimes), &runner.RuntimeVersions)
+		_ = json.Unmarshal([]byte(operations), &runner.Operations)
 		runner.Draining = drain != 0
 		runner.LastSeen = nullableSQLiteTime(seen)
 		runner.CreatedAt = parseSQLiteTime(created)
@@ -251,16 +267,17 @@ func hostingRunnerAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		var runner HostingRunner
-		var labels, manifests, runtimes, created string
+		var labels, manifests, runtimes, operations, created string
 		var seen sql.NullString
 		err := db.QueryRowContext(r.Context(), `SELECT id, name, labels_json, protocol_version, manifest_versions_json,
-			runtime_versions_json, draining, status, last_seen, created_at FROM hosting_runners WHERE token_hash=?`, hashToken(strings.TrimSpace(strings.TrimPrefix(auth, "Bearer ")))).Scan(
-			&runner.ID, &runner.Name, &labels, &runner.ProtocolVersion, &manifests, &runtimes, &runner.Draining, &runner.Status, &seen, &created)
+			runtime_versions_json, operation_capabilities_json, draining, status, last_seen, created_at FROM hosting_runners WHERE token_hash=?`, hashToken(strings.TrimSpace(strings.TrimPrefix(auth, "Bearer ")))).Scan(
+			&runner.ID, &runner.Name, &labels, &runner.ProtocolVersion, &manifests, &runtimes, &operations, &runner.Draining, &runner.Status, &seen, &created)
 		if err != nil {
 			jsonErrorCode(w, errCodeInvalidAgentToken, "invalid hosting runner token", http.StatusUnauthorized)
 			return
 		}
 		runner.LastSeen = nullableSQLiteTime(seen)
+		_ = json.Unmarshal([]byte(operations), &runner.Operations)
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), hostingRunnerContextKey{}, &runner)))
 	})
 }
@@ -271,6 +288,7 @@ type hostingHeartbeatRequest struct {
 	ProtocolVersion  string      `json:"protocol_version"`
 	ManifestVersions []string    `json:"manifest_versions"`
 	RuntimeVersions  []string    `json:"runtime_versions"`
+	Operations       []string    `json:"operations,omitempty"`
 }
 
 type hostingHeartbeatResponse struct {
@@ -281,6 +299,7 @@ type hostingRetainedRelease struct {
 	ReleaseDigest        string `json:"release_digest"`
 	ExternalProjectID    string `json:"external_project_id"`
 	ExternalDeploymentID string `json:"external_deployment_id"`
+	RuntimeInstanceID    string `json:"runtime_instance_id,omitempty"`
 	Status               string `json:"status"`
 }
 
@@ -301,8 +320,23 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		jsonErrorCode(w, errCodeValidation, "unsupported hosting runner protocol or manifest version", http.StatusBadRequest)
 		return
 	}
+	if len(input.Operations) == 0 {
+		input.Operations = []string{"build"}
+	}
+	input.Operations = normalizeStringList(input.Operations)
+	for _, operation := range input.Operations {
+		if operation != "build" && operation != "restore" {
+			jsonErrorCode(w, errCodeValidation, "hosting runner operation must be build or restore", http.StatusBadRequest)
+			return
+		}
+	}
+	if !hostingStringListContains(input.Operations, "build") {
+		jsonErrorCode(w, errCodeValidation, "hosting runner must advertise the build operation", http.StatusBadRequest)
+		return
+	}
 	manifests, _ := json.Marshal(normalizeStringList(input.ManifestVersions))
 	runtimes, _ := json.Marshal(normalizeStringList(input.RuntimeVersions))
+	operations, _ := json.Marshal(input.Operations)
 	now := time.Now().UTC()
 	conn, err := db.Conn(r.Context())
 	if err != nil {
@@ -323,9 +357,9 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	result, err := conn.ExecContext(r.Context(), `UPDATE hosting_runners SET
 		reported_free_cpu_millis=MIN(capacity_cpu_millis, ?), reported_free_ram_bytes=MIN(capacity_ram_bytes, ?),
 		reported_free_disk_bytes=MIN(capacity_disk_bytes, ?), reported_free_pids=MIN(capacity_pids, ?),
-		draining=?, protocol_version=?, manifest_versions_json=?, runtime_versions_json=?, status='online', last_seen=? WHERE id=?`,
+		draining=?, protocol_version=?, manifest_versions_json=?, runtime_versions_json=?, operation_capabilities_json=?, status='online', last_seen=? WHERE id=?`,
 		input.Free.CPUMillis, input.Free.RAMBytes, input.Free.DiskBytes, input.Free.PIDs, input.Draining,
-		input.ProtocolVersion, string(manifests), string(runtimes), formatSQLiteTime(now), runner.ID)
+		input.ProtocolVersion, string(manifests), string(runtimes), string(operations), formatSQLiteTime(now), runner.ID)
 	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "update hosting runner heartbeat failed", http.StatusInternalServerError)
 		return
@@ -339,12 +373,32 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		jsonErrorCode(w, errCodeInternal, "reconcile hosting runner capacity failed", http.StatusInternalServerError)
 		return
 	}
-	rows, err := conn.QueryContext(r.Context(), `SELECT rel.release_digest, p.external_project_id,
-		d.external_deployment_id, rel.status FROM hosting_releases rel
-		JOIN hosting_jobs j ON j.hosting_deployment_id=rel.hosting_deployment_id
+	rows, err := conn.QueryContext(r.Context(), `SELECT DISTINCT rel.release_digest, p.external_project_id,
+			d.external_deployment_id,
+			CASE
+				WHEN recovery_op.id IS NOT NULL THEN 'active'
+				WHEN activation.id IS NOT NULL AND job.hosting_runner_id=? THEN 'healthy'
+				ELSE rel.status
+			END,
+			CASE
+				WHEN recovery_op.id IS NOT NULL THEN 'restore-' || recovery.id || '-' || recovery.lease_generation
+				WHEN activation.id IS NOT NULL AND job.hosting_runner_id=? THEN 'build-' || job.id || '-' || job.lease_generation
+				ELSE rel.runtime_instance_id
+		END
+		FROM hosting_releases rel
 		JOIN hosting_deployments d ON d.id=rel.hosting_deployment_id
 		JOIN hosting_projects p ON p.id=rel.hosting_project_id
-		WHERE j.hosting_runner_id=? AND rel.status IN ('healthy','active','inactive') ORDER BY rel.id`, runner.ID)
+		LEFT JOIN hosting_jobs job ON job.hosting_deployment_id=rel.hosting_deployment_id
+		LEFT JOIN hosting_proxy_operations activation ON activation.hosting_deployment_id=rel.hosting_deployment_id
+			AND activation.operation_type='activate' AND activation.status IN ('pending','applied')
+		LEFT JOIN hosting_runtime_recoveries recovery ON recovery.hosting_release_id=rel.id
+			AND recovery.hosting_runner_id=? AND recovery.status='running'
+		LEFT JOIN hosting_proxy_operations recovery_op ON recovery_op.hosting_runtime_recovery_id=recovery.id
+			AND recovery_op.operation_type='recover' AND recovery_op.status IN ('pending','applied')
+		WHERE (rel.runtime_runner_id=? AND rel.status IN ('healthy','active','inactive'))
+		   OR (job.hosting_runner_id=? AND rel.status='healthy' AND activation.id IS NOT NULL)
+		   OR (recovery.runtime_endpoint<>'' AND recovery_op.id IS NOT NULL)
+		ORDER BY rel.id`, runner.ID, runner.ID, runner.ID, runner.ID, runner.ID)
 	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "list retained hosting releases failed", http.StatusInternalServerError)
 		return
@@ -353,7 +407,8 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	response := hostingHeartbeatResponse{RetainedReleases: make([]hostingRetainedRelease, 0)}
 	for rows.Next() {
 		var release hostingRetainedRelease
-		if err := rows.Scan(&release.ReleaseDigest, &release.ExternalProjectID, &release.ExternalDeploymentID, &release.Status); err != nil {
+		if err := rows.Scan(&release.ReleaseDigest, &release.ExternalProjectID, &release.ExternalDeploymentID,
+			&release.Status, &release.RuntimeInstanceID); err != nil {
 			jsonErrorCode(w, errCodeInternal, "read retained hosting release failed", http.StatusInternalServerError)
 			return
 		}
@@ -379,16 +434,48 @@ func recomputeHostingRunnerCapacity(ctx context.Context, conn *sql.Conn, runnerI
 	_, err := conn.ExecContext(ctx, `UPDATE hosting_runners SET
 		free_cpu_millis=MAX(0, MIN(reported_free_cpu_millis, capacity_cpu_millis-COALESCE((
 			SELECT SUM(required_cpu_millis) FROM hosting_jobs WHERE hosting_runner_id=hosting_runners.id
-			AND status IN ('queued','leased','running','succeeded')), 0))),
+			AND (status IN ('queued','leased','running') OR (status='succeeded' AND EXISTS (
+				SELECT 1 FROM hosting_releases release WHERE release.hosting_deployment_id=hosting_jobs.hosting_deployment_id
+				AND release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive')
+				AND (release.runtime_instance_id='' OR release.runtime_instance_id='build-' || hosting_jobs.id || '-' || hosting_jobs.lease_generation))))), 0)
+			-COALESCE((SELECT SUM(required_cpu_millis) FROM hosting_runtime_recoveries
+			WHERE hosting_runner_id=hosting_runners.id AND (status IN ('queued','leased','running') OR (status='succeeded'
+				AND EXISTS (SELECT 1 FROM hosting_releases release WHERE release.id=hosting_runtime_recoveries.hosting_release_id
+				AND release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive')
+				AND release.runtime_instance_id='restore-' || hosting_runtime_recoveries.id || '-' || hosting_runtime_recoveries.lease_generation)))), 0))),
 		free_ram_bytes=MAX(0, MIN(reported_free_ram_bytes, capacity_ram_bytes-COALESCE((
 			SELECT SUM(required_ram_bytes) FROM hosting_jobs WHERE hosting_runner_id=hosting_runners.id
-			AND status IN ('queued','leased','running','succeeded')), 0))),
+			AND (status IN ('queued','leased','running') OR (status='succeeded' AND EXISTS (
+				SELECT 1 FROM hosting_releases release WHERE release.hosting_deployment_id=hosting_jobs.hosting_deployment_id
+				AND release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive')
+				AND (release.runtime_instance_id='' OR release.runtime_instance_id='build-' || hosting_jobs.id || '-' || hosting_jobs.lease_generation))))), 0)
+			-COALESCE((SELECT SUM(required_ram_bytes) FROM hosting_runtime_recoveries
+			WHERE hosting_runner_id=hosting_runners.id AND (status IN ('queued','leased','running') OR (status='succeeded'
+				AND EXISTS (SELECT 1 FROM hosting_releases release WHERE release.id=hosting_runtime_recoveries.hosting_release_id
+				AND release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive')
+				AND release.runtime_instance_id='restore-' || hosting_runtime_recoveries.id || '-' || hosting_runtime_recoveries.lease_generation)))), 0))),
 		free_disk_bytes=MAX(0, MIN(reported_free_disk_bytes, capacity_disk_bytes-COALESCE((
 			SELECT SUM(required_disk_bytes) FROM hosting_jobs WHERE hosting_runner_id=hosting_runners.id
-			AND status IN ('queued','leased','running','succeeded')), 0))),
+			AND (status IN ('queued','leased','running') OR (status='succeeded' AND EXISTS (
+				SELECT 1 FROM hosting_releases release WHERE release.hosting_deployment_id=hosting_jobs.hosting_deployment_id
+				AND release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive')
+				AND (release.runtime_instance_id='' OR release.runtime_instance_id='build-' || hosting_jobs.id || '-' || hosting_jobs.lease_generation))))), 0)
+			-COALESCE((SELECT SUM(required_disk_bytes) FROM hosting_runtime_recoveries
+			WHERE hosting_runner_id=hosting_runners.id AND (status IN ('queued','leased','running') OR (status='succeeded'
+				AND EXISTS (SELECT 1 FROM hosting_releases release WHERE release.id=hosting_runtime_recoveries.hosting_release_id
+				AND release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive')
+				AND release.runtime_instance_id='restore-' || hosting_runtime_recoveries.id || '-' || hosting_runtime_recoveries.lease_generation)))), 0))),
 		free_pids=MAX(0, MIN(reported_free_pids, capacity_pids-COALESCE((
 			SELECT SUM(required_pids) FROM hosting_jobs WHERE hosting_runner_id=hosting_runners.id
-			AND status IN ('queued','leased','running','succeeded')), 0)))
+			AND (status IN ('queued','leased','running') OR (status='succeeded' AND EXISTS (
+				SELECT 1 FROM hosting_releases release WHERE release.hosting_deployment_id=hosting_jobs.hosting_deployment_id
+				AND release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive')
+				AND (release.runtime_instance_id='' OR release.runtime_instance_id='build-' || hosting_jobs.id || '-' || hosting_jobs.lease_generation))))), 0)
+			-COALESCE((SELECT SUM(required_pids) FROM hosting_runtime_recoveries
+			WHERE hosting_runner_id=hosting_runners.id AND (status IN ('queued','leased','running') OR (status='succeeded'
+				AND EXISTS (SELECT 1 FROM hosting_releases release WHERE release.id=hosting_runtime_recoveries.hosting_release_id
+				AND release.runtime_runner_id=hosting_runners.id AND release.status IN ('healthy','active','inactive')
+				AND release.runtime_instance_id='restore-' || hosting_runtime_recoveries.id || '-' || hosting_runtime_recoveries.lease_generation)))), 0)))
 		WHERE id=?`, runnerID)
 	return err
 }
@@ -407,6 +494,15 @@ func handleHostingAgentPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runner := r.Context().Value(hostingRunnerContextKey{}).(*HostingRunner)
+	recovery, err := claimHostingRuntimeRecovery(r.Context(), runner.ID)
+	if err == nil {
+		jsonResponse(w, recovery)
+		return
+	}
+	if err != errNoHostingJob {
+		jsonErrorCode(w, errCodeInternal, "claim hosting runtime recovery failed", http.StatusInternalServerError)
+		return
+	}
 	job, err := claimHostingJob(r.Context(), runner.ID)
 	if err == errNoHostingJob {
 		w.WriteHeader(http.StatusNoContent)
@@ -483,8 +579,14 @@ func claimHostingJob(ctx context.Context, runnerID int64) (*hostingClaimedJob, e
 	if err := json.Unmarshal([]byte(recipeJSON), &recipe); err != nil {
 		return nil, err
 	}
+	if recipe.Operation == "" {
+		recipe.Operation = "build"
+	}
 	if err := json.Unmarshal([]byte(secretsJSON), &secrets); err != nil {
 		return nil, err
+	}
+	if secrets == nil {
+		secrets = make([]HostingSecretReference, 0)
 	}
 	return &hostingClaimedJob{JobID: jobID, LeaseGeneration: generation, LeaseToken: leaseToken, LeaseExpiresAt: expires, Recipe: recipe, SecretRefs: secrets}, nil
 }

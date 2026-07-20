@@ -194,6 +194,7 @@ func Run() {
 	mux.Handle("/api/hosting-agent/v1/heartbeat", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentHeartbeat)))
 	mux.Handle("/api/hosting-agent/v1/poll", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentPoll)))
 	mux.Handle("/api/hosting-agent/v1/jobs/", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentJob)))
+	mux.Handle("/api/hosting-agent/v1/recoveries/", hostingRunnerAuthMiddleware(http.HandlerFunc(handleHostingAgentRecovery)))
 
 	// Agent API routes
 	mux.HandleFunc("/api/agent/poll", handleAgentPoll)
@@ -250,8 +251,11 @@ func Run() {
 }
 
 func cleanupRuntimeState(cfg AppConfig) {
-	protectActiveHostingArtifacts()
-	cleanupStaleArtifacts(cfg)
+	if err := protectActiveHostingArtifacts(); err != nil {
+		logOperationalError("protect active hosting artifacts", err)
+	} else {
+		cleanupStaleArtifacts(cfg)
+	}
 	if cfg.LogRetentionDays > 0 {
 		affected, err := cleanupOldBuildLogs(cfg.LogRetentionDays)
 		if err != nil {

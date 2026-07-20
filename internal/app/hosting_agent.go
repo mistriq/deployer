@@ -179,7 +179,9 @@ func sendHostingAgentHeartbeat(ctx context.Context, config hostingAgentConfig) e
 	if err != nil {
 		return err
 	}
-	payload := hostingHeartbeatRequest{Free: free, Draining: config.Draining, ProtocolVersion: hostingRunnerProtocolVersion, ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"20", "22"}}
+	payload := hostingHeartbeatRequest{Free: free, Draining: config.Draining, ProtocolVersion: hostingRunnerProtocolVersion,
+		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"20", "22"},
+		Operations: []string{"build", "restore"}}
 	var response hostingHeartbeatResponse
 	if err := hostingAgentJSON(ctx, config, http.MethodPost, "/api/hosting-agent/v1/heartbeat", payload, &response, nil); err != nil {
 		return err
@@ -399,6 +401,10 @@ func hostingAgentWorkPath(job *hostingClaimedJob, suffix string) string {
 	return fmt.Sprintf("/api/hosting-agent/v1/%s/%d/%s", group, job.JobID, suffix)
 }
 
+func hostingAgentInstanceID(job *hostingClaimedJob) string {
+	return fmt.Sprintf("%s-%d-%d", hostingAgentOperation(job), job.JobID, job.LeaseGeneration)
+}
+
 func hostingLeaseHeaders(job *hostingClaimedJob) map[string]string {
 	return map[string]string{
 		"X-Deployer-Lease-Generation": strconv.FormatInt(job.LeaseGeneration, 10),
@@ -525,8 +531,9 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 	fail := func(code string, err error) hostingCompletionRequest {
 		return hostingCompletionRequest{Status: "failed", FailureCode: code, FailureMessage: redactSecrets(err.Error())}
 	}
-	containerName := "deployer-hosting-" + safeFileName(job.Recipe.ExternalDeploymentID)
-	if err := removeStaleHostingContainer(ctx, containerName, job.Recipe.ExternalProjectID, job.Recipe.ExternalDeploymentID); err != nil {
+	instanceID := hostingAgentInstanceID(job)
+	containerName := "deployer-hosting-" + safeFileName(job.Recipe.ExternalDeploymentID) + "-" + safeFileName(instanceID)
+	if err := removeStaleHostingContainer(ctx, containerName, job.Recipe.ExternalProjectID, job.Recipe.ExternalDeploymentID, instanceID); err != nil {
 		return fail("workload_policy_violation", err)
 	}
 	containerPort := job.Recipe.Runtime.Port
@@ -537,6 +544,7 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 		"--label", "light-apps.hosting.managed=true", "--label", "light-apps.hosting.release=" + releaseDigest,
 		"--label", "light-apps.hosting.project=" + job.Recipe.ExternalProjectID,
 		"--label", "light-apps.hosting.deployment=" + job.Recipe.ExternalDeploymentID,
+		"--label", "light-apps.hosting.instance=" + instanceID,
 		"--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit", strconv.FormatInt(job.Recipe.Limits.PIDs, 10), "--memory", strconv.FormatInt(job.Recipe.Limits.RAMBytes, 10), "--cpus", fmt.Sprintf("%.3f", float64(job.Recipe.Limits.CPUMillis)/1000), "--storage-opt", "size=" + strconv.FormatInt(job.Recipe.Limits.DiskBytes, 10), "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "-p", fmt.Sprintf("%s::%d", config.RuntimeBindAddress, containerPort)}
 	for index, reference := range job.SecretRefs {
 		runArgs = append(runArgs, "--env", fmt.Sprintf("DEPLOYER_SECRET_REF_%d=%s", index, reference.Reference), "--env", fmt.Sprintf("DEPLOYER_SECRET_PROVIDER_%d=%s", index, reference.Provider))
@@ -577,9 +585,9 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 	return hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: releaseArtifactDigest, RuntimeEndpoint: endpoint, HealthEvidence: map[string]any{"healthy": true, "attempts": attempts, "status_code": statusCode}}
 }
 
-func removeStaleHostingContainer(ctx context.Context, containerName, externalProjectID, externalDeploymentID string) error {
+func removeStaleHostingContainer(ctx context.Context, containerName, externalProjectID, externalDeploymentID, instanceID string) error {
 	output, err := exec.CommandContext(ctx, "docker", "inspect", "--format",
-		`{{index .Config.Labels "light-apps.hosting.managed"}}\t{{index .Config.Labels "light-apps.hosting.project"}}\t{{index .Config.Labels "light-apps.hosting.deployment"}}`,
+		`{{index .Config.Labels "light-apps.hosting.managed"}}\t{{index .Config.Labels "light-apps.hosting.project"}}\t{{index .Config.Labels "light-apps.hosting.deployment"}}\t{{index .Config.Labels "light-apps.hosting.instance"}}`,
 		containerName).CombinedOutput()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -589,7 +597,7 @@ func removeStaleHostingContainer(ctx context.Context, containerName, externalPro
 		return fmt.Errorf("inspect existing hosting container: %w", err)
 	}
 	fields := strings.Split(strings.TrimSpace(string(output)), "\t")
-	if len(fields) != 3 || fields[0] != "true" || fields[1] != externalProjectID || fields[2] != externalDeploymentID {
+	if len(fields) != 4 || fields[0] != "true" || fields[1] != externalProjectID || fields[2] != externalDeploymentID || fields[3] != instanceID {
 		return fmt.Errorf("refusing to replace container with mismatched ownership labels")
 	}
 	if err := exec.CommandContext(ctx, "docker", "rm", "-f", containerName).Run(); err != nil {
@@ -635,27 +643,36 @@ func uploadHostingReleaseArtifact(ctx context.Context, config hostingAgentConfig
 
 func reconcileHostingAgentReleases(ctx context.Context, retained []hostingRetainedRelease) error {
 	retainedSet := make(map[string]struct{}, len(retained))
+	legacyRetainedSet := make(map[string]struct{})
 	for _, release := range retained {
 		if !validSHA256Digest(release.ReleaseDigest) || !externalIDPattern.MatchString(release.ExternalProjectID) || !externalIDPattern.MatchString(release.ExternalDeploymentID) {
 			return fmt.Errorf("control plane returned invalid retained release identity")
 		}
-		retainedSet[release.ExternalProjectID+"\x00"+release.ExternalDeploymentID] = struct{}{}
+		base := release.ExternalProjectID + "\x00" + release.ExternalDeploymentID + "\x00" + release.ReleaseDigest
+		if release.RuntimeInstanceID == "" {
+			legacyRetainedSet[base] = struct{}{}
+		} else {
+			retainedSet[base+"\x00"+release.RuntimeInstanceID] = struct{}{}
+		}
 	}
-	output, err := exec.CommandContext(ctx, "docker", "ps", "-a", "--filter", "label=light-apps.hosting.managed=true", "--format", `{{.ID}}\t{{.Label "light-apps.hosting.release"}}\t{{.Label "light-apps.hosting.project"}}\t{{.Label "light-apps.hosting.deployment"}}`).Output()
+	output, err := exec.CommandContext(ctx, "docker", "ps", "-a", "--filter", "label=light-apps.hosting.managed=true", "--format", `{{.ID}}\t{{.Label "light-apps.hosting.release"}}\t{{.Label "light-apps.hosting.project"}}\t{{.Label "light-apps.hosting.deployment"}}\t{{.Label "light-apps.hosting.instance"}}`).Output()
 	if err != nil {
 		return fmt.Errorf("list managed hosting containers: %w", err)
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+	for _, line := range strings.Split(string(output), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		fields := strings.Split(line, "\t")
-		if len(fields) != 4 || strings.TrimSpace(fields[0]) == "" || !validSHA256Digest(strings.TrimSpace(fields[1])) {
+		if len(fields) != 5 || strings.TrimSpace(fields[0]) == "" || !validSHA256Digest(strings.TrimSpace(fields[1])) {
 			return fmt.Errorf("container runtime returned invalid managed container metadata")
 		}
 		containerID := strings.TrimSpace(fields[0])
-		identity := strings.TrimSpace(fields[2]) + "\x00" + strings.TrimSpace(fields[3])
-		if _, ok := retainedSet[identity]; ok {
+		base := strings.TrimSpace(fields[2]) + "\x00" + strings.TrimSpace(fields[3]) + "\x00" + strings.TrimSpace(fields[1])
+		identity := base + "\x00" + strings.TrimSpace(fields[4])
+		_, exact := retainedSet[identity]
+		_, legacy := legacyRetainedSet[base]
+		if exact || (legacy && strings.TrimSpace(fields[4]) == "") {
 			continue
 		}
 		imageOutput, _ := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.Image}}", containerID).Output()

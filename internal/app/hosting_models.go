@@ -50,6 +50,8 @@ type HostingDeployment struct {
 	FailureMessage       string     `json:"failure_message,omitempty"`
 	ReleaseDigest        string     `json:"release_digest,omitempty"`
 	PreviousRelease      string     `json:"previous_release_digest,omitempty"`
+	RuntimeStatus        string     `json:"runtime_status,omitempty"`
+	RuntimeRecoveryID    int64      `json:"runtime_recovery_id,omitempty"`
 	CallbackState        string     `json:"callback_state"`
 	CancelRequestedAt    *time.Time `json:"cancel_requested_at,omitempty"`
 	StartedAt            *time.Time `json:"started_at,omitempty"`
@@ -437,6 +439,33 @@ func applyHostingMigrations() error {
 				`CREATE INDEX idx_hosting_proxy_operations_reconcile ON hosting_proxy_operations(status, updated_at)`,
 			},
 		},
+		{
+			id: "029_hosting_runtime_capabilities",
+			statements: []string{
+				`ALTER TABLE hosting_runners ADD COLUMN operation_capabilities_json TEXT NOT NULL DEFAULT '["build"]'`,
+				`ALTER TABLE hosting_releases ADD COLUMN runtime_instance_id TEXT NOT NULL DEFAULT ''`,
+			},
+		},
+		{
+			id: "030_hosting_recovery_completion_fingerprint",
+			statements: []string{
+				`ALTER TABLE hosting_runtime_recoveries ADD COLUMN completion_fingerprint TEXT NOT NULL DEFAULT ''`,
+			},
+		},
+		{
+			id: "031_hosting_recovery_completion_receipts",
+			statements: []string{
+				`CREATE TABLE hosting_runtime_recovery_completion_receipts (
+					hosting_runtime_recovery_id INTEGER NOT NULL REFERENCES hosting_runtime_recoveries(id) ON DELETE CASCADE,
+					lease_generation INTEGER NOT NULL,
+					hosting_runner_id INTEGER NOT NULL REFERENCES hosting_runners(id) ON DELETE RESTRICT,
+					lease_token_hash TEXT NOT NULL,
+					completion_fingerprint TEXT NOT NULL,
+					accepted_at DATETIME NOT NULL,
+					PRIMARY KEY (hosting_runtime_recovery_id, lease_generation)
+				)`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {
@@ -536,13 +565,53 @@ func nullableSQLiteTime(value sql.NullString) *time.Time {
 }
 
 func getHostingDeploymentByExternalID(ctx context.Context, externalID string) (*HostingDeployment, error) {
-	return scanHostingDeployment(db.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
+	deployment, err := scanHostingDeployment(db.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
 		d.commit_sha, d.manifest_digest, d.artifact_digest, d.status, d.phase, d.failure_code,
 		d.failure_message, d.release_digest, d.previous_release_digest, d.callback_state,
 		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at
 		FROM hosting_deployments d
 		JOIN hosting_projects p ON p.id=d.hosting_project_id
 		WHERE d.external_deployment_id=?`, externalID))
+	if err != nil {
+		return nil, err
+	}
+	if deployment.Status == hostingStatusActive {
+		var releaseStatus, desiredState, killReason, runnerStatus string
+		var globalKill int
+		var recoveryID sql.NullInt64
+		var runnerLastSeen sql.NullString
+		err := db.QueryRowContext(ctx, `SELECT release.status, project.desired_state,
+			project.kill_switch_reason, settings.global_kill_switch,
+			COALESCE(runner.status, ''), runner.last_seen,
+			(SELECT recovery.id FROM hosting_runtime_recoveries recovery
+			 WHERE recovery.hosting_release_id=release.id AND recovery.status IN ('queued','leased','running')
+			   AND recovery.cancel_requested_at IS NULL
+			 ORDER BY recovery.id DESC LIMIT 1)
+			FROM hosting_releases release
+			JOIN hosting_projects project ON project.id=release.hosting_project_id
+			JOIN hosting_settings settings ON settings.id=1
+			LEFT JOIN hosting_runners runner ON runner.id=release.runtime_runner_id
+			WHERE release.hosting_deployment_id=?
+			ORDER BY release.id DESC LIMIT 1`, deployment.ID).Scan(&releaseStatus, &desiredState,
+			&killReason, &globalKill, &runnerStatus, &runnerLastSeen, &recoveryID)
+		if err != nil && err != sql.ErrNoRows {
+			return nil, err
+		}
+		runnerLive := runnerStatus == "online" && runnerLastSeen.Valid &&
+			!parseSQLiteTime(runnerLastSeen.String).Before(time.Now().UTC().Add(-hostingRunnerStaleAfter))
+		switch {
+		case desiredState != "active" || killReason != "" || globalKill != 0:
+			deployment.RuntimeStatus = "unavailable"
+		case recoveryID.Valid:
+			deployment.RuntimeStatus = "recovering"
+			deployment.RuntimeRecoveryID = recoveryID.Int64
+		case releaseStatus == "failed" || !runnerLive:
+			deployment.RuntimeStatus = "unavailable"
+		case releaseStatus != "":
+			deployment.RuntimeStatus = "available"
+		}
+	}
+	return deployment, nil
 }
 
 func listHostingReleases(ctx context.Context, projectID int64) ([]HostingRelease, error) {

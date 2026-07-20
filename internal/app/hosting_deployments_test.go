@@ -17,13 +17,13 @@ func insertHostingRunnerForTest(t *testing.T, name string, free hostingWorkloadL
 	t.Helper()
 	now := formatSQLiteTime(time.Now().UTC())
 	result, err := db.Exec(`INSERT INTO hosting_runners
-		(name, token_hash, labels_json, protocol_version, manifest_versions_json, runtime_versions_json,
+		(name, token_hash, labels_json, protocol_version, manifest_versions_json, runtime_versions_json, operation_capabilities_json,
 		 capacity_cpu_millis, capacity_ram_bytes, capacity_disk_bytes, capacity_pids,
 		 free_cpu_millis, free_ram_bytes, free_disk_bytes, free_pids,
 		 reported_free_cpu_millis, reported_free_ram_bytes, reported_free_disk_bytes, reported_free_pids,
 		 reserve_cpu_millis, reserve_ram_bytes, reserve_disk_bytes, reserve_pids,
 		 draining, status, last_seen, created_at)
-		VALUES (?, ?, '["linux"]', 'v1', '["v1"]', '["20","22"]',
+		VALUES (?, ?, '["linux"]', 'v1', '["v1"]', '["20","22"]', '["build","restore"]',
 		 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 'online', ?, ?)`,
 		name, hashToken("runner-"+name), free.CPUMillis, free.RAMBytes, free.DiskBytes, free.PIDs,
 		free.CPUMillis, free.RAMBytes, free.DiskBytes, free.PIDs,
@@ -253,16 +253,18 @@ func TestInternalDeploymentCannotReadOrExecuteLegacyObjects(t *testing.T) {
 func TestHostingMigrationsCreateDurableLifecycleSchema(t *testing.T) {
 	withTempDB(t)
 	for table, columns := range map[string][]string{
-		"hosting_projects":           {"desired_state", "kill_switch_reason", "runner_selector_json"},
-		"hosting_deployments":        {"phase", "failure_code", "cancel_requested_at", "request_hash"},
-		"hosting_idempotency":        {"issuer_token_id", "operation", "request_hash", "response_body"},
-		"hosting_jobs":               {"lease_generation", "lease_expires_at", "cancel_requested_at"},
-		"hosting_releases":           {"health_evidence_json", "route_revision", "runtime_endpoint", "runtime_runner_id", "runtime_generation"},
-		"hosting_runtime_recoveries": {"hosting_release_id", "hosting_runner_id", "lease_generation", "lease_token_hash", "lease_expires_at"},
-		"hosting_proxy_operations":   {"hosting_runtime_recovery_id", "operation_type", "status"},
-		"callback_outbox":            {"event_id", "payload_hash", "next_attempt_at"},
-		"service_token_credentials":  {"token_hash", "expires_at", "revoked_at"},
-		"service_token_audit_events": {"event_type", "actor", "metadata_json"},
+		"hosting_projects":                             {"desired_state", "kill_switch_reason", "runner_selector_json"},
+		"hosting_deployments":                          {"phase", "failure_code", "cancel_requested_at", "request_hash"},
+		"hosting_idempotency":                          {"issuer_token_id", "operation", "request_hash", "response_body"},
+		"hosting_jobs":                                 {"lease_generation", "lease_expires_at", "cancel_requested_at"},
+		"hosting_releases":                             {"health_evidence_json", "route_revision", "runtime_endpoint", "runtime_runner_id", "runtime_generation", "runtime_instance_id"},
+		"hosting_runners":                              {"operation_capabilities_json"},
+		"hosting_runtime_recoveries":                   {"hosting_release_id", "hosting_runner_id", "lease_generation", "lease_token_hash", "lease_expires_at", "completion_fingerprint"},
+		"hosting_runtime_recovery_completion_receipts": {"hosting_runtime_recovery_id", "lease_generation", "hosting_runner_id", "lease_token_hash", "completion_fingerprint", "accepted_at"},
+		"hosting_proxy_operations":                     {"hosting_runtime_recovery_id", "operation_type", "status"},
+		"callback_outbox":                              {"event_id", "payload_hash", "next_attempt_at"},
+		"service_token_credentials":                    {"token_hash", "expires_at", "revoked_at"},
+		"service_token_audit_events":                   {"event_type", "actor", "metadata_json"},
 	} {
 		for _, column := range columns {
 			exists, err := columnExists(table, column)
@@ -271,7 +273,7 @@ func TestHostingMigrationsCreateDurableLifecycleSchema(t *testing.T) {
 			}
 		}
 	}
-	for _, migrationID := range []string{"017_hosting_lifecycle", "018_hosting_idempotency_events", "019_hosting_runners_jobs", "020_hosting_releases_callbacks", "021_service_credentials_audit", "022_hosting_release_runtime_endpoint", "023_callback_outbox_leases", "024_hosting_job_source_artifact", "025_hosting_audit_events", "026_hosting_recovery_invariants", "027_hosting_release_artifacts", "028_hosting_runtime_recovery"} {
+	for _, migrationID := range []string{"017_hosting_lifecycle", "018_hosting_idempotency_events", "019_hosting_runners_jobs", "020_hosting_releases_callbacks", "021_service_credentials_audit", "022_hosting_release_runtime_endpoint", "023_callback_outbox_leases", "024_hosting_job_source_artifact", "025_hosting_audit_events", "026_hosting_recovery_invariants", "027_hosting_release_artifacts", "028_hosting_runtime_recovery", "029_hosting_runtime_capabilities", "030_hosting_recovery_completion_fingerprint", "031_hosting_recovery_completion_receipts"} {
 		var count int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE id=?`, migrationID).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("migration %s count=%d err=%v", migrationID, count, err)

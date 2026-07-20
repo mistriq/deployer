@@ -3,6 +3,7 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -79,7 +80,7 @@ func TestCleanupHostingRecordsAppliesConfiguredRetention(t *testing.T) {
 	}
 }
 
-func TestProtectActiveHostingArtifactsRefreshesReferencedSource(t *testing.T) {
+func TestProtectActiveHostingArtifactsRefreshesReferencedSourceAndRelease(t *testing.T) {
 	withTempDB(t)
 	oldConfig := appConfig
 	oldStorage := artifactStorage
@@ -112,12 +113,46 @@ func TestProtectActiveHostingArtifactsRefreshesReferencedSource(t *testing.T) {
 	if _, err := db.Exec(`UPDATE hosting_jobs SET source_artifact_path=?`, path); err != nil {
 		t.Fatal(err)
 	}
-	protectActiveHostingArtifacts()
+	releasePath := managedArtifactPath("hosting-release-protected.tar")
+	if err := os.WriteFile(releasePath, []byte("release"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(releasePath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	releaseArtifactDigest := "sha256:" + strings.Repeat("e", 64)
+	releaseDigest := "sha256:" + strings.Repeat("f", 64)
+	var deploymentID int64
+	if err := db.QueryRow(`SELECT id FROM hosting_deployments WHERE external_deployment_id=?`, request.ExternalDeploymentID).Scan(&deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO hosting_release_artifacts
+		(artifact_digest, release_digest, artifact_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?)`,
+		releaseArtifactDigest, releaseDigest, releasePath, 7, formatSQLiteTime(time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO hosting_releases
+		(hosting_project_id, hosting_deployment_id, release_digest, release_artifact_digest, commit_sha,
+		 artifact_digest, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`, project.ID,
+		deploymentID, releaseDigest, releaseArtifactDigest, request.CommitSHA, request.ArtifactDigest,
+		formatSQLiteTime(time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	if err := protectActiveHostingArtifacts(); err != nil {
+		t.Fatal(err)
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if time.Since(info.ModTime()) > time.Minute {
 		t.Fatalf("active source artifact mtime was not refreshed: %v", info.ModTime())
+	}
+	releaseInfo, err := os.Stat(releasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(releaseInfo.ModTime()) > time.Minute {
+		t.Fatalf("retained release artifact mtime was not refreshed: %v", releaseInfo.ModTime())
 	}
 }

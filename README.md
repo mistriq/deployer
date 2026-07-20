@@ -341,6 +341,14 @@ short-lived `control-plane` secret references are persisted. Callers must branch
 on stable JSON `code`, `status`, `phase`, and `failure_code` values rather than
 human text.
 
+The exact-object check currently starts from a repository already populated
+under `DEPLOYER_HOSTING_REPO_ROOT`; Deployer does not yet perform an
+installation-authenticated clone/fetch or bind the local object database to the
+provisioned GitHub repository identity. Likewise, passing an opaque secret
+reference is not secret delivery: no workload identity, redemption, or renewal
+exchange is implemented yet. These production gates remain open in
+`HOSTING_TODO.md`.
+
 Terminal callbacks are delivered at least once. Their signature covers
 `<timestamp>.<event_id>.<raw body>`; receivers reject timestamps outside five
 minutes and deduplicate event IDs. Polling remains authoritative when delivery
@@ -367,7 +375,31 @@ candidate ports to the configured private address, drops all capabilities,
 enables `no-new-privileges`, uses a read-only root filesystem, and enforces CPU,
 RAM, disk, PID, build-time, and temporary-filesystem limits. Before activation
 it uploads a digest-verified Docker image archive to Deployer-managed artifact
-storage. Heartbeats reconcile exact project/deployment release instances.
+storage. Heartbeats reconcile exact project/deployment release instances. If
+an active runner is lost, a generation-fenced recovery lease downloads that
+retained image, verifies both archive and image identity, starts and health
+checks it without rebuilding customer source, and switches the private adapter
+through a durable idempotent operation.
+
+Restore is explicitly negotiated through the runner `operations` capability.
+Legacy v1 agents that omit it are treated as build-only and never receive a
+restore recipe. During a rolling upgrade, deploy the new agents and confirm
+`restore` appears in `/api/internal/v1/runners` before enabling reliance on
+active-runtime recovery. Deployment polling exposes `runtime_status` as
+`available`, `recovering`, or `unavailable`; it remains authoritative after the
+original deployment callback. Secret-bearing releases fail closed on runner
+loss until the separate workload-identity redemption/renewal contract exists.
+Recovery currently starts from whole-runner liveness loss. The heartbeat
+response is an authoritative retention set, not a runner-reported runtime
+inventory, so a missing container on an otherwise online runner is not yet
+detected and the overall runner-recovery TODO item remains open.
+
+The recovery cancellation path also still needs adapter-side ordered fencing
+for an activation that returns after a newer suspend/resume intent. Deployer
+attempts an action-specific correction after observing the late response, but
+that correction is not yet a durable, revision-ordered adapter saga across a
+process crash or concurrent desired-state change. Keep cancellation/recovery
+durability unchecked until the versioned adapter contract enforces convergence.
 
 Agent API:
 
@@ -383,6 +415,7 @@ Dedicated hosting-agent API:
 - `POST /api/hosting-agent/v1/heartbeat`
 - `POST /api/hosting-agent/v1/poll`
 - `/api/hosting-agent/v1/jobs/:jobId/{source,release-artifact,heartbeat,phase,logs,complete}`
+- `/api/hosting-agent/v1/recoveries/:recoveryId/{artifact,heartbeat,logs,complete}`
 
 Agent-accessible release endpoints:
 

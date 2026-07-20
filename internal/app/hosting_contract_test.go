@@ -36,8 +36,13 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/phase:",
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/logs:",
 		"/api/hosting-agent/v1/jobs/{hostingJobId}/complete:",
+		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/artifact:",
+		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/heartbeat:",
+		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/logs:",
+		"/api/hosting-agent/v1/recoveries/{hostingRecoveryId}/complete:",
 		"Idempotency-Key", "X-Deployer-Lease-Generation", "X-Deployer-Lease-Token",
 		"hosting:admin", "workload_policy_violation", "idempotency_conflict",
+		"HostingRestoreJobRecipe", "release_artifact_url", "artifact_unavailable",
 		"X-Deployer-Event-ID", "outside a five-minute window", "at-least-once",
 	}
 	for _, value := range required {

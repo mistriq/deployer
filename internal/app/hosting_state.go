@@ -38,6 +38,7 @@ type internalCapabilitiesResponse struct {
 	RuntimeKinds           []string                         `json:"runtime_kinds"`
 	ResourceProfiles       map[string]hostingWorkloadLimits `json:"resource_profiles"`
 	FailureCodes           []string                         `json:"failure_codes"`
+	RunnerOperations       []string                         `json:"runner_operations"`
 }
 
 type internalRunnerResponse struct {
@@ -47,6 +48,7 @@ type internalRunnerResponse struct {
 	ProtocolVersion  string      `json:"protocol_version"`
 	ManifestVersions []string    `json:"manifest_versions"`
 	RuntimeVersions  []string    `json:"runtime_versions"`
+	Operations       []string    `json:"operations"`
 	Capacity         capacityDTO `json:"capacity"`
 	Free             capacityDTO `json:"free"`
 	Reserve          capacityDTO `json:"reserve"`
@@ -74,11 +76,12 @@ func handleInternalCapabilities(w http.ResponseWriter, r *http.Request) {
 		RunnerProtocolVersions: []string{hostingRunnerProtocolVersion},
 		NodeVersions:           []string{"20", "22"},
 		RuntimeKinds:           []string{"static", "node"},
+		RunnerOperations:       []string{"build", "restore"},
 		ResourceProfiles:       map[string]hostingWorkloadLimits{"starter": starter, "standard": standard},
 		FailureCodes: []string{
-			"artifact_digest_mismatch", "build_failed", "build_timeout", "cancelled", "health_check_failed",
+			"artifact_digest_mismatch", "artifact_unavailable", "build_failed", "build_timeout", "cancelled", "health_check_failed",
 			"proxy_activation_failed", "release_persistence_failed", "runner_lost", "runtime_start_failed",
-			"source_fetch_failed", "workload_policy_violation",
+			"secret_reference_unavailable", "source_fetch_failed", "workload_policy_violation",
 		},
 	})
 }
@@ -88,7 +91,7 @@ func handleInternalRunners(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := db.QueryContext(r.Context(), `SELECT id, name, labels_json, protocol_version,
-		manifest_versions_json, runtime_versions_json,
+		manifest_versions_json, runtime_versions_json, operation_capabilities_json,
 		capacity_cpu_millis, capacity_ram_bytes, capacity_disk_bytes, capacity_pids,
 		free_cpu_millis, free_ram_bytes, free_disk_bytes, free_pids,
 		reserve_cpu_millis, reserve_ram_bytes, reserve_disk_bytes, reserve_pids,
@@ -101,11 +104,11 @@ func handleInternalRunners(w http.ResponseWriter, r *http.Request) {
 	runners := make([]internalRunnerResponse, 0)
 	for rows.Next() {
 		var runner internalRunnerResponse
-		var labelsJSON, manifestsJSON, runtimesJSON string
+		var labelsJSON, manifestsJSON, runtimesJSON, operationsJSON string
 		var draining int
 		var lastSeen sql.NullString
 		if err := rows.Scan(&runner.ID, &runner.Name, &labelsJSON, &runner.ProtocolVersion,
-			&manifestsJSON, &runtimesJSON,
+			&manifestsJSON, &runtimesJSON, &operationsJSON,
 			&runner.Capacity.CPUMillis, &runner.Capacity.RAMBytes, &runner.Capacity.DiskBytes, &runner.Capacity.PIDs,
 			&runner.Free.CPUMillis, &runner.Free.RAMBytes, &runner.Free.DiskBytes, &runner.Free.PIDs,
 			&runner.Reserve.CPUMillis, &runner.Reserve.RAMBytes, &runner.Reserve.DiskBytes, &runner.Reserve.PIDs,
@@ -115,7 +118,8 @@ func handleInternalRunners(w http.ResponseWriter, r *http.Request) {
 		}
 		if json.Unmarshal([]byte(labelsJSON), &runner.Labels) != nil ||
 			json.Unmarshal([]byte(manifestsJSON), &runner.ManifestVersions) != nil ||
-			json.Unmarshal([]byte(runtimesJSON), &runner.RuntimeVersions) != nil {
+			json.Unmarshal([]byte(runtimesJSON), &runner.RuntimeVersions) != nil ||
+			json.Unmarshal([]byte(operationsJSON), &runner.Operations) != nil {
 			jsonErrorCode(w, errCodeInternal, "hosting runner capabilities are invalid", http.StatusInternalServerError)
 			return
 		}

@@ -179,17 +179,17 @@ func TestReconcileHostingAgentReleasesRemovesOnlyUnretainedManagedContainers(t *
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = "ps" ]; then
-  printf 'keep-container\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\ndrop-container\t%s\tproject_01JDROPX\tdeployment_01JDROPX\n'
+  printf 'keep-container\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\ndrop-container\t%s\tproject_01JDROPX\tdeployment_01JDROPX\tbuild-2-1\nstale-container\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi
-`, logPath, keep, drop, imageDigest)
+`, logPath, keep, drop, drop, imageDigest)
 	dockerPath := filepath.Join(directory, "docker")
 	if err := os.WriteFile(dockerPath, []byte(script), 0750); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if err := reconcileHostingAgentReleases(context.Background(), []hostingRetainedRelease{{ReleaseDigest: keep, ExternalProjectID: "project_01JKEEPX", ExternalDeploymentID: "deployment_01JKEEPX", Status: "active"}}); err != nil {
+	if err := reconcileHostingAgentReleases(context.Background(), []hostingRetainedRelease{{ReleaseDigest: keep, ExternalProjectID: "project_01JKEEPX", ExternalDeploymentID: "deployment_01JKEEPX", RuntimeInstanceID: "build-1-1", Status: "active"}}); err != nil {
 		t.Fatal(err)
 	}
 	commands, err := os.ReadFile(logPath)
@@ -197,11 +197,44 @@ fi
 		t.Fatal(err)
 	}
 	text := string(commands)
-	if strings.Contains(text, "rm -f keep-container") || !strings.Contains(text, "rm -f drop-container") || !strings.Contains(text, "image rm "+imageDigest) {
+	if strings.Contains(text, "rm -f keep-container") || !strings.Contains(text, "rm -f drop-container") ||
+		!strings.Contains(text, "rm -f stale-container") || !strings.Contains(text, "image rm "+imageDigest) {
 		t.Fatalf("docker commands = %s", text)
 	}
 	if err := reconcileHostingAgentReleases(context.Background(), []hostingRetainedRelease{{ReleaseDigest: "invalid", ExternalProjectID: "project_01JKEEPX", ExternalDeploymentID: "deployment_01JKEEPX"}}); err == nil {
 		t.Fatal("invalid retained digest was accepted")
+	}
+}
+
+func TestReconcileHostingAgentReleasesAcceptsOnlyUnlabelledLegacyInstance(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "docker.log")
+	digest := "sha256:" + strings.Repeat("a", 64)
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+if [ "$1" = "ps" ]; then
+  printf 'legacy-container\t%s\tproject_01JLEGACY\tdeployment_01JLEGACY\t\nlabelled-container\t%s\tproject_01JLEGACY\tdeployment_01JLEGACY\tbuild-9-1\n'
+elif [ "$1" = "inspect" ]; then
+  printf '%s\n'
+fi
+`, logPath, digest, digest, digest)
+	dockerPath := filepath.Join(directory, "docker")
+	if err := os.WriteFile(dockerPath, []byte(script), 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	retained := []hostingRetainedRelease{{ReleaseDigest: digest, ExternalProjectID: "project_01JLEGACY",
+		ExternalDeploymentID: "deployment_01JLEGACY", Status: "active"}}
+	if err := reconcileHostingAgentReleases(t.Context(), retained); err != nil {
+		t.Fatal(err)
+	}
+	commands, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(commands)
+	if strings.Contains(text, "rm -f legacy-container") || !strings.Contains(text, "rm -f labelled-container") {
+		t.Fatalf("legacy identity cleanup commands = %s", text)
 	}
 }
 
@@ -325,6 +358,8 @@ fi
 	text := string(commands)
 	if !strings.Contains(text, "image load --input") || !strings.Contains(text, "run -d") ||
 		!strings.Contains(text, "--cap-drop=ALL") || !strings.Contains(text, "127.0.0.1::3000") ||
+		!strings.Contains(text, "--name deployer-hosting-deployment_01JRESTORE-restore-77-4") ||
+		!strings.Contains(text, "light-apps.hosting.instance=restore-77-4") ||
 		strings.Contains(text, " build ") {
 		t.Fatalf("unexpected restore docker commands:\n%s", text)
 	}

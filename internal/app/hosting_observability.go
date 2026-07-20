@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -109,23 +110,45 @@ func maxFloat(a, b float64) float64 {
 	return b
 }
 
-func protectActiveHostingArtifacts() {
+func protectActiveHostingArtifacts() error {
 	if db == nil {
-		return
+		return fmt.Errorf("hosting database is not initialized")
 	}
-	rows, err := db.Query(`SELECT DISTINCT source_artifact_path FROM hosting_jobs
-		WHERE status IN ('queued','leased','running') AND source_artifact_path<>''`)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
 	now := time.Now()
-	for rows.Next() {
-		var path string
-		if rows.Scan(&path) == nil && isManagedArtifactPath(path) {
-			_ = os.Chtimes(path, now, now)
+	for _, query := range []string{
+		`SELECT DISTINCT source_artifact_path FROM hosting_jobs
+			WHERE status IN ('queued','leased','running') AND source_artifact_path<>''`,
+		`SELECT DISTINCT artifact.artifact_path FROM hosting_release_artifacts artifact
+			JOIN hosting_releases release ON release.release_artifact_digest=artifact.artifact_digest`,
+	} {
+		rows, err := db.Query(query)
+		if err != nil {
+			return fmt.Errorf("list protected hosting artifacts: %w", err)
+		}
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				rows.Close()
+				return fmt.Errorf("read protected hosting artifact: %w", err)
+			}
+			if !isManagedArtifactPath(path) {
+				rows.Close()
+				return fmt.Errorf("referenced hosting artifact is outside managed storage")
+			}
+			if err := os.Chtimes(path, now, now); err != nil {
+				rows.Close()
+				return fmt.Errorf("refresh protected hosting artifact: %w", err)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate protected hosting artifacts: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close protected hosting artifacts: %w", err)
 		}
 	}
+	return nil
 }
 
 func cleanupHostingRecords(ctx context.Context, cfg AppConfig, now time.Time) error {
@@ -150,6 +173,29 @@ func cleanupHostingRecords(ctx context.Context, cfg AppConfig, now time.Time) er
 	if err := deleteOlder(`DELETE FROM hosting_releases WHERE status IN ('inactive','failed') AND created_at<?`, cfg.HostingReleaseRetentionDays); err != nil {
 		return err
 	}
+	orphanRows, err := tx.QueryContext(ctx, `SELECT artifact_path FROM hosting_release_artifacts artifact
+		WHERE NOT EXISTS (SELECT 1 FROM hosting_releases release
+			WHERE release.release_artifact_digest=artifact.artifact_digest)`)
+	if err != nil {
+		return err
+	}
+	var orphanArtifacts []string
+	for orphanRows.Next() {
+		var path string
+		if err := orphanRows.Scan(&path); err != nil {
+			orphanRows.Close()
+			return err
+		}
+		orphanArtifacts = append(orphanArtifacts, path)
+	}
+	if err := orphanRows.Close(); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM hosting_release_artifacts
+		WHERE NOT EXISTS (SELECT 1 FROM hosting_releases release
+			WHERE release.release_artifact_digest=hosting_release_artifacts.artifact_digest)`); err != nil {
+		return err
+	}
 	if err := deleteOlder(`DELETE FROM callback_outbox WHERE status IN ('delivered','dead_letter') AND created_at<?`, cfg.HostingCallbackRetentionDays); err != nil {
 		return err
 	}
@@ -162,5 +208,37 @@ func cleanupHostingRecords(ctx context.Context, cfg AppConfig, now time.Time) er
 	if _, err := tx.ExecContext(ctx, `DELETE FROM hosting_idempotency WHERE expires_at<?`, formatSQLiteTime(now)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, path := range orphanArtifacts {
+		removeManagedArtifact(path)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	runnerRows, err := conn.QueryContext(ctx, `SELECT id FROM hosting_runners`)
+	if err != nil {
+		return err
+	}
+	var runnerIDs []int64
+	for runnerRows.Next() {
+		var id int64
+		if err := runnerRows.Scan(&id); err != nil {
+			runnerRows.Close()
+			return err
+		}
+		runnerIDs = append(runnerIDs, id)
+	}
+	if err := runnerRows.Close(); err != nil {
+		return err
+	}
+	for _, id := range runnerIDs {
+		if err := recomputeHostingRunnerCapacity(ctx, conn, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }

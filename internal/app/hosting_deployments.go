@@ -42,21 +42,21 @@ type hostingWorkloadLimits struct {
 }
 
 type hostingJobRecipe struct {
-	Operation             string                    `json:"operation"`
-	SchemaVersion         string                    `json:"schema_version"`
-	ExternalProjectID     string                    `json:"external_project_id"`
-	ExternalDeploymentID  string                    `json:"external_deployment_id"`
-	Repository            HostingRepositoryManifest `json:"repository"`
-	CommitSHA             string                    `json:"commit_sha"`
-	ManifestDigest        string                    `json:"manifest_digest"`
-	ArtifactDigest        string                    `json:"artifact_digest"`
-	Runtime               HostingRuntimeManifest    `json:"runtime"`
-	Limits                hostingWorkloadLimits     `json:"limits"`
-	ReleaseRoot           string                    `json:"release_root"`
-	SourceArtifactURL     string                    `json:"source_artifact_url"`
-	ReleaseDigest         string                    `json:"release_digest,omitempty"`
-	ReleaseArtifactDigest string                    `json:"release_artifact_digest,omitempty"`
-	ReleaseArtifactURL    string                    `json:"release_artifact_url,omitempty"`
+	Operation             string                     `json:"operation"`
+	SchemaVersion         string                     `json:"schema_version"`
+	ExternalProjectID     string                     `json:"external_project_id"`
+	ExternalDeploymentID  string                     `json:"external_deployment_id"`
+	Repository            *HostingRepositoryManifest `json:"repository,omitempty"`
+	CommitSHA             string                     `json:"commit_sha,omitempty"`
+	ManifestDigest        string                     `json:"manifest_digest,omitempty"`
+	ArtifactDigest        string                     `json:"artifact_digest,omitempty"`
+	Runtime               HostingRuntimeManifest     `json:"runtime"`
+	Limits                hostingWorkloadLimits      `json:"limits"`
+	ReleaseRoot           string                     `json:"release_root,omitempty"`
+	SourceArtifactURL     string                     `json:"source_artifact_url,omitempty"`
+	ReleaseDigest         string                     `json:"release_digest,omitempty"`
+	ReleaseArtifactDigest string                     `json:"release_artifact_digest,omitempty"`
+	ReleaseArtifactURL    string                     `json:"release_artifact_url,omitempty"`
 }
 
 type hostingCreateResult struct {
@@ -257,7 +257,7 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 	if err != nil {
 		return nil, err
 	}
-	runnerID, err := reserveHostingRunner(ctx, conn, project, limits)
+	runnerID, err := reserveHostingRunner(ctx, conn, project, limits, "build", 0)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +285,7 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 		SchemaVersion:        hostingRunnerProtocolVersion,
 		ExternalProjectID:    project.ExternalProjectID,
 		ExternalDeploymentID: request.ExternalDeploymentID,
-		Repository:           project.Manifest.Repository,
+		Repository:           &project.Manifest.Repository,
 		CommitSHA:            request.CommitSHA,
 		ManifestDigest:       request.ManifestDigest,
 		ArtifactDigest:       request.ArtifactDigest,
@@ -424,16 +424,16 @@ func findHostingIdempotencyReplay(ctx context.Context, conn *sql.Conn, issuerID 
 	return &hostingCreateResult{Deployment: &deployment, StatusCode: int(status.Int64), Replayed: true}, nil
 }
 
-func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingProjectState, limits hostingWorkloadLimits) (int64, error) {
+func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingProjectState, limits hostingWorkloadLimits, operation string, excludedRunnerID int64) (int64, error) {
 	cutoff := formatSQLiteTime(time.Now().UTC().Add(-hostingRunnerStaleAfter))
-	rows, err := conn.QueryContext(ctx, `SELECT id, manifest_versions_json, runtime_versions_json
+	rows, err := conn.QueryContext(ctx, `SELECT id, manifest_versions_json, runtime_versions_json, operation_capabilities_json
 		FROM hosting_runners
-		WHERE execution_class='hosting' AND status='online' AND draining=0 AND last_seen>=?
+		WHERE execution_class='hosting' AND status='online' AND draining=0 AND last_seen>=? AND id<>?
 		  AND free_cpu_millis-reserve_cpu_millis>=?
 		  AND free_ram_bytes-reserve_ram_bytes>=?
 		  AND free_disk_bytes-reserve_disk_bytes>=?
 		  AND free_pids-reserve_pids>=?
-		ORDER BY free_cpu_millis DESC, id`, cutoff, limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs)
+		ORDER BY free_cpu_millis DESC, id`, cutoff, excludedRunnerID, limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs)
 	if err != nil {
 		return 0, err
 	}
@@ -441,11 +441,13 @@ func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingP
 	var selected int64
 	for rows.Next() {
 		var id int64
-		var manifestsJSON, runtimesJSON string
-		if err := rows.Scan(&id, &manifestsJSON, &runtimesJSON); err != nil {
+		var manifestsJSON, runtimesJSON, operationsJSON string
+		if err := rows.Scan(&id, &manifestsJSON, &runtimesJSON, &operationsJSON); err != nil {
 			return 0, err
 		}
-		if jsonStringListContains(manifestsJSON, project.Manifest.SchemaVersion) && jsonStringListContains(runtimesJSON, project.Manifest.Runtime.NodeVersion) {
+		if jsonStringListContains(manifestsJSON, project.Manifest.SchemaVersion) &&
+			jsonStringListContains(runtimesJSON, project.Manifest.Runtime.NodeVersion) &&
+			jsonStringListContains(operationsJSON, operation) {
 			selected = id
 			break
 		}

@@ -230,5 +230,66 @@ func cancelHostingJobsForKillSwitch(ctx context.Context, conn *sql.Conn, project
 			return err
 		}
 	}
+	return cancelHostingRuntimeRecoveries(ctx, conn, projectID, reason, now)
+}
+
+func cancelHostingRuntimeRecoveries(ctx context.Context, conn *sql.Conn, projectID sql.NullInt64, reason string, now time.Time) error {
+	query := `SELECT recovery.id, release.hosting_project_id, release.hosting_deployment_id,
+		recovery.hosting_runner_id, recovery.status, recovery.required_cpu_millis,
+		recovery.required_ram_bytes, recovery.required_disk_bytes, recovery.required_pids
+		FROM hosting_runtime_recoveries recovery
+		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
+		WHERE recovery.status IN ('queued','leased','running')`
+	var args []any
+	if projectID.Valid {
+		query += ` AND release.hosting_project_id=?`
+		args = append(args, projectID.Int64)
+	}
+	rows, err := conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	type recoveryState struct {
+		id, projectID, deploymentID int64
+		runnerID                    sql.NullInt64
+		status                      string
+		limits                      hostingWorkloadLimits
+	}
+	var recoveries []recoveryState
+	for rows.Next() {
+		var recovery recoveryState
+		if err := rows.Scan(&recovery.id, &recovery.projectID, &recovery.deploymentID,
+			&recovery.runnerID, &recovery.status, &recovery.limits.CPUMillis,
+			&recovery.limits.RAMBytes, &recovery.limits.DiskBytes, &recovery.limits.PIDs); err != nil {
+			rows.Close()
+			return err
+		}
+		recoveries = append(recoveries, recovery)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, recovery := range recoveries {
+		if recovery.status == "queued" {
+			if recovery.runnerID.Valid {
+				if err := restoreHostingRunnerCapacity(ctx, conn, recovery.runnerID.Int64, recovery.limits); err != nil {
+					return err
+				}
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET status='cancelled',
+				cancel_requested_at=?, completed_at=?, hosting_runner_id=NULL WHERE id=? AND status='queued'`,
+				formatSQLiteTime(now), formatSQLiteTime(now), recovery.id); err != nil {
+				return err
+			}
+		} else if _, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET cancel_requested_at=?
+			WHERE id=? AND status IN ('leased','running')`, formatSQLiteTime(now), recovery.id); err != nil {
+			return err
+		}
+		if err := recordHostingEvent(ctx, conn, recovery.projectID, recovery.deploymentID,
+			"runtime_recovery_cancellation_requested", hostingPhaseCancelling, "cancelled",
+			map[string]any{"reason": redactSecrets(reason)}, now); err != nil {
+			return err
+		}
+	}
 	return nil
 }

@@ -20,23 +20,40 @@ import (
 )
 
 type fakeProxyClient struct {
-	mu          sync.Mutex
-	activations []proxyActivationRequest
-	suspensions []proxySuspendRequest
-	fail        bool
-	reject      bool
+	mu               sync.Mutex
+	activations      []proxyActivationRequest
+	suspensions      []proxySuspendRequest
+	fail             bool
+	reject           bool
+	activateStarted  chan struct{}
+	activateContinue chan struct{}
+	suspendedOps     map[string]struct{}
+	currentSuspended bool
+	currentEndpoint  string
 }
 
 func (fake *fakeProxyClient) Activate(_ context.Context, request proxyActivationRequest) (*proxyActivationResponse, error) {
 	fake.mu.Lock()
-	defer fake.mu.Unlock()
 	fake.activations = append(fake.activations, request)
-	if fake.fail {
+	fail := fake.fail
+	reject := fake.reject
+	started := fake.activateStarted
+	continued := fake.activateContinue
+	fake.mu.Unlock()
+	if started != nil {
+		started <- struct{}{}
+		<-continued
+	}
+	if fail {
 		return nil, errors.New("adapter unavailable")
 	}
-	if fake.reject {
+	if reject {
 		return nil, &hostingAPIError{Code: errCodeProxyRejected, Message: "adapter rejected activation", StatusCode: http.StatusBadGateway}
 	}
+	fake.mu.Lock()
+	fake.currentSuspended = false
+	fake.currentEndpoint = request.RuntimeEndpoint
+	fake.mu.Unlock()
 	return &proxyActivationResponse{RouteRevision: "route-rev-" + request.ReleaseDigest[len(request.ReleaseDigest)-8:], ActiveReleaseDigest: request.ReleaseDigest}, nil
 }
 
@@ -47,6 +64,14 @@ func (fake *fakeProxyClient) SetSuspended(_ context.Context, request proxySuspen
 	if fake.fail {
 		return errors.New("adapter unavailable")
 	}
+	if fake.suspendedOps == nil {
+		fake.suspendedOps = make(map[string]struct{})
+	}
+	if _, alreadyApplied := fake.suspendedOps[request.OperationID]; alreadyApplied {
+		return nil
+	}
+	fake.suspendedOps[request.OperationID] = struct{}{}
+	fake.currentSuspended = request.Suspended
 	return nil
 }
 
@@ -190,6 +215,630 @@ func TestHostingHeartbeatCannotEraseOutstandingReservations(t *testing.T) {
 	}
 	if freeCPU != capacity.CPUMillis-limits.CPUMillis {
 		t.Fatalf("heartbeat erased reservation: free=%d", freeCPU)
+	}
+}
+
+func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	_, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRESTORX", "deployment_01JRESTORX")
+	releaseDigest := "sha256:" + strings.Repeat("6", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
+	completion := hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
+		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.70.0.1:3000",
+		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1), "status_code": float64(200)}}
+	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile("starter")
+	capacity := hostingWorkloadLimits{CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
+		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2}
+	recoveryRunnerID := insertHostingRunnerForTest(t, "runtime-recovery-target", capacity)
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build"]' WHERE id=?`, recoveryRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=? WHERE id=?`,
+		formatSQLiteTime(time.Now().UTC().Add(-2*hostingRunnerStaleAfter)), lostRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var assignedRecoveryRunner sql.NullInt64
+	if err := db.QueryRow(`SELECT hosting_runner_id FROM hosting_runtime_recoveries`).Scan(&assignedRecoveryRunner); err != nil {
+		t.Fatal(err)
+	}
+	if assignedRecoveryRunner.Valid {
+		t.Fatalf("build-only runner received restore placement: %v", assignedRecoveryRunner)
+	}
+	if _, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID); !errors.Is(err, errNoHostingJob) {
+		t.Fatalf("build-only runner claimed recovery: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, recoveryRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT hosting_runner_id FROM hosting_runtime_recoveries`).Scan(&assignedRecoveryRunner); err != nil {
+		t.Fatal(err)
+	}
+	if !assignedRecoveryRunner.Valid || assignedRecoveryRunner.Int64 != recoveryRunnerID {
+		t.Fatalf("restore-capable runner was not assigned: %v", assignedRecoveryRunner)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build"]' WHERE id=?`, recoveryRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT hosting_runner_id FROM hosting_runtime_recoveries`).Scan(&assignedRecoveryRunner); err != nil {
+		t.Fatal(err)
+	}
+	var unassignedFreeCPU int64
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, recoveryRunnerID).Scan(&unassignedFreeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if assignedRecoveryRunner.Valid || unassignedFreeCPU != capacity.CPUMillis {
+		t.Fatalf("incompatible queued assignment was not released: runner=%v free CPU=%d", assignedRecoveryRunner, unassignedFreeCPU)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, recoveryRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	oldCapacity := capacityDTO{CPUMillis: limits.CPUMillis * 3, RAMBytes: limits.RAMBytes * 3,
+		DiskBytes: limits.DiskBytes * 3, PIDs: limits.PIDs * 3}
+	heartbeatBody, _ := json.Marshal(hostingHeartbeatRequest{Free: oldCapacity, ProtocolVersion: "v1",
+		ManifestVersions: []string{"v1"}, RuntimeVersions: []string{"20", "22"},
+		Operations: []string{"build", "restore"}})
+	heartbeatRequest := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/heartbeat", bytes.NewReader(heartbeatBody))
+	heartbeatRequest.Header.Set("Content-Type", "application/json")
+	heartbeatRequest = heartbeatRequest.WithContext(context.WithValue(heartbeatRequest.Context(),
+		hostingRunnerContextKey{}, &HostingRunner{ID: lostRunnerID}))
+	heartbeatRecorder := httptest.NewRecorder()
+	handleHostingAgentHeartbeat(heartbeatRecorder, heartbeatRequest)
+	if heartbeatRecorder.Code != http.StatusOK {
+		t.Fatalf("returning runner heartbeat status=%d body=%s", heartbeatRecorder.Code, heartbeatRecorder.Body.String())
+	}
+	var oldFreeCPU int64
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, lostRunnerID).Scan(&oldFreeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if oldFreeCPU != oldCapacity.CPUMillis-limits.CPUMillis {
+		t.Fatalf("returning runner lost active runtime reservation: free CPU=%d", oldFreeCPU)
+	}
+	recovery, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID)
+	if err != nil {
+		t.Fatalf("claim runtime recovery: %v", err)
+	}
+	if recovery.Recipe.Operation != "restore" || recovery.Recipe.ReleaseDigest != releaseDigest ||
+		recovery.Recipe.ReleaseArtifactDigest != artifactDigest {
+		t.Fatalf("recovery recipe = %+v", recovery.Recipe)
+	}
+	encodedRecipe, err := json.Marshal(recovery.Recipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, buildOnlyField := range []string{`"repository"`, `"commit_sha"`, `"manifest_digest"`,
+		`"artifact_digest"`, `"release_root"`, `"source_artifact_url"`} {
+		if bytes.Contains(encodedRecipe, []byte(buildOnlyField)) {
+			t.Fatalf("restore recipe contains build-only field %s: %s", buildOnlyField, encodedRecipe)
+		}
+	}
+	artifactRequest := httptest.NewRequest(http.MethodGet, recovery.Recipe.ReleaseArtifactURL, nil)
+	artifactRequest.Header.Set("X-Deployer-Lease-Generation", fmt.Sprint(recovery.LeaseGeneration))
+	artifactRequest.Header.Set("X-Deployer-Lease-Token", recovery.LeaseToken)
+	artifactRequest = artifactRequest.WithContext(context.WithValue(artifactRequest.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: recoveryRunnerID}))
+	artifactRecorder := httptest.NewRecorder()
+	handleHostingRecoveryArtifact(artifactRecorder, artifactRequest, recovery.JobID)
+	if artifactRecorder.Code != http.StatusOK || artifactRecorder.Header().Get("X-Deployer-Artifact-Digest") != artifactDigest {
+		t.Fatalf("recovery artifact status=%d digest=%q", artifactRecorder.Code, artifactRecorder.Header().Get("X-Deployer-Artifact-Digest"))
+	}
+	artifactContent := append([]byte(nil), artifactRecorder.Body.Bytes()...)
+	var artifactPath string
+	if err := db.QueryRow(`SELECT artifact_path FROM hosting_release_artifacts WHERE artifact_digest=?`, artifactDigest).Scan(&artifactPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(artifactPath); err != nil {
+		t.Fatal(err)
+	}
+	missingRequest := httptest.NewRequest(http.MethodGet, recovery.Recipe.ReleaseArtifactURL, nil)
+	missingRequest.Header.Set("X-Deployer-Lease-Generation", fmt.Sprint(recovery.LeaseGeneration))
+	missingRequest.Header.Set("X-Deployer-Lease-Token", recovery.LeaseToken)
+	missingRequest = missingRequest.WithContext(context.WithValue(missingRequest.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: recoveryRunnerID}))
+	missingRecorder := httptest.NewRecorder()
+	handleHostingRecoveryArtifact(missingRecorder, missingRequest, recovery.JobID)
+	if missingRecorder.Code != http.StatusNotFound {
+		t.Fatalf("missing recovery artifact status=%d body=%s", missingRecorder.Code, missingRecorder.Body.String())
+	}
+	if err := os.WriteFile(artifactPath, artifactContent, 0600); err != nil {
+		t.Fatal(err)
+	}
+	restored := hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
+		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.70.0.2:3000",
+		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(2), "status_code": float64(200)}}
+	if err := completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, recovery.JobID,
+		recovery.LeaseGeneration, recovery.LeaseToken, restored); err != nil {
+		t.Fatalf("complete runtime recovery: %v", err)
+	}
+	if err := completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, recovery.JobID,
+		recovery.LeaseGeneration, recovery.LeaseToken, restored); err != nil {
+		t.Fatalf("duplicate recovery completion: %v", err)
+	}
+	conflicting := restored
+	conflicting.RuntimeEndpoint = "http://10.70.0.3:3000"
+	err = completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, recovery.JobID,
+		recovery.LeaseGeneration, recovery.LeaseToken, conflicting)
+	var conflict *hostingAPIError
+	if !errors.As(err, &conflict) || conflict.Code != errCodeIdempotencyConflict {
+		t.Fatalf("conflicting terminal recovery completion was accepted: %v", err)
+	}
+	var releaseRunnerID, generation int64
+	var endpoint, recoveryStatus string
+	if err := db.QueryRow(`SELECT runtime_runner_id, runtime_generation, runtime_endpoint
+		FROM hosting_releases WHERE release_digest=?`, releaseDigest).Scan(&releaseRunnerID, &generation, &endpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_runtime_recoveries WHERE id=?`, recovery.JobID).Scan(&recoveryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if releaseRunnerID != recoveryRunnerID || generation != 2 || endpoint != restored.RuntimeEndpoint || recoveryStatus != "succeeded" {
+		t.Fatalf("restored release runner=%d generation=%d endpoint=%q recovery=%q", releaseRunnerID, generation, endpoint, recoveryStatus)
+	}
+	var oldJobStatus string
+	if err := db.QueryRow(`SELECT status FROM hosting_jobs WHERE id=?`, job.JobID).Scan(&oldJobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if oldJobStatus != "succeeded" {
+		t.Fatalf("immutable build outcome changed after runtime move: %q", oldJobStatus)
+	}
+	var freeCPU int64
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, recoveryRunnerID).Scan(&freeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if freeCPU != capacity.CPUMillis-limits.CPUMillis {
+		t.Fatalf("recovery reservation free CPU=%d", freeCPU)
+	}
+	if _, err := db.Exec(`INSERT INTO hosting_runtime_recoveries
+		(hosting_release_id, hosting_runner_id, status, lease_generation, lease_token_hash,
+		 attempts, required_cpu_millis, required_ram_bytes, required_disk_bytes, required_pids,
+		 created_at, completed_at)
+		SELECT id, ?, 'succeeded', 77, '', 1, ?, ?, ?, ?, ?, ?
+		FROM hosting_releases WHERE release_digest=?`, recoveryRunnerID, limits.CPUMillis,
+		limits.RAMBytes, limits.DiskBytes, limits.PIDs, formatSQLiteTime(time.Now().UTC()),
+		formatSQLiteTime(time.Now().UTC()), releaseDigest); err != nil {
+		t.Fatalf("insert historical recovery: %v", err)
+	}
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recomputeHostingRunnerCapacity(t.Context(), conn, recoveryRunnerID); err != nil {
+		conn.Close()
+		t.Fatalf("recompute capacity with multi-hop history: %v", err)
+	}
+	conn.Close()
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, recoveryRunnerID).Scan(&freeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if freeCPU != capacity.CPUMillis-limits.CPUMillis {
+		t.Fatalf("historical recovery was double-counted: free CPU=%d", freeCPU)
+	}
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, lostRunnerID).Scan(&oldFreeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if oldFreeCPU != oldCapacity.CPUMillis {
+		t.Fatalf("old runner reservation was not transferred after recovery: free CPU=%d", oldFreeCPU)
+	}
+	if len(fake.activations) != 2 || fake.activations[1].ExpectedPreviousReleaseDigest != releaseDigest {
+		t.Fatalf("proxy recoveries = %#v", fake.activations)
+	}
+}
+
+func TestHostingRuntimeRecoveryProxyIntentSurvivesDatabaseRestart(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	healthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer healthServer.Close()
+	_, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRECRST", "deployment_01JRECRST")
+	releaseDigest := "sha256:" + strings.Repeat("5", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
+	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{
+		Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
+		RuntimeEndpoint: "http://10.71.0.1:3000", HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile("starter")
+	recoveryRunnerID := insertHostingRunnerForTest(t, "runtime-restart-target", hostingWorkloadLimits{
+		CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
+		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2,
+	})
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline' WHERE id=?`, lostRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.fail = true
+	err = completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, recovery.JobID,
+		recovery.LeaseGeneration, recovery.LeaseToken, hostingCompletionRequest{
+			Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
+			RuntimeEndpoint: healthServer.URL, HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
+		})
+	if err == nil {
+		t.Fatal("proxy outage did not interrupt recovery completion")
+	}
+	var operationStatus string
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE hosting_runtime_recovery_id=?`, recovery.JobID).Scan(&operationStatus); err != nil || operationStatus != "pending" {
+		t.Fatalf("durable recovery proxy intent status=%q err=%v", operationStatus, err)
+	}
+	heartbeatBody, _ := json.Marshal(hostingHeartbeatRequest{Free: capacityDTO{
+		CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
+		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2,
+	}, ProtocolVersion: "v1", ManifestVersions: []string{"v1"}, RuntimeVersions: []string{"20", "22"},
+		Operations: []string{"build", "restore"}})
+	heartbeatRequest := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/heartbeat", bytes.NewReader(heartbeatBody))
+	heartbeatRequest.Header.Set("Content-Type", "application/json")
+	heartbeatRequest = heartbeatRequest.WithContext(context.WithValue(heartbeatRequest.Context(),
+		hostingRunnerContextKey{}, &HostingRunner{ID: recoveryRunnerID}))
+	heartbeatRecorder := httptest.NewRecorder()
+	handleHostingAgentHeartbeat(heartbeatRecorder, heartbeatRequest)
+	if heartbeatRecorder.Code != http.StatusOK {
+		t.Fatalf("recovery candidate heartbeat status=%d body=%s", heartbeatRecorder.Code, heartbeatRecorder.Body.String())
+	}
+	var heartbeat hostingHeartbeatResponse
+	if err := json.NewDecoder(heartbeatRecorder.Body).Decode(&heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if len(heartbeat.RetainedReleases) != 1 || heartbeat.RetainedReleases[0].RuntimeInstanceID != fmt.Sprintf("restore-%d-%d", recovery.JobID, recovery.LeaseGeneration) {
+		t.Fatalf("pending recovery was not retained: %+v", heartbeat.RetainedReleases)
+	}
+	var sequence int
+	var databaseName, databasePath string
+	if err := db.QueryRow(`PRAGMA database_list`).Scan(&sequence, &databaseName, &databasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	fake.fail = false
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var recoveryStatus, endpoint string
+	if err := db.QueryRow(`SELECT status, runtime_endpoint FROM hosting_runtime_recoveries WHERE id=?`, recovery.JobID).Scan(&recoveryStatus, &endpoint); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryStatus != "succeeded" || endpoint != healthServer.URL {
+		t.Fatalf("reconciled recovery status=%q endpoint=%q", recoveryStatus, endpoint)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE hosting_runtime_recovery_id=?`, recovery.JobID).Scan(&operationStatus); err != nil || operationStatus != "committed" {
+		t.Fatalf("reconciled operation status=%q err=%v", operationStatus, err)
+	}
+}
+
+func TestHostingRuntimeRecoveryProxyIntentFencesConcurrentFailure(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	_, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRECRCE", "deployment_01JRECRCE")
+	releaseDigest := "sha256:" + strings.Repeat("b", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
+	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.71.1.1:3000",
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile("starter")
+	recoveryRunnerID := insertHostingRunnerForTest(t, "runtime-race-target", hostingWorkloadLimits{
+		CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
+		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2,
+	})
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline' WHERE id=?`, lostRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.activateStarted = make(chan struct{}, 2)
+	fake.activateContinue = make(chan struct{})
+	successResult := make(chan error, 2)
+	for range 2 {
+		go func() {
+			successResult <- completeHostingRuntimeRecovery(context.Background(), recoveryRunnerID, recovery.JobID,
+				recovery.LeaseGeneration, recovery.LeaseToken, hostingCompletionRequest{Status: "success",
+					ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
+					RuntimeEndpoint: "http://10.71.1.2:3000",
+					HealthEvidence:  map[string]any{"healthy": true, "attempts": float64(1)}})
+		}()
+	}
+	<-fake.activateStarted
+	<-fake.activateStarted
+	failureErr := completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, recovery.JobID,
+		recovery.LeaseGeneration, recovery.LeaseToken, hostingCompletionRequest{
+			Status: "failed", FailureCode: "runtime_start_failed", FailureMessage: "late failure",
+		})
+	var completionConflict *hostingAPIError
+	if !errors.As(failureErr, &completionConflict) || completionConflict.Code != errCodeIdempotencyConflict {
+		close(fake.activateContinue)
+		t.Fatalf("concurrent failure was not fenced: %v", failureErr)
+	}
+	close(fake.activateContinue)
+	for range 2 {
+		if err := <-successResult; err != nil {
+			t.Fatalf("idempotent concurrent success completion: %v", err)
+		}
+	}
+	var recoveryStatus, operationStatus string
+	if err := db.QueryRow(`SELECT status FROM hosting_runtime_recoveries WHERE id=?`, recovery.JobID).Scan(&recoveryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE hosting_runtime_recovery_id=?`, recovery.JobID).Scan(&operationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryStatus != "succeeded" || operationStatus != "committed" {
+		t.Fatalf("recovery=%q operation=%q", recoveryStatus, operationStatus)
+	}
+}
+
+func TestExpiredHostingRuntimeRecoveryLeaseIsReassignedAndFenced(t *testing.T) {
+	withTempDB(t)
+	withFakeProxy(t)
+	_, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRCFENC", "deployment_01JRCFENC")
+	releaseDigest := "sha256:" + strings.Repeat("4", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
+	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{
+		Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
+		RuntimeEndpoint: "http://10.72.0.1:3000", HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile("starter")
+	recoveryRunnerID := insertHostingRunnerForTest(t, "runtime-fencing-target", hostingWorkloadLimits{
+		CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
+		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2,
+	})
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline' WHERE id=?`, lostRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runtime_recoveries SET lease_expires_at=?,
+		completion_fingerprint='crash-window-fingerprint' WHERE id=?`,
+		formatSQLiteTime(time.Now().UTC().Add(-time.Minute)), first.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.JobID != first.JobID || second.LeaseGeneration != first.LeaseGeneration+1 || second.LeaseToken == first.LeaseToken {
+		t.Fatalf("reassigned recovery first=%+v second=%+v", first, second)
+	}
+	err = completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, first.JobID,
+		first.LeaseGeneration, first.LeaseToken, hostingCompletionRequest{Status: "failed", FailureCode: "runner_lost"})
+	var apiErr *hostingAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeJobForbidden {
+		t.Fatalf("stale recovery completion was not fenced: %v", err)
+	}
+	failedCompletion := hostingCompletionRequest{Status: "failed", FailureCode: "runtime_start_failed",
+		FailureMessage: "retryable start failure"}
+	startFailures := make(chan struct{})
+	failureResults := make(chan error, 8)
+	for range 8 {
+		go func() {
+			<-startFailures
+			failureResults <- completeHostingRuntimeRecovery(context.Background(), recoveryRunnerID,
+				second.JobID, second.LeaseGeneration, second.LeaseToken, failedCompletion)
+		}()
+	}
+	close(startFailures)
+	for range 8 {
+		if err := <-failureResults; err != nil {
+			t.Fatalf("concurrent retryable recovery failure: %v", err)
+		}
+	}
+	if err := completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, second.JobID,
+		second.LeaseGeneration, second.LeaseToken, failedCompletion); err != nil {
+		t.Fatalf("replay accepted retryable recovery failure: %v", err)
+	}
+	conflictingFailure := failedCompletion
+	conflictingFailure.FailureCode = "health_check_failed"
+	err = completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, second.JobID,
+		second.LeaseGeneration, second.LeaseToken, conflictingFailure)
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeIdempotencyConflict {
+		t.Fatalf("conflicting accepted retryable failure was not fenced: %v", err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	third, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID)
+	if err != nil {
+		t.Fatalf("claim recovery after failed generation: %v", err)
+	}
+	if third.LeaseGeneration != second.LeaseGeneration+1 {
+		t.Fatalf("retry generation=%d want=%d", third.LeaseGeneration, second.LeaseGeneration+1)
+	}
+	if err := completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, third.JobID,
+		third.LeaseGeneration, third.LeaseToken, hostingCompletionRequest{Status: "success",
+			ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
+			RuntimeEndpoint: "http://10.72.0.2:3000",
+			HealthEvidence:  map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatalf("complete recovery after failed generation: %v", err)
+	}
+}
+
+func TestHostingRuntimeRecoveryHonorsDurableProjectSuspension(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRCSUSP", "deployment_01JRCSUSP")
+	releaseDigest := "sha256:" + strings.Repeat("3", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
+	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{
+		Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
+		RuntimeEndpoint: "http://10.73.0.1:3000", HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile("starter")
+	capacity := hostingWorkloadLimits{CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
+		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2}
+	recoveryRunnerID := insertHostingRunnerForTest(t, "runtime-suspend-target", capacity)
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline' WHERE id=?`, lostRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
+		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.73.0.2:3000",
+		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}
+	fake.activateStarted = make(chan struct{}, 1)
+	fake.activateContinue = make(chan struct{})
+	completionResult := make(chan error, 1)
+	go func() {
+		completionResult <- completeHostingRuntimeRecovery(context.Background(), recoveryRunnerID, recovery.JobID,
+			recovery.LeaseGeneration, recovery.LeaseToken, restored)
+	}()
+	<-fake.activateStarted
+	operator, err := createServiceToken("runtime-recovery-suspender", []string{serviceScopeProjectsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := setHostingProjectDesiredState(t.Context(), operator, project.ExternalProjectID,
+		"suspended", "suspend_runtime_recovery_01"); err != nil {
+		t.Fatal(err)
+	}
+	var cancelRequested sql.NullString
+	if err := db.QueryRow(`SELECT cancel_requested_at FROM hosting_runtime_recoveries WHERE id=?`, recovery.JobID).Scan(&cancelRequested); err != nil || !cancelRequested.Valid {
+		t.Fatalf("recovery cancellation intent valid=%v err=%v", cancelRequested.Valid, err)
+	}
+	if err := reconcileHostingRecoveryProxyOperations(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := setHostingProjectDesiredState(t.Context(), operator, project.ExternalProjectID,
+		"active", "resume_runtime_recovery_01"); err != nil {
+		t.Fatal(err)
+	}
+	close(fake.activateContinue)
+	var fenced *hostingAPIError
+	if err := <-completionResult; !errors.As(err, &fenced) || fenced.Code != errCodeProjectSuspended {
+		t.Fatalf("in-flight activation was not fenced and compensated: %v", err)
+	}
+	if err := completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, recovery.JobID,
+		recovery.LeaseGeneration, recovery.LeaseToken, restored); err != nil {
+		t.Fatalf("terminal recovery replay after cancellation: %v", err)
+	}
+	var status string
+	var operationStatus string
+	var freeCPU int64
+	if err := db.QueryRow(`SELECT status FROM hosting_runtime_recoveries WHERE id=?`, recovery.JobID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, recoveryRunnerID).Scan(&freeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE hosting_runtime_recovery_id=?`,
+		recovery.JobID).Scan(&operationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if status != "cancelled" || operationStatus != "failed" || freeCPU != capacity.CPUMillis {
+		t.Fatalf("cancelled recovery status=%q operation=%q free CPU=%d", status, operationStatus, freeCPU)
+	}
+	if len(fake.activations) != 3 || fake.activations[2].RuntimeEndpoint != "http://10.73.0.1:3000" ||
+		len(fake.suspensions) < 3 || fake.suspensions[len(fake.suspensions)-1].Suspended ||
+		fake.activations[2].OperationID == fake.suspensions[1].OperationID || fake.currentSuspended ||
+		fake.currentEndpoint != "http://10.73.0.1:3000" {
+		t.Fatalf("late recovery activation=%#v suspensions=%#v", fake.activations, fake.suspensions)
+	}
+}
+
+func TestHostingRuntimeLossWithSecretReferencesFailsClosed(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	_, _, lostRunnerID, job := createAndClaimHostingJob(t, "project_01JRECSEC", "deployment_01JRECSEC")
+	releaseDigest := "sha256:" + strings.Repeat("c", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
+	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
+		hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.73.1.1:3000",
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	secretReference := "opaque-reference-that-must-not-leak"
+	encodedSecrets, err := json.Marshal([]HostingSecretReference{{Provider: "control-plane",
+		Reference: secretReference, ExpiresAt: time.Now().UTC().Add(time.Minute)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_jobs SET secret_refs_json=? WHERE id=?`, string(encodedSecrets), job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=? WHERE id=?`,
+		formatSQLiteTime(time.Now().UTC().Add(-2*hostingRunnerStaleAfter)), lostRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var releaseStatus string
+	var releaseRunner sql.NullInt64
+	if err := db.QueryRow(`SELECT status, runtime_runner_id FROM hosting_releases WHERE release_digest=?`,
+		releaseDigest).Scan(&releaseStatus, &releaseRunner); err != nil {
+		t.Fatal(err)
+	}
+	var recoveryCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_runtime_recoveries`).Scan(&recoveryCount); err != nil {
+		t.Fatal(err)
+	}
+	var eventCode string
+	var eventMetadata string
+	if err := db.QueryRow(`SELECT failure_code, metadata_json FROM hosting_events
+		WHERE event_type='runtime_recovery_unavailable' ORDER BY id DESC LIMIT 1`).Scan(&eventCode, &eventMetadata); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JRECSEC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if releaseStatus != "failed" || releaseRunner.Valid || recoveryCount != 0 ||
+		eventCode != "secret_reference_unavailable" || deployment.RuntimeStatus != "unavailable" {
+		t.Fatalf("release=%q runner=%v recoveries=%d event=%q deployment=%+v",
+			releaseStatus, releaseRunner, recoveryCount, eventCode, deployment)
+	}
+	if strings.Contains(eventMetadata, secretReference) || len(fake.suspensions) != 1 || !fake.suspensions[0].Suspended {
+		t.Fatalf("secret leaked or route remained active: metadata=%q suspensions=%#v", eventMetadata, fake.suspensions)
 	}
 }
 
@@ -799,6 +1448,18 @@ func TestHostingRunnerCredentialsAreSeparateHashedAndAudited(t *testing.T) {
 	}
 	if !strings.HasPrefix(runner.Token, "htr_") {
 		t.Fatalf("token = %q", runner.Token)
+	}
+	if len(runner.Operations) != 1 || runner.Operations[0] != "build" {
+		t.Fatalf("legacy runner operation default = %#v", runner.Operations)
+	}
+	if _, err := createHostingRunner(t.Context(), hostingRunnerInput{
+		Name: "unsupported-operation-runner", ProtocolVersion: hostingRunnerProtocolVersion,
+		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"20"},
+		Operations: []string{"build", "arbitrary"},
+		Capacity:   capacityDTO{CPUMillis: 2000, RAMBytes: 2 << 30, DiskBytes: 10 << 30, PIDs: 512},
+		Reserve:    capacityDTO{CPUMillis: 250, RAMBytes: 256 << 20, DiskBytes: 1 << 30, PIDs: 32},
+	}, "invalid-runner-operation"); err == nil {
+		t.Fatal("unknown runner operation was accepted")
 	}
 	var storedHash string
 	if err := db.QueryRow(`SELECT token_hash FROM hosting_runners WHERE id=?`, runner.ID).Scan(&storedHash); err != nil {

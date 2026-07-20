@@ -13,7 +13,11 @@ private network.
   hosting-agent work root. Back up the database independently from artifacts.
 - Make exact Git objects available below `DEPLOYER_HOSTING_REPO_ROOT`. The
   control plane provisions repository identity; Deployer derives the local path
-  from `external_project_id` and never accepts a caller-supplied host path.
+  from `external_project_id` and never accepts a caller-supplied host path. This
+  is currently an operator-provided handoff: Deployer does not yet perform an
+  installation-authenticated clone/fetch or prove that the local object belongs
+  to the provisioned repository identity. Do not mark the production source
+  handoff complete until that ownership and retry contract is implemented.
 - Configure `DEPLOYER_PROXY_ADAPTER_URL` and its bearer credential. HTTPS is
   mandatory except for loopback development. Deployer only calls the adapter's
   versioned private activation/suspension API and never writes proxy config.
@@ -101,8 +105,42 @@ phase, logs, heartbeat, or completion after expiry/reassignment. If its
 heartbeat becomes stale, Deployer marks it offline. After a lost lease,
 capacity is restored exactly once and uncancelled work is transactionally
 placed on another compatible runner. After three lost attempts, the deployment
-terminates with `runner_lost` and emits the usual callback. A durable cancel
-intent wins over recovery or a late success.
+terminates with `runner_lost` and emits the usual callback. Cancellation intent
+is durable, but the late adapter-response ordering gap below remains open.
+
+For an already active release, runner loss creates a separate durable recovery
+record. A compatible runner downloads the retained Docker image archive through
+the recovery lease, verifies the archive digest and loaded image ID, starts the
+runtime with the original limits and private bind policy, and reports health
+evidence. Adapter activation is persisted before the external call and is
+reconciled after a Deployer restart. A stale recovery generation is fenced; a
+project suspension or kill switch records durable cancellation intent for
+current recovery work. The remaining late-response correction is not yet a
+durable, revision-ordered adapter saga: an activation returning across a process
+crash or concurrent suspend/resume change can require operator reconciliation.
+Keep cancellation/recovery durability unchecked until adapter-side ordering is
+implemented and tested. If no retained artifact exists or all attempts fail,
+Deployer records a stable failure and stages adapter suspension instead of
+rebuilding untrusted or mutable source.
+
+Restore support is negotiated independently from protocol v1. Older agents
+that omit `operations` remain build-only. Upgrade agents first, verify that
+`restore` is reported by `/api/internal/v1/runners`, and only then rely on
+runtime recovery. Poll `runtime_status` on the original deployment:
+`recovering` identifies an active recovery lease and `unavailable` means the
+retained runtime could not be restored and adapter suspension was staged.
+
+Secret-bearing runtime recovery is not a completed production path. The
+original deployment contract persists opaque references, but there is no
+workload-identity redemption or renewal exchange; recovery therefore fails such
+a release closed before creating a restore lease. Keep the runtime-secret and
+overall runner-recovery TODO items open until that path is implemented and
+tested without plaintext persistence.
+
+Recovery currently detects whole-runner liveness loss. The heartbeat response
+describes what the agent must retain, but the agent does not yet report an
+observed runtime inventory back to Deployer. A missing or crashed container on
+an otherwise online runner therefore remains an open production-path gap.
 
 For an intentional drain, mark the runner draining through its heartbeat
 configuration, wait for current leases to finish, then stop it. For an

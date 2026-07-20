@@ -11,18 +11,19 @@ import (
 )
 
 var allowedHostingFailureCodes = map[string]struct{}{
-	"artifact_digest_mismatch":   {},
-	"artifact_unavailable":       {},
-	"build_failed":               {},
-	"build_timeout":              {},
-	"cancelled":                  {},
-	"health_check_failed":        {},
-	"proxy_activation_failed":    {},
-	"runner_lost":                {},
-	"runtime_start_failed":       {},
-	"release_persistence_failed": {},
-	"source_fetch_failed":        {},
-	"workload_policy_violation":  {},
+	"artifact_digest_mismatch":     {},
+	"artifact_unavailable":         {},
+	"build_failed":                 {},
+	"build_timeout":                {},
+	"cancelled":                    {},
+	"health_check_failed":          {},
+	"proxy_activation_failed":      {},
+	"runner_lost":                  {},
+	"secret_reference_unavailable": {},
+	"runtime_start_failed":         {},
+	"release_persistence_failed":   {},
+	"source_fetch_failed":          {},
+	"workload_policy_violation":    {},
 }
 
 type hostingCompletionState struct {
@@ -354,9 +355,10 @@ func activateHealthyHostingRelease(ctx context.Context, state *hostingCompletion
 		return false, err
 	}
 	result, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision=?, activated_at=?,
-		deactivated_at=NULL, runtime_runner_id=?, runtime_generation=runtime_generation+1
+		deactivated_at=NULL, runtime_runner_id=?, runtime_generation=runtime_generation+1, runtime_instance_id=?
 		WHERE hosting_project_id=? AND hosting_deployment_id=? AND release_digest=? AND status='healthy'`,
-		routeRevision, formatSQLiteTime(now), state.RunnerID, state.ProjectID, state.DeploymentID, releaseDigest)
+		routeRevision, formatSQLiteTime(now), state.RunnerID,
+		fmt.Sprintf("build-%d-%d", state.JobID, state.LeaseGeneration), state.ProjectID, state.DeploymentID, releaseDigest)
 	if err != nil {
 		return false, err
 	}
@@ -508,7 +510,17 @@ func markHostingProxyOperationApplied(ctx context.Context, operationID, routeRev
 	if err != nil {
 		return err
 	}
-	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		var status, storedRevision string
+		if err := db.QueryRowContext(ctx, `SELECT status, route_revision FROM hosting_proxy_operations
+			WHERE operation_id=?`, operationID).Scan(&status, &storedRevision); err != nil {
+			return fmt.Errorf("proxy operation is no longer pending: %w", err)
+		}
+		if status == "committed" && storedRevision == routeRevision {
+			return nil
+		}
 		return fmt.Errorf("proxy operation is no longer pending")
 	}
 	return nil
