@@ -257,7 +257,9 @@ func TestHostingMigrationsCreateDurableLifecycleSchema(t *testing.T) {
 		"hosting_deployments":        {"phase", "failure_code", "cancel_requested_at", "request_hash"},
 		"hosting_idempotency":        {"issuer_token_id", "operation", "request_hash", "response_body"},
 		"hosting_jobs":               {"lease_generation", "lease_expires_at", "cancel_requested_at"},
-		"hosting_releases":           {"health_evidence_json", "route_revision", "runtime_endpoint"},
+		"hosting_releases":           {"health_evidence_json", "route_revision", "runtime_endpoint", "runtime_runner_id", "runtime_generation"},
+		"hosting_runtime_recoveries": {"hosting_release_id", "hosting_runner_id", "lease_generation", "lease_token_hash", "lease_expires_at"},
+		"hosting_proxy_operations":   {"hosting_runtime_recovery_id", "operation_type", "status"},
 		"callback_outbox":            {"event_id", "payload_hash", "next_attempt_at"},
 		"service_token_credentials":  {"token_hash", "expires_at", "revoked_at"},
 		"service_token_audit_events": {"event_type", "actor", "metadata_json"},
@@ -269,7 +271,7 @@ func TestHostingMigrationsCreateDurableLifecycleSchema(t *testing.T) {
 			}
 		}
 	}
-	for _, migrationID := range []string{"017_hosting_lifecycle", "018_hosting_idempotency_events", "019_hosting_runners_jobs", "020_hosting_releases_callbacks", "021_service_credentials_audit", "022_hosting_release_runtime_endpoint", "023_callback_outbox_leases", "024_hosting_job_source_artifact", "025_hosting_audit_events", "026_hosting_recovery_invariants", "027_hosting_release_artifacts"} {
+	for _, migrationID := range []string{"017_hosting_lifecycle", "018_hosting_idempotency_events", "019_hosting_runners_jobs", "020_hosting_releases_callbacks", "021_service_credentials_audit", "022_hosting_release_runtime_endpoint", "023_callback_outbox_leases", "024_hosting_job_source_artifact", "025_hosting_audit_events", "026_hosting_recovery_invariants", "027_hosting_release_artifacts", "028_hosting_runtime_recovery"} {
 		var count int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE id=?`, migrationID).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("migration %s count=%d err=%v", migrationID, count, err)

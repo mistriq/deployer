@@ -5,7 +5,7 @@ The primary agent owns this checklist and updates it only after implementation a
 ## P0 — current WIP stabilization
 
 - [ ] Inventory every current modified/untracked file and classify complete/partial/failing/unrelated without discarding anything.
-- [ ] Repair fresh DB and legacy migration expectations.
+- [x] Repair fresh DB and legacy migration expectations.
 - [ ] Establish green `test`, `race` and `vet` baseline before trusting inherited hosting changes.
 - [ ] Preserve legacy trusted-admin deployment behavior and tests.
 - [ ] Keep `deployer.db.bak-*` untracked and untouched unless the user explicitly decides otherwise.
@@ -68,7 +68,7 @@ The primary agent owns this checklist and updates it only after implementation a
 
 ## Required verification
 
-- [ ] Fresh DB and legacy migration tests.
+- [x] Fresh DB and legacy migration tests.
 - [ ] Auth, scope, rotation, revocation and audit tests.
 - [ ] Idempotency replay and concurrent duplicate tests.
 - [ ] Per-project deployment serialization tests.

@@ -378,6 +378,65 @@ func applyHostingMigrations() error {
 				`CREATE INDEX idx_hosting_releases_content ON hosting_releases(release_digest)`,
 			},
 		},
+		{
+			id: "028_hosting_runtime_recovery",
+			statements: []string{
+				`ALTER TABLE hosting_releases ADD COLUMN runtime_runner_id INTEGER REFERENCES hosting_runners(id) ON DELETE RESTRICT`,
+				`ALTER TABLE hosting_releases ADD COLUMN runtime_generation INTEGER NOT NULL DEFAULT 0`,
+				`UPDATE hosting_releases SET runtime_runner_id=(SELECT hosting_runner_id FROM hosting_jobs
+					WHERE hosting_jobs.hosting_deployment_id=hosting_releases.hosting_deployment_id)
+					WHERE status IN ('healthy','active','inactive')`,
+				`CREATE TABLE hosting_runtime_recoveries (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					hosting_release_id INTEGER NOT NULL REFERENCES hosting_releases(id) ON DELETE CASCADE,
+					hosting_runner_id INTEGER REFERENCES hosting_runners(id) ON DELETE RESTRICT,
+					status TEXT NOT NULL CHECK (status IN ('queued','leased','running','succeeded','failed','cancelled')),
+					lease_generation INTEGER NOT NULL DEFAULT 0,
+					lease_token_hash TEXT NOT NULL DEFAULT '',
+					lease_expires_at DATETIME,
+					attempts INTEGER NOT NULL DEFAULT 0,
+					required_cpu_millis INTEGER NOT NULL,
+					required_ram_bytes INTEGER NOT NULL,
+					required_disk_bytes INTEGER NOT NULL,
+					required_pids INTEGER NOT NULL,
+					cancel_requested_at DATETIME,
+					runtime_endpoint TEXT NOT NULL DEFAULT '',
+					health_evidence_json TEXT NOT NULL DEFAULT '{}',
+					created_at DATETIME NOT NULL,
+					started_at DATETIME,
+					completed_at DATETIME
+				)`,
+				`CREATE UNIQUE INDEX idx_hosting_runtime_recovery_one_active ON hosting_runtime_recoveries(hosting_release_id)
+					WHERE status IN ('queued','leased','running')`,
+				`CREATE INDEX idx_hosting_runtime_recovery_runner ON hosting_runtime_recoveries(hosting_runner_id, status, lease_expires_at)`,
+				`ALTER TABLE hosting_proxy_operations RENAME TO hosting_proxy_operations_pre_recovery`,
+				`CREATE TABLE hosting_proxy_operations (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					operation_id TEXT NOT NULL UNIQUE,
+					hosting_project_id INTEGER NOT NULL REFERENCES hosting_projects(id) ON DELETE RESTRICT,
+					hosting_deployment_id INTEGER REFERENCES hosting_deployments(id) ON DELETE RESTRICT,
+					hosting_runtime_recovery_id INTEGER REFERENCES hosting_runtime_recoveries(id) ON DELETE RESTRICT,
+					operation_type TEXT NOT NULL CHECK (operation_type IN ('activate','suspend','resume','rollback','compensate','recover')),
+					release_digest TEXT NOT NULL DEFAULT '',
+					runtime_endpoint TEXT NOT NULL DEFAULT '',
+					expected_previous_release_digest TEXT NOT NULL DEFAULT '',
+					status TEXT NOT NULL CHECK (status IN ('pending','applied','committed','failed')),
+					route_revision TEXT NOT NULL DEFAULT '',
+					last_error_code TEXT NOT NULL DEFAULT '',
+					created_at DATETIME NOT NULL,
+					updated_at DATETIME NOT NULL
+				)`,
+				`INSERT INTO hosting_proxy_operations
+					(id, operation_id, hosting_project_id, hosting_deployment_id, operation_type, release_digest,
+					 runtime_endpoint, expected_previous_release_digest, status, route_revision, last_error_code,
+					 created_at, updated_at)
+				 SELECT id, operation_id, hosting_project_id, hosting_deployment_id, operation_type, release_digest,
+					runtime_endpoint, expected_previous_release_digest, status, route_revision, last_error_code,
+					created_at, updated_at FROM hosting_proxy_operations_pre_recovery`,
+				`DROP TABLE hosting_proxy_operations_pre_recovery`,
+				`CREATE INDEX idx_hosting_proxy_operations_reconcile ON hosting_proxy_operations(status, updated_at)`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {
