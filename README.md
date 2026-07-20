@@ -320,6 +320,8 @@ overlap window, revocation invalidates every credential, and authentication,
 scope denial, rotation, revocation, runner credential changes, and kill-switch
 changes are audited. Mutating lifecycle calls use `Idempotency-Key`; a key is
 scoped to issuer and operation and conflicts if reused for a different payload.
+Suspend/resume responses acknowledge durable desired state; adapter
+convergence is asynchronous and generation-fenced during an adapter outage.
 
 Provision accepts only the versioned hosting manifest documented in OpenAPI:
 GitHub App installation/repository IDs, `static` or `node`, an allowlisted Node
@@ -387,6 +389,13 @@ checks it without rebuilding customer source, and switches the private adapter
 through a durable idempotent operation. Restore and rollback use the immutable
 runtime/health snapshot stored with the release, not a later project manifest.
 
+Every activation, rollback, suspension, resume, recovery and compensation sent
+to the proxy adapter carries a positive, per-project monotonic
+`route_generation`. The adapter must atomically ignore requests below the
+highest generation it has applied for that project. Deployer persists each
+generation before the network call and reconciles pending operations after
+restart; compensations receive a newer generation.
+
 Restore is explicitly negotiated through the runner `operations` capability.
 Legacy v1 agents that omit it are treated as build-only and never receive a
 restore recipe. During a rolling upgrade, deploy the new agents and confirm
@@ -400,12 +409,9 @@ response is an authoritative retention set, not a runner-reported runtime
 inventory, so a missing container on an otherwise online runner is not yet
 detected and the overall runner-recovery TODO item remains open.
 
-The recovery cancellation path also still needs adapter-side ordered fencing
-for an activation that returns after a newer suspend/resume intent. Deployer
-attempts an action-specific correction after observing the late response, but
-that correction is not yet a durable, revision-ordered adapter saga across a
-process crash or concurrent desired-state change. Keep cancellation/recovery
-durability unchecked until the versioned adapter contract enforces convergence.
+The local client, persistence and reconciliation paths are generation-fenced.
+Real staging acceptance must still prove that the colleague-owned adapter
+enforces the matching monotonic-generation contract.
 
 Agent API:
 

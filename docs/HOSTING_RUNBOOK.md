@@ -21,6 +21,8 @@ private network.
 - Configure `DEPLOYER_PROXY_ADAPTER_URL` and its bearer credential. HTTPS is
   mandatory except for loopback development. Deployer only calls the adapter's
   versioned private activation/suspension API and never writes proxy config.
+  The adapter must persist the highest `route_generation` per project and make
+  lower-generation activation/suspension requests no-ops.
 - Configure the HTTPS terminal callback URL and an independent HMAC key of at
   least 32 random bytes.
 - Register at least one dedicated hosting runner with capacity and reserve
@@ -110,7 +112,7 @@ heartbeat becomes stale, Deployer marks it offline. After a lost lease,
 capacity is restored exactly once and uncancelled work is transactionally
 placed on another compatible runner. After three lost attempts, the deployment
 terminates with `runner_lost` and emits the usual callback. Cancellation intent
-is durable, but the late adapter-response ordering gap below remains open.
+and corrective proxy operations are durable.
 Release artifact attachment is also generation-fenced and compare-and-swap;
 an identical upload is a safe replay and a different artifact conflicts.
 
@@ -122,11 +124,9 @@ private bind policy, and reports health
 evidence. Adapter activation is persisted before the external call and is
 reconciled after a Deployer restart. A stale recovery generation is fenced; a
 project suspension or kill switch records durable cancellation intent for
-current recovery work. The remaining late-response correction is not yet a
-durable, revision-ordered adapter saga: an activation returning across a process
-crash or concurrent suspend/resume change can require operator reconciliation.
-Keep cancellation/recovery durability unchecked until adapter-side ordering is
-implemented and tested. If no retained artifact exists or all attempts fail,
+current recovery work. Late responses are fenced by the persisted per-project
+route generation, and corrective activation/suspension is itself a durable
+operation with a newer generation. If no retained artifact exists or all attempts fail,
 Deployer records a stable failure and stages adapter suspension instead of
 rebuilding untrusted or mutable source.
 

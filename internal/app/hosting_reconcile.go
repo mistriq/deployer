@@ -34,6 +34,9 @@ func runHostingReconciler(ctx context.Context) {
 }
 
 func reconcileHostingState(ctx context.Context, now time.Time) error {
+	if err := reconcileHostingCompensationOperations(ctx); err != nil {
+		return err
+	}
 	if err := reconcileHostingDesiredStateOperations(ctx); err != nil {
 		return err
 	}
@@ -177,9 +180,52 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 	return nil
 }
 
+func reconcileHostingCompensationOperations(ctx context.Context) error {
+	rows, err := db.QueryContext(ctx, `SELECT operation.operation_id, operation.hosting_project_id,
+		operation.hosting_deployment_id, project.external_project_id,
+		operation.expected_previous_release_digest, operation.release_digest, operation.runtime_endpoint
+		FROM hosting_proxy_operations operation JOIN hosting_projects project ON project.id=operation.hosting_project_id
+		WHERE operation.operation_type='compensate' AND operation.status='pending' ORDER BY operation.id`)
+	if err != nil {
+		return err
+	}
+	type compensation struct {
+		operationID, externalProjectID, candidateDigest, previousDigest, previousEndpoint string
+		projectID                                                                         int64
+		deploymentID                                                                      sql.NullInt64
+	}
+	var operations []compensation
+	for rows.Next() {
+		var operation compensation
+		if err := rows.Scan(&operation.operationID, &operation.projectID, &operation.deploymentID,
+			&operation.externalProjectID, &operation.candidateDigest, &operation.previousDigest,
+			&operation.previousEndpoint); err != nil {
+			rows.Close()
+			return err
+		}
+		operations = append(operations, operation)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, operation := range operations {
+		proxy, err := hostingProxyClientFactory(appConfig)
+		if err != nil {
+			_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
+			continue
+		}
+		if err := executeHostingCompensation(ctx, proxy, operation.operationID, operation.projectID,
+			operation.deploymentID.Int64, operation.externalProjectID, operation.candidateDigest,
+			operation.previousDigest, operation.previousEndpoint); err != nil {
+			continue
+		}
+	}
+	return nil
+}
+
 func reconcileHostingRollbackOperations(ctx context.Context) error {
 	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.status, op.release_digest,
-		op.runtime_endpoint, op.expected_previous_release_digest, op.route_revision,
+		op.runtime_endpoint, op.expected_previous_release_digest, op.route_revision, op.route_generation, p.route_generation,
 		op.hosting_project_id, op.hosting_deployment_id, p.external_project_id,
 		d.external_deployment_id, target.runtime_manifest_json, op.expected_previous_runtime_endpoint
 		FROM hosting_proxy_operations op
@@ -194,14 +240,16 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 	}
 	type rollbackOperation struct {
 		operationID, status, digest, endpoint, previous, routeRevision          string
-		projectID, deploymentID                                                 int64
+		projectID, deploymentID, routeGeneration, currentGeneration             int64
 		externalProjectID, externalDeploymentID, manifestJSON, previousEndpoint string
 	}
 	var operations []rollbackOperation
 	for rows.Next() {
 		var operation rollbackOperation
 		if err := rows.Scan(&operation.operationID, &operation.status, &operation.digest,
-			&operation.endpoint, &operation.previous, &operation.routeRevision, &operation.projectID, &operation.deploymentID,
+			&operation.endpoint, &operation.previous, &operation.routeRevision, &operation.routeGeneration,
+			&operation.currentGeneration,
+			&operation.projectID, &operation.deploymentID,
 			&operation.externalProjectID, &operation.externalDeploymentID, &operation.manifestJSON,
 			&operation.previousEndpoint); err != nil {
 			rows.Close()
@@ -213,6 +261,12 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 		return err
 	}
 	for _, operation := range operations {
+		if operation.routeGeneration != operation.currentGeneration {
+			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeConflict); err != nil {
+				return err
+			}
+			continue
+		}
 		allowed, err := hostingActivationAllowed(ctx, operation.projectID)
 		if err != nil {
 			return err
@@ -256,6 +310,7 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 				OperationID: operation.operationID, ExternalProjectID: operation.externalProjectID,
 				ReleaseDigest: operation.digest, RuntimeEndpoint: operation.endpoint,
 				ExpectedPreviousReleaseDigest: operation.previous,
+				RouteGeneration:               operation.routeGeneration,
 			})
 			if activateErr != nil {
 				_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
@@ -322,19 +377,23 @@ func reconcileHostingRollbackOperations(ctx context.Context) error {
 }
 
 func reconcileHostingDesiredStateOperations(ctx context.Context) error {
-	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.operation_type, p.external_project_id
+	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.operation_type, op.route_generation, op.desired_state,
+		p.external_project_id, p.route_generation, p.desired_state
 		FROM hosting_proxy_operations op JOIN hosting_projects p ON p.id=op.hosting_project_id
 		WHERE op.operation_type IN ('suspend','resume') AND op.status='pending' ORDER BY op.id`)
 	if err != nil {
 		return err
 	}
 	type desiredOperation struct {
-		operationID, operationType, externalProjectID string
+		operationID, operationType, operationDesiredState, externalProjectID string
+		routeGeneration, currentGeneration                                   int64
+		desiredState                                                         string
 	}
 	var operations []desiredOperation
 	for rows.Next() {
 		var operation desiredOperation
-		if err := rows.Scan(&operation.operationID, &operation.operationType, &operation.externalProjectID); err != nil {
+		if err := rows.Scan(&operation.operationID, &operation.operationType, &operation.routeGeneration, &operation.operationDesiredState,
+			&operation.externalProjectID, &operation.currentGeneration, &operation.desiredState); err != nil {
 			rows.Close()
 			return err
 		}
@@ -344,6 +403,17 @@ func reconcileHostingDesiredStateOperations(ctx context.Context) error {
 		return err
 	}
 	for _, operation := range operations {
+		expectedType := "resume"
+		if operation.desiredState == "suspended" {
+			expectedType = "suspend"
+		}
+		if operation.routeGeneration != operation.currentGeneration || (operation.operationDesiredState != "" &&
+			(operation.operationType != expectedType || operation.operationDesiredState != operation.desiredState)) {
+			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeConflict); err != nil {
+				return err
+			}
+			continue
+		}
 		proxy, err := hostingProxyClientFactory(appConfig)
 		if err != nil {
 			_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
@@ -353,6 +423,7 @@ func reconcileHostingDesiredStateOperations(ctx context.Context) error {
 			OperationID:       operation.operationID,
 			ExternalProjectID: operation.externalProjectID,
 			Suspended:         operation.operationType == "suspend",
+			RouteGeneration:   operation.routeGeneration,
 		})
 		if err != nil {
 			code := errCodeProxyUnavailable
@@ -373,6 +444,7 @@ func reconcileHostingDesiredStateOperations(ctx context.Context) error {
 func reconcileHostingActivationOperations(ctx context.Context) error {
 	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.status, op.release_digest,
 		op.runtime_endpoint, op.expected_previous_release_digest, op.route_revision,
+		op.route_generation, p.route_generation,
 		j.id, j.hosting_deployment_id, d.hosting_project_id, j.hosting_runner_id,
 		j.lease_generation, j.lease_token_hash, j.status, p.external_project_id,
 		d.external_deployment_id, d.commit_sha, d.artifact_digest, j.cancel_requested_at,
@@ -389,12 +461,14 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 	type pendingActivation struct {
 		operationID, status, releaseDigest, runtimeEndpoint, routeRevision string
 		state                                                              hostingCompletionState
+		currentGeneration                                                  int64
 	}
 	var operations []pendingActivation
 	for rows.Next() {
 		var operation pendingActivation
 		if err := rows.Scan(&operation.operationID, &operation.status, &operation.releaseDigest,
 			&operation.runtimeEndpoint, &operation.state.PreviousReleaseDigest, &operation.routeRevision,
+			&operation.state.RouteGeneration, &operation.currentGeneration,
 			&operation.state.JobID, &operation.state.DeploymentID, &operation.state.ProjectID,
 			&operation.state.RunnerID, &operation.state.LeaseGeneration, &operation.state.LeaseTokenHash,
 			&operation.state.JobStatus, &operation.state.ExternalProjectID,
@@ -415,6 +489,16 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 		return err
 	}
 	for _, operation := range operations {
+		if operation.state.RouteGeneration != operation.currentGeneration {
+			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeConflict); err != nil {
+				return err
+			}
+			if err := finishHostingJobTerminal(ctx, &operation.state, hostingStatusCancelled,
+				hostingPhaseCancelled, "cancelled", "a newer routing intent superseded candidate activation"); err != nil {
+				return err
+			}
+			continue
+		}
 		proxy, err := hostingProxyClientFactory(appConfig)
 		if err != nil {
 			_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
@@ -443,6 +527,7 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 				ReleaseDigest:                 operation.releaseDigest,
 				RuntimeEndpoint:               operation.runtimeEndpoint,
 				ExpectedPreviousReleaseDigest: operation.state.PreviousReleaseDigest,
+				RouteGeneration:               operation.state.RouteGeneration,
 			})
 			if activateErr != nil {
 				code := errCodeProxyUnavailable

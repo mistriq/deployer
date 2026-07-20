@@ -22,7 +22,7 @@ func TestHostingProxyClientUsesVersionedAuthenticatedAdapterContract(t *testing.
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatal(err)
 		}
-		if request.OperationID == "" || request.ReleaseDigest != digest || request.RuntimeEndpoint != "http://10.1.2.3:3000" {
+		if request.OperationID == "" || request.ReleaseDigest != digest || request.RuntimeEndpoint != "http://10.1.2.3:3000" || request.RouteGeneration != 7 {
 			t.Fatalf("activation = %+v", request)
 		}
 		jsonResponse(w, proxyActivationResponse{RouteRevision: "revision-1", ActiveReleaseDigest: digest})
@@ -34,10 +34,33 @@ func TestHostingProxyClientUsesVersionedAuthenticatedAdapterContract(t *testing.
 	}
 	response, err := client.Activate(context.Background(), proxyActivationRequest{
 		OperationID: "activate-operation", ExternalProjectID: "project_01JPROXY", ReleaseDigest: digest,
-		RuntimeEndpoint: "http://10.1.2.3:3000",
+		RuntimeEndpoint: "http://10.1.2.3:3000", RouteGeneration: 7,
 	})
 	if err != nil || response.RouteRevision != "revision-1" {
 		t.Fatalf("response=%+v err=%v", response, err)
+	}
+}
+
+func TestHostingProxySuspensionCarriesRouteGeneration(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request proxySuspendRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.OperationID != "suspend-operation" || request.ExternalProjectID != "project_01JSUSPEND" ||
+			!request.Suspended || request.RouteGeneration != 9 {
+			t.Fatalf("suspension request=%+v", request)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := newHostingProxyClient(AppConfig{ProxyAdapterURL: server.URL, ProxyAdapterToken: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetSuspended(t.Context(), proxySuspendRequest{OperationID: "suspend-operation",
+		ExternalProjectID: "project_01JSUSPEND", Suspended: true, RouteGeneration: 9}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -67,7 +90,7 @@ func TestHostingProxyRejectsMismatchedActivationIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.Activate(context.Background(), proxyActivationRequest{OperationID: "op", ExternalProjectID: "project_01JPROXY", ReleaseDigest: requested, RuntimeEndpoint: "http://10.1.2.3:3000"})
+	_, err = client.Activate(context.Background(), proxyActivationRequest{OperationID: "op", ExternalProjectID: "project_01JPROXY", ReleaseDigest: requested, RuntimeEndpoint: "http://10.1.2.3:3000", RouteGeneration: 1})
 	apiErr, ok := err.(*hostingAPIError)
 	if !ok || apiErr.Code != errCodeProxyRejected {
 		t.Fatalf("error = %v", err)

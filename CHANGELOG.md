@@ -17,6 +17,9 @@
   success.
 - Make release artifact uploads use unique temporary files and lease-fenced
   compare-and-swap attachment with exact replay validation.
+- Add durable per-project route generations to activation, rollback,
+  suspend/resume, recovery and compensation so late adapter calls cannot
+  override newer desired state and corrections survive restart.
 - Add immutable health-gated activation through the private versioned proxy
   adapter client, selected-release rollback, suspend/resume, and compensation
   when cancellation races activation.

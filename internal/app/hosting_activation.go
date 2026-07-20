@@ -48,6 +48,24 @@ type hostingCompletionState struct {
 	ReleaseUploadPath       string
 	ReleaseUploadSize       int64
 	CompletionFingerprint   string
+	RouteGeneration         int64
+}
+
+type hostingRouteGenerationQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func nextHostingRouteGeneration(ctx context.Context, querier hostingRouteGenerationQuerier, projectID int64) (int64, error) {
+	var generation int64
+	err := querier.QueryRowContext(ctx, `UPDATE hosting_projects SET route_generation=route_generation+1
+		WHERE id=? RETURNING route_generation`, projectID).Scan(&generation)
+	if err != nil {
+		return 0, err
+	}
+	if generation <= 0 {
+		return 0, fmt.Errorf("invalid hosting route generation")
+	}
+	return generation, nil
 }
 
 func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, leaseToken string, input hostingCompletionRequest) error {
@@ -167,6 +185,7 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 		ReleaseDigest:                 input.ReleaseDigest,
 		RuntimeEndpoint:               input.RuntimeEndpoint,
 		ExpectedPreviousReleaseDigest: state.PreviousReleaseDigest,
+		RouteGeneration:               state.RouteGeneration,
 	})
 	if err != nil {
 		errorCode := errCodeProxyUnavailable
@@ -180,6 +199,20 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 			return failHostingActivation(ctx, state, input.ReleaseDigest, err)
 		}
 		return err
+	}
+	current, err := hostingProxyOperationIsCurrent(ctx, operationID)
+	if err != nil {
+		return err
+	}
+	if !current {
+		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
+			return err
+		}
+		if err := compensateCancelledActivation(ctx, proxy, state, input.ReleaseDigest); err != nil {
+			return err
+		}
+		return finishHostingJobTerminal(ctx, state, hostingStatusCancelled, hostingPhaseCancelled,
+			"cancelled", "a newer routing intent superseded candidate activation")
 	}
 	if err := markHostingProxyOperationApplied(ctx, operationID, activation.RouteRevision); err != nil {
 		return err
@@ -240,6 +273,9 @@ func getHostingCompletionState(ctx context.Context, runnerID, jobID, generation 
 	}
 	_ = db.QueryRowContext(ctx, `SELECT release_digest, runtime_endpoint FROM hosting_releases
 		WHERE hosting_project_id=? AND status='active'`, state.ProjectID).Scan(&state.PreviousReleaseDigest, &state.PreviousRuntimeEndpoint)
+	_ = db.QueryRowContext(ctx, `SELECT route_generation FROM hosting_proxy_operations
+		WHERE hosting_deployment_id=? AND operation_type='activate' ORDER BY id DESC LIMIT 1`,
+		state.DeploymentID).Scan(&state.RouteGeneration)
 	return &state, nil
 }
 
@@ -348,14 +384,29 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 		return err
 	}
 	operationID := hashHostingOperation("activate", state.ExternalDeploymentID, input.ReleaseDigest)
-	if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
-		(operation_id, hosting_project_id, hosting_deployment_id, operation_type, release_digest,
-		 runtime_endpoint, expected_previous_release_digest, status, created_at, updated_at)
-		VALUES (?, ?, ?, 'activate', ?, ?, ?, 'pending', ?, ?)
-		ON CONFLICT(operation_id) DO NOTHING`, operationID, state.ProjectID, state.DeploymentID,
-		input.ReleaseDigest, input.RuntimeEndpoint, state.PreviousReleaseDigest, formatSQLiteTime(now), formatSQLiteTime(now)); err != nil {
+	var routeGeneration int64
+	var storedDigest, storedEndpoint string
+	err = conn.QueryRowContext(ctx, `SELECT route_generation, release_digest, runtime_endpoint
+		FROM hosting_proxy_operations WHERE operation_id=?`, operationID).Scan(&routeGeneration, &storedDigest, &storedEndpoint)
+	if err == sql.ErrNoRows {
+		routeGeneration, err = nextHostingRouteGeneration(ctx, conn, state.ProjectID)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
+			(operation_id, hosting_project_id, hosting_deployment_id, operation_type, release_digest,
+			 runtime_endpoint, expected_previous_release_digest, route_generation, status, created_at, updated_at)
+			VALUES (?, ?, ?, 'activate', ?, ?, ?, ?, 'pending', ?, ?)`, operationID, state.ProjectID, state.DeploymentID,
+			input.ReleaseDigest, input.RuntimeEndpoint, state.PreviousReleaseDigest, routeGeneration,
+			formatSQLiteTime(now), formatSQLiteTime(now)); err != nil {
+			return err
+		}
+	} else if err != nil {
 		return err
+	} else if storedDigest != input.ReleaseDigest || storedEndpoint != input.RuntimeEndpoint {
+		return &hostingAPIError{Code: errCodeIdempotencyConflict, Message: "activation intent conflicts with the durable operation", StatusCode: http.StatusConflict}
 	}
+	state.RouteGeneration = routeGeneration
 	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
 		return err
 	}
@@ -527,23 +578,88 @@ func finishHostingJobTerminal(ctx context.Context, state *hostingCompletionState
 
 func compensateCancelledActivation(ctx context.Context, proxy hostingProxyClient, state *hostingCompletionState, candidateDigest string) error {
 	operationID := hashHostingOperation("compensate", state.ExternalDeploymentID, candidateDigest)
-	var desiredState string
-	if err := db.QueryRowContext(ctx, `SELECT desired_state FROM hosting_projects WHERE id=?`, state.ProjectID).Scan(&desiredState); err != nil {
+	return executeHostingCompensation(ctx, proxy, operationID, state.ProjectID, state.DeploymentID,
+		state.ExternalProjectID, candidateDigest, state.PreviousReleaseDigest, state.PreviousRuntimeEndpoint)
+}
+
+func executeHostingCompensation(ctx context.Context, proxy hostingProxyClient, operationID string,
+	projectID, deploymentID int64, externalProjectID, candidateDigest, previousDigest, previousEndpoint string) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
 		return err
 	}
-	if desiredState == "suspended" {
-		return proxy.SetSuspended(ctx, proxySuspendRequest{OperationID: operationID, ExternalProjectID: state.ExternalProjectID, Suspended: true})
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
 	}
-	if state.PreviousReleaseDigest == "" || state.PreviousRuntimeEndpoint == "" {
-		return proxy.SetSuspended(ctx, proxySuspendRequest{OperationID: operationID, ExternalProjectID: state.ExternalProjectID, Suspended: true})
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	var generation int64
+	var storedDigest, storedEndpoint, storedStatus string
+	err = conn.QueryRowContext(ctx, `SELECT route_generation, release_digest, runtime_endpoint, status
+		FROM hosting_proxy_operations WHERE operation_id=? AND operation_type='compensate'`, operationID).Scan(
+		&generation, &storedDigest, &storedEndpoint, &storedStatus)
+	if err == sql.ErrNoRows {
+		var desired, kill string
+		var global int
+		if err := conn.QueryRowContext(ctx, `SELECT project.desired_state, project.kill_switch_reason,
+			settings.global_kill_switch FROM hosting_projects project JOIN hosting_settings settings ON settings.id=1
+			WHERE project.id=?`, projectID).Scan(&desired, &kill, &global); err != nil {
+			return err
+		}
+		storedDigest, storedEndpoint = previousDigest, previousEndpoint
+		if desired != "active" || kill != "" || global != 0 || storedDigest == "" || storedEndpoint == "" {
+			storedDigest, storedEndpoint = "", ""
+		}
+		generation, err = nextHostingRouteGeneration(ctx, conn, projectID)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
+			(operation_id, hosting_project_id, hosting_deployment_id, operation_type, release_digest,
+			 runtime_endpoint, expected_previous_release_digest, route_generation, status, created_at, updated_at)
+			VALUES (?, ?, NULLIF(?, 0), 'compensate', ?, ?, ?, ?, 'pending', ?, ?)`, operationID,
+			projectID, deploymentID, storedDigest, storedEndpoint, candidateDigest, generation,
+			formatSQLiteTime(time.Now().UTC()), formatSQLiteTime(time.Now().UTC())); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	} else if storedStatus == "committed" || storedStatus == "failed" {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return err
+		}
+		committed = true
+		return nil
 	}
-	_, err := proxy.Activate(ctx, proxyActivationRequest{
-		OperationID:       operationID,
-		ExternalProjectID: state.ExternalProjectID,
-		ReleaseDigest:     state.PreviousReleaseDigest,
-		RuntimeEndpoint:   state.PreviousRuntimeEndpoint,
-	})
-	return err
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return err
+	}
+	committed = true
+	if storedDigest != "" && storedEndpoint != "" {
+		_, err = proxy.Activate(ctx, proxyActivationRequest{OperationID: operationID,
+			ExternalProjectID: externalProjectID, ReleaseDigest: storedDigest, RuntimeEndpoint: storedEndpoint,
+			ExpectedPreviousReleaseDigest: candidateDigest, RouteGeneration: generation})
+	} else {
+		err = proxy.SetSuspended(ctx, proxySuspendRequest{OperationID: operationID,
+			ExternalProjectID: externalProjectID, Suspended: true, RouteGeneration: generation})
+	}
+	if err != nil {
+		_ = markHostingProxyOperationError(ctx, operationID, errCodeProxyUnavailable)
+		return err
+	}
+	current, err := hostingProxyOperationIsCurrent(ctx, operationID)
+	if err != nil {
+		return err
+	}
+	if !current {
+		return markHostingProxyOperationFailed(ctx, operationID, errCodeConflict)
+	}
+	return markHostingProxyOperationCommitted(ctx, operationID)
 }
 
 func hostingActivationAllowed(ctx context.Context, projectID int64) (bool, error) {
@@ -601,4 +717,12 @@ func markHostingProxyOperationCommitted(ctx context.Context, operationID string)
 	_, err := db.ExecContext(ctx, `UPDATE hosting_proxy_operations SET status='committed', updated_at=?
 		WHERE operation_id=? AND status IN ('pending','applied','committed')`, formatSQLiteTime(time.Now().UTC()), operationID)
 	return err
+}
+
+func hostingProxyOperationIsCurrent(ctx context.Context, operationID string) (bool, error) {
+	var current int
+	err := db.QueryRowContext(ctx, `SELECT CASE WHEN operation.route_generation=project.route_generation THEN 1 ELSE 0 END
+		FROM hosting_proxy_operations operation JOIN hosting_projects project ON project.id=operation.hosting_project_id
+		WHERE operation.operation_id=?`, operationID).Scan(&current)
+	return current == 1, err
 }

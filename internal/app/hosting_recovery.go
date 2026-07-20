@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -37,6 +38,7 @@ type hostingRuntimeRecoveryState struct {
 	Limits                  hostingWorkloadLimits
 	Runtime                 HostingRuntimeManifest
 	SecretRefs              []HostingSecretReference
+	RouteGeneration         int64
 }
 
 var allowedHostingRecoveryFailureCodes = map[string]struct{}{
@@ -621,46 +623,35 @@ func reconcileExpiredHostingRecoveries(ctx context.Context, conn *sql.Conn, now 
 
 func stageHostingRuntimeUnavailable(ctx context.Context, conn *sql.Conn, projectID, deploymentID, releaseID int64, now time.Time) error {
 	operationID := hashHostingOperation("runtime-unavailable", fmt.Sprint(releaseID))
-	_, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
-		(operation_id, hosting_project_id, hosting_deployment_id, operation_type, status, created_at, updated_at)
-		VALUES (?, ?, ?, 'suspend', 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`, operationID,
-		projectID, deploymentID, formatSQLiteTime(now), formatSQLiteTime(now))
+	var existingGeneration int64
+	err := conn.QueryRowContext(ctx, `SELECT route_generation FROM hosting_proxy_operations WHERE operation_id=?`, operationID).Scan(&existingGeneration)
+	if err == nil {
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	routeGeneration, err := nextHostingRouteGeneration(ctx, conn, projectID)
+	if err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
+		(operation_id, hosting_project_id, hosting_deployment_id, operation_type, route_generation, status, created_at, updated_at)
+		VALUES (?, ?, ?, 'suspend', ?, 'pending', ?, ?)`, operationID,
+		projectID, deploymentID, routeGeneration, formatSQLiteTime(now), formatSQLiteTime(now))
 	return err
 }
 
 func compensateCancelledHostingRecovery(ctx context.Context, proxy hostingProxyClient, state *hostingRuntimeRecoveryState) error {
 	operationID := hashHostingOperation("compensate-recovery", fmt.Sprint(state.ID), fmt.Sprint(state.LeaseGeneration))
-	return proxy.SetSuspended(ctx, proxySuspendRequest{
-		OperationID:       operationID,
-		ExternalProjectID: state.ExternalProjectID,
-		Suspended:         true,
-	})
+	return executeHostingCompensation(ctx, proxy, operationID, state.ProjectID, state.DeploymentID,
+		state.ExternalProjectID, state.ReleaseDigest, state.ReleaseDigest, state.PreviousRuntimeEndpoint)
 }
 
 func reconcileLateHostingRecoveryActivation(ctx context.Context, proxy hostingProxyClient, state *hostingRuntimeRecoveryState) error {
-	var desiredState, killSwitchReason string
-	var globalKillSwitch int
-	if err := db.QueryRowContext(ctx, `SELECT project.desired_state, project.kill_switch_reason,
-		settings.global_kill_switch FROM hosting_projects project JOIN hosting_settings settings ON settings.id=1
-		WHERE project.id=?`, state.ProjectID).Scan(&desiredState, &killSwitchReason, &globalKillSwitch); err != nil {
-		return err
-	}
 	operationID := hashHostingOperation("compensate-recovery-late-activation", fmt.Sprint(state.ID), fmt.Sprint(state.LeaseGeneration))
-	if desiredState == "active" && killSwitchReason == "" && globalKillSwitch == 0 && state.PreviousRuntimeEndpoint != "" {
-		_, err := proxy.Activate(ctx, proxyActivationRequest{
-			OperationID:                   operationID,
-			ExternalProjectID:             state.ExternalProjectID,
-			ReleaseDigest:                 state.ReleaseDigest,
-			RuntimeEndpoint:               state.PreviousRuntimeEndpoint,
-			ExpectedPreviousReleaseDigest: state.ReleaseDigest,
-		})
-		return err
-	}
-	return proxy.SetSuspended(ctx, proxySuspendRequest{
-		OperationID:       operationID,
-		ExternalProjectID: state.ExternalProjectID,
-		Suspended:         true,
-	})
+	return executeHostingCompensation(ctx, proxy, operationID, state.ProjectID, state.DeploymentID,
+		state.ExternalProjectID, state.ReleaseDigest, state.ReleaseDigest, state.PreviousRuntimeEndpoint)
 }
 
 func completeHostingRuntimeRecovery(ctx context.Context, runnerID, recoveryID, generation int64, leaseToken string, input hostingCompletionRequest) error {
@@ -791,14 +782,20 @@ func completeHostingRuntimeRecovery(ctx context.Context, runnerID, recoveryID, g
 		}
 	}
 	if err == nil {
-		_, err = conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
-			(operation_id, hosting_project_id, hosting_deployment_id, hosting_runtime_recovery_id,
-			 operation_type, release_digest, runtime_endpoint, expected_previous_release_digest,
-			 status, created_at, updated_at)
-			VALUES (?, ?, ?, ?, 'recover', ?, ?, ?, 'pending', ?, ?)
-			ON CONFLICT(operation_id) DO NOTHING`, operationID, state.ProjectID, state.DeploymentID,
-			state.ID, state.ReleaseDigest, input.RuntimeEndpoint, state.ReleaseDigest,
-			formatSQLiteTime(now), formatSQLiteTime(now))
+		err = conn.QueryRowContext(ctx, `SELECT route_generation FROM hosting_proxy_operations
+			WHERE operation_id=?`, operationID).Scan(&state.RouteGeneration)
+		if err == sql.ErrNoRows {
+			state.RouteGeneration, err = nextHostingRouteGeneration(ctx, conn, state.ProjectID)
+			if err == nil {
+				_, err = conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
+					(operation_id, hosting_project_id, hosting_deployment_id, hosting_runtime_recovery_id,
+					 operation_type, release_digest, runtime_endpoint, expected_previous_release_digest,
+					 route_generation, status, created_at, updated_at)
+					VALUES (?, ?, ?, ?, 'recover', ?, ?, ?, ?, 'pending', ?, ?)`, operationID,
+					state.ProjectID, state.DeploymentID, state.ID, state.ReleaseDigest, input.RuntimeEndpoint,
+					state.ReleaseDigest, state.RouteGeneration, formatSQLiteTime(now), formatSQLiteTime(now))
+			}
+		}
 	}
 	if err == nil {
 		var storedRecoveryID int64
@@ -828,7 +825,8 @@ func completeHostingRuntimeRecovery(ctx context.Context, runnerID, recoveryID, g
 	}
 	activation, err := proxy.Activate(ctx, proxyActivationRequest{OperationID: operationID,
 		ExternalProjectID: state.ExternalProjectID, ReleaseDigest: state.ReleaseDigest,
-		RuntimeEndpoint: input.RuntimeEndpoint, ExpectedPreviousReleaseDigest: state.ReleaseDigest})
+		RuntimeEndpoint: input.RuntimeEndpoint, ExpectedPreviousReleaseDigest: state.ReleaseDigest,
+		RouteGeneration: state.RouteGeneration})
 	if err != nil {
 		code := errCodeProxyUnavailable
 		var apiErr *hostingAPIError
@@ -844,6 +842,23 @@ func completeHostingRuntimeRecovery(ctx context.Context, runnerID, recoveryID, g
 		}
 		_ = markHostingProxyOperationError(ctx, operationID, code)
 		return err
+	}
+	current, err := hostingProxyOperationIsCurrent(ctx, operationID)
+	if err != nil {
+		return err
+	}
+	if !current {
+		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
+			return err
+		}
+		if err := reconcileLateHostingRecoveryActivation(ctx, proxy, state); err != nil {
+			return err
+		}
+		if err := cancelHostingRuntimeRecovery(ctx, state, "a newer routing intent superseded runtime recovery"); err != nil && !errors.Is(err, errHostingStateConflict) {
+			return err
+		}
+		return &hostingAPIError{Code: errCodeProjectSuspended,
+			Message: "a newer routing intent superseded runtime recovery", StatusCode: http.StatusConflict}
 	}
 	if err := markHostingProxyOperationApplied(ctx, operationID, activation.RouteRevision); err != nil {
 		var operationStatus string
@@ -1091,7 +1106,8 @@ func failHostingRuntimeRecovery(ctx context.Context, state *hostingRuntimeRecove
 
 func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 	rows, err := db.QueryContext(ctx, `SELECT operation.operation_id, operation.status,
-		operation.runtime_endpoint, operation.route_revision, recovery.id, recovery.hosting_release_id,
+		operation.runtime_endpoint, operation.route_revision, operation.route_generation, project.route_generation,
+		recovery.id, recovery.hosting_release_id,
 		release.hosting_deployment_id, release.hosting_project_id, recovery.hosting_runner_id,
 		release.runtime_runner_id,
 		recovery.lease_generation, recovery.lease_token_hash, recovery.completion_fingerprint,
@@ -1114,13 +1130,15 @@ func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 	type recoveryOperation struct {
 		operationID, operationStatus, endpoint, routeRevision string
 		state                                                 hostingRuntimeRecoveryState
+		currentGeneration                                     int64
 	}
 	var operations []recoveryOperation
 	for rows.Next() {
 		var operation recoveryOperation
 		var manifestJSON string
 		if err := rows.Scan(&operation.operationID, &operation.operationStatus, &operation.endpoint,
-			&operation.routeRevision, &operation.state.ID, &operation.state.ReleaseID,
+			&operation.routeRevision, &operation.state.RouteGeneration, &operation.currentGeneration,
+			&operation.state.ID, &operation.state.ReleaseID,
 			&operation.state.DeploymentID, &operation.state.ProjectID, &operation.state.RunnerID,
 			&operation.state.RuntimeOwnerRunnerID, &operation.state.LeaseGeneration,
 			&operation.state.LeaseTokenHash, &operation.state.CompletionFingerprint, &operation.state.Status,
@@ -1146,6 +1164,16 @@ func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 		return err
 	}
 	for _, operation := range operations {
+		if operation.state.RouteGeneration != operation.currentGeneration {
+			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeConflict); err != nil {
+				return err
+			}
+			if err := cancelHostingRuntimeRecovery(ctx, &operation.state,
+				"a newer routing intent superseded runtime recovery"); err != nil {
+				return err
+			}
+			continue
+		}
 		cancelledOrTerminal := operation.state.CancelRequested.Valid ||
 			operation.state.Status == "cancelled" || operation.state.Status == "failed"
 		if cancelledOrTerminal {
@@ -1219,6 +1247,7 @@ func reconcileHostingRecoveryProxyOperations(ctx context.Context) error {
 				OperationID: operation.operationID, ExternalProjectID: operation.state.ExternalProjectID,
 				ReleaseDigest: operation.state.ReleaseDigest, RuntimeEndpoint: operation.endpoint,
 				ExpectedPreviousReleaseDigest: operation.state.ReleaseDigest,
+				RouteGeneration:               operation.state.RouteGeneration,
 			})
 			if activateErr != nil {
 				code := errCodeProxyUnavailable

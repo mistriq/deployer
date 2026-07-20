@@ -19,6 +19,7 @@ type proxyActivationRequest struct {
 	ReleaseDigest                 string `json:"release_digest"`
 	RuntimeEndpoint               string `json:"runtime_endpoint"`
 	ExpectedPreviousReleaseDigest string `json:"expected_previous_release_digest,omitempty"`
+	RouteGeneration               int64  `json:"route_generation"`
 }
 
 type proxyActivationResponse struct {
@@ -30,6 +31,7 @@ type proxySuspendRequest struct {
 	OperationID       string `json:"operation_id"`
 	ExternalProjectID string `json:"external_project_id"`
 	Suspended         bool   `json:"suspended"`
+	RouteGeneration   int64  `json:"route_generation"`
 }
 
 type hostingProxyClient interface {
@@ -61,6 +63,9 @@ func newHostingProxyClient(cfg AppConfig) (hostingProxyClient, error) {
 }
 
 func (client *httpHostingProxyClient) Activate(ctx context.Context, request proxyActivationRequest) (*proxyActivationResponse, error) {
+	if request.RouteGeneration <= 0 {
+		return nil, &hostingAPIError{Code: errCodeProxyRejected, Message: "reverse-proxy activation requires a positive route generation", StatusCode: http.StatusBadGateway}
+	}
 	var response proxyActivationResponse
 	path := "/api/internal/v1/projects/" + url.PathEscape(request.ExternalProjectID) + "/activate"
 	if err := client.doJSON(ctx, http.MethodPost, path, request, &response); err != nil {
@@ -73,6 +78,9 @@ func (client *httpHostingProxyClient) Activate(ctx context.Context, request prox
 }
 
 func (client *httpHostingProxyClient) SetSuspended(ctx context.Context, request proxySuspendRequest) error {
+	if request.RouteGeneration <= 0 {
+		return &hostingAPIError{Code: errCodeProxyRejected, Message: "reverse-proxy suspension requires a positive route generation", StatusCode: http.StatusBadGateway}
+	}
 	path := "/api/internal/v1/projects/" + url.PathEscape(request.ExternalProjectID) + "/suspension"
 	return client.doJSON(ctx, http.MethodPut, path, request, nil)
 }

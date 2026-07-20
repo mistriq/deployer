@@ -488,6 +488,19 @@ func applyHostingMigrations() error {
 				`ALTER TABLE hosting_proxy_operations ADD COLUMN expected_previous_runtime_endpoint TEXT NOT NULL DEFAULT ''`,
 			},
 		},
+		{
+			id: "035_hosting_proxy_route_generation",
+			statements: []string{
+				`ALTER TABLE hosting_projects ADD COLUMN route_generation INTEGER NOT NULL DEFAULT 0`,
+				`ALTER TABLE hosting_proxy_operations ADD COLUMN route_generation INTEGER NOT NULL DEFAULT 0`,
+				`ALTER TABLE hosting_proxy_operations ADD COLUMN desired_state TEXT NOT NULL DEFAULT ''`,
+				`UPDATE hosting_proxy_operations SET route_generation=(SELECT COUNT(*)
+					FROM hosting_proxy_operations earlier WHERE earlier.hosting_project_id=hosting_proxy_operations.hosting_project_id
+					AND earlier.id<=hosting_proxy_operations.id)`,
+				`UPDATE hosting_projects SET route_generation=COALESCE((SELECT MAX(operation.route_generation)
+					FROM hosting_proxy_operations operation WHERE operation.hosting_project_id=hosting_projects.id), 0)`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {

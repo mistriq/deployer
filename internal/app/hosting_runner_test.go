@@ -27,7 +27,10 @@ type fakeProxyClient struct {
 	reject           bool
 	activateStarted  chan struct{}
 	activateContinue chan struct{}
+	suspendStarted   chan struct{}
+	suspendContinue  chan struct{}
 	suspendedOps     map[string]struct{}
+	routeGenerations map[string]int64
 	currentSuspended bool
 	currentEndpoint  string
 }
@@ -51,6 +54,14 @@ func (fake *fakeProxyClient) Activate(_ context.Context, request proxyActivation
 		return nil, &hostingAPIError{Code: errCodeProxyRejected, Message: "adapter rejected activation", StatusCode: http.StatusBadGateway}
 	}
 	fake.mu.Lock()
+	if fake.routeGenerations == nil {
+		fake.routeGenerations = make(map[string]int64)
+	}
+	if request.RouteGeneration < fake.routeGenerations[request.ExternalProjectID] {
+		fake.mu.Unlock()
+		return &proxyActivationResponse{RouteRevision: "route-rev-stale", ActiveReleaseDigest: request.ReleaseDigest}, nil
+	}
+	fake.routeGenerations[request.ExternalProjectID] = request.RouteGeneration
 	fake.currentSuspended = false
 	fake.currentEndpoint = request.RuntimeEndpoint
 	fake.mu.Unlock()
@@ -59,18 +70,34 @@ func (fake *fakeProxyClient) Activate(_ context.Context, request proxyActivation
 
 func (fake *fakeProxyClient) SetSuspended(_ context.Context, request proxySuspendRequest) error {
 	fake.mu.Lock()
-	defer fake.mu.Unlock()
 	fake.suspensions = append(fake.suspensions, request)
-	if fake.fail {
+	fail := fake.fail
+	started := fake.suspendStarted
+	continued := fake.suspendContinue
+	fake.mu.Unlock()
+	if started != nil && request.Suspended {
+		started <- struct{}{}
+		<-continued
+	}
+	if fail {
 		return errors.New("adapter unavailable")
 	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
 	if fake.suspendedOps == nil {
 		fake.suspendedOps = make(map[string]struct{})
+	}
+	if fake.routeGenerations == nil {
+		fake.routeGenerations = make(map[string]int64)
 	}
 	if _, alreadyApplied := fake.suspendedOps[request.OperationID]; alreadyApplied {
 		return nil
 	}
 	fake.suspendedOps[request.OperationID] = struct{}{}
+	if request.RouteGeneration < fake.routeGenerations[request.ExternalProjectID] {
+		return nil
+	}
+	fake.routeGenerations[request.ExternalProjectID] = request.RouteGeneration
 	fake.currentSuspended = request.Suspended
 	return nil
 }
@@ -836,7 +863,7 @@ func TestHostingRuntimeRecoveryHonorsDurableProjectSuspension(t *testing.T) {
 		t.Fatalf("cancelled recovery status=%q operation=%q free CPU=%d", status, operationStatus, freeCPU)
 	}
 	if len(fake.activations) != 3 || fake.activations[2].RuntimeEndpoint != "http://10.73.0.1:3000" ||
-		len(fake.suspensions) < 3 || fake.suspensions[len(fake.suspensions)-1].Suspended ||
+		len(fake.suspensions) != 2 || fake.activations[2].RouteGeneration <= fake.suspensions[1].RouteGeneration ||
 		fake.activations[2].OperationID == fake.suspensions[1].OperationID || fake.currentSuspended ||
 		fake.currentEndpoint != "http://10.73.0.1:3000" {
 		t.Fatalf("late recovery activation=%#v suspensions=%#v", fake.activations, fake.suspensions)
@@ -1434,8 +1461,8 @@ func TestSuspendIntentPersistsAndReconcilesAfterProxyFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake.fail = true
-	if _, _, err := setHostingProjectDesiredState(t.Context(), operator, project.ExternalProjectID, "suspended", "suspend_failure_01"); err == nil {
-		t.Fatal("proxy failure was accepted")
+	if _, _, err := setHostingProjectDesiredState(t.Context(), operator, project.ExternalProjectID, "suspended", "suspend_failure_01"); err != nil {
+		t.Fatalf("durable desired state was not accepted during proxy outage: %v", err)
 	}
 	stored, err := getHostingProjectByExternalID(project.ExternalProjectID)
 	if err != nil || stored.DesiredState != "suspended" {
@@ -1460,6 +1487,90 @@ func TestSuspendIntentPersistsAndReconcilesAfterProxyFailure(t *testing.T) {
 	}
 	if len(fake.suspensions) != 4 || !fake.suspensions[1].Suspended || !fake.suspensions[2].Suspended || fake.suspensions[3].Suspended {
 		t.Fatalf("proxy suspension calls=%#v", fake.suspensions)
+	}
+}
+
+func TestDesiredStateRouteGenerationFencesLateSuspend(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	fake.suspendStarted = make(chan struct{})
+	fake.suspendContinue = make(chan struct{})
+	project, token := provisionDeploymentTestProject(t, "project_01JSTATEGEN")
+	suspendResult := make(chan error, 1)
+	go func() {
+		_, _, err := setHostingProjectDesiredState(context.Background(), token, project.ExternalProjectID,
+			"suspended", "suspend_01JSTATEGEN")
+		suspendResult <- err
+	}()
+	<-fake.suspendStarted
+	if _, _, err := setHostingProjectDesiredState(t.Context(), token, project.ExternalProjectID,
+		"active", "resume_01JSTATEGEN"); err != nil {
+		t.Fatalf("resume while suspend is delayed: %v", err)
+	}
+	fake.suspendContinue <- struct{}{}
+	if err := <-suspendResult; err != nil {
+		t.Fatalf("superseded suspend request: %v", err)
+	}
+	fake.mu.Lock()
+	suspended := fake.currentSuspended
+	requests := append([]proxySuspendRequest(nil), fake.suspensions...)
+	fake.mu.Unlock()
+	if suspended {
+		t.Fatal("late lower-generation suspend overrode the newer resume")
+	}
+	if len(requests) != 2 || requests[0].RouteGeneration != 1 || requests[1].RouteGeneration != 2 {
+		t.Fatalf("ordered suspension requests=%+v", requests)
+	}
+	var desired string
+	var generation int64
+	if err := db.QueryRow(`SELECT desired_state, route_generation FROM hosting_projects WHERE id=?`, project.ID).Scan(&desired, &generation); err != nil {
+		t.Fatal(err)
+	}
+	if desired != "active" || generation != 2 {
+		t.Fatalf("desired state=%q generation=%d", desired, generation)
+	}
+	var failed, committed int
+	if err := db.QueryRow(`SELECT
+		SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN status='committed' THEN 1 ELSE 0 END)
+		FROM hosting_proxy_operations WHERE hosting_project_id=? AND operation_type IN ('suspend','resume')`, project.ID).Scan(&failed, &committed); err != nil {
+		t.Fatal(err)
+	}
+	if failed != 1 || committed != 1 {
+		t.Fatalf("desired-state operations failed=%d committed=%d", failed, committed)
+	}
+}
+
+func TestHostingRouteCompensationSurvivesAdapterFailureAndRestart(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _ := provisionDeploymentTestProject(t, "project_01JCOMPSAG")
+	digest := "sha256:" + strings.Repeat("e", 64)
+	operationID := hashHostingOperation("test-compensation", project.ExternalProjectID)
+	fake.fail = true
+	err := executeHostingCompensation(t.Context(), fake, operationID, project.ID, 0,
+		project.ExternalProjectID, "sha256:"+strings.Repeat("f", 64), digest, "http://10.88.0.1:3000")
+	if err == nil {
+		t.Fatal("adapter failure unexpectedly committed compensation")
+	}
+	var status string
+	var generation int64
+	if err := db.QueryRow(`SELECT status, route_generation FROM hosting_proxy_operations WHERE operation_id=?`,
+		operationID).Scan(&status, &generation); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || generation <= 0 {
+		t.Fatalf("durable compensation status=%q generation=%d", status, generation)
+	}
+	fake.fail = false
+	if err := reconcileHostingCompensationOperations(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE operation_id=?`, operationID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "committed" || fake.currentEndpoint != "http://10.88.0.1:3000" {
+		t.Fatalf("reconciled compensation status=%q endpoint=%q", status, fake.currentEndpoint)
 	}
 }
 

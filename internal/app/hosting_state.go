@@ -538,6 +538,10 @@ func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, ext
 		}
 		return nil, false, err
 	}
+	routeGeneration, err := nextHostingRouteGeneration(ctx, conn, projectID)
+	if err != nil {
+		return nil, false, err
+	}
 	if _, err := conn.ExecContext(ctx, `UPDATE hosting_projects SET desired_state=?, updated_at=? WHERE id=?`, desired, formatSQLiteTime(now), projectID); err != nil {
 		return nil, false, err
 	}
@@ -554,9 +558,9 @@ func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, ext
 		operationType = "suspend"
 	}
 	if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
-		(operation_id, hosting_project_id, operation_type, status, created_at, updated_at)
-		VALUES (?, ?, ?, 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`, operationID,
-		projectID, operationType, formatSQLiteTime(now), formatSQLiteTime(now)); err != nil {
+		(operation_id, hosting_project_id, operation_type, route_generation, desired_state, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`, operationID,
+		projectID, operationType, routeGeneration, desired, formatSQLiteTime(now), formatSQLiteTime(now)); err != nil {
 		return nil, false, err
 	}
 	metadata, _ := json.Marshal(map[string]any{"desired_state": desired, "external_project_id": externalID})
@@ -576,16 +580,27 @@ func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, ext
 	proxy, err := hostingProxyClientFactory(appConfig)
 	if err != nil {
 		_ = markHostingProxyOperationError(ctx, operationID, errCodeProxyUnavailable)
-		return nil, false, err
+		return response, false, nil
 	}
-	if err := proxy.SetSuspended(ctx, proxySuspendRequest{OperationID: operationID, ExternalProjectID: externalID, Suspended: desired == "suspended"}); err != nil {
+	if err := proxy.SetSuspended(ctx, proxySuspendRequest{OperationID: operationID, ExternalProjectID: externalID,
+		Suspended: desired == "suspended", RouteGeneration: routeGeneration}); err != nil {
 		code := errCodeProxyUnavailable
 		var apiErr *hostingAPIError
 		if errorsAsHosting(err, &apiErr) {
 			code = apiErr.Code
 		}
 		_ = markHostingProxyOperationError(ctx, operationID, code)
+		return response, false, nil
+	}
+	current, err := hostingProxyOperationIsCurrent(ctx, operationID)
+	if err != nil {
 		return nil, false, err
+	}
+	if !current {
+		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
+			return nil, false, err
+		}
+		return response, false, nil
 	}
 	if err := markHostingProxyOperationCommitted(ctx, operationID); err != nil {
 		return nil, false, err
@@ -753,12 +768,18 @@ func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID
 		intentConn.Close()
 		return nil, false, &hostingAPIError{Code: errCodeProjectSuspended, Message: "project execution is disabled or suspended", StatusCode: http.StatusConflict}
 	}
+	routeGeneration, err := nextHostingRouteGeneration(ctx, intentConn, project.ID)
+	if err != nil {
+		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
+		intentConn.Close()
+		return nil, false, err
+	}
 	intentResult, err := intentConn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
 		(operation_id, hosting_project_id, hosting_deployment_id, operation_type, release_digest, runtime_endpoint,
-		 expected_previous_release_digest, expected_previous_runtime_endpoint, status, created_at, updated_at)
-		VALUES (?, ?, ?, 'rollback', ?, ?, ?, ?, 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`,
+		 expected_previous_release_digest, expected_previous_runtime_endpoint, route_generation, status, created_at, updated_at)
+		VALUES (?, ?, ?, 'rollback', ?, ?, ?, ?, ?, 'pending', ?, ?) ON CONFLICT(operation_id) DO NOTHING`,
 		operationID, project.ID, deploymentID, digest, release.RuntimeEndpoint, previous, previousEndpoint,
-		formatSQLiteTime(now), formatSQLiteTime(now))
+		routeGeneration, formatSQLiteTime(now), formatSQLiteTime(now))
 	if err != nil {
 		_, _ = intentConn.ExecContext(context.Background(), `ROLLBACK`)
 		intentConn.Close()
@@ -785,10 +806,28 @@ func rollbackHostingRelease(ctx context.Context, token *ServiceToken, externalID
 	if err != nil {
 		return nil, false, err
 	}
-	activation, err := proxy.Activate(ctx, proxyActivationRequest{OperationID: operationID, ExternalProjectID: externalID, ReleaseDigest: digest, RuntimeEndpoint: release.RuntimeEndpoint, ExpectedPreviousReleaseDigest: previous})
+	activation, err := proxy.Activate(ctx, proxyActivationRequest{OperationID: operationID,
+		ExternalProjectID: externalID, ReleaseDigest: digest, RuntimeEndpoint: release.RuntimeEndpoint,
+		ExpectedPreviousReleaseDigest: previous, RouteGeneration: routeGeneration})
 	if err != nil {
 		_ = markHostingProxyOperationError(ctx, operationID, errCodeProxyUnavailable)
 		return nil, false, err
+	}
+	current, err := hostingProxyOperationIsCurrent(ctx, operationID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !current {
+		if err := markHostingProxyOperationFailed(ctx, operationID, errCodeConflict); err != nil {
+			return nil, false, err
+		}
+		state := &hostingCompletionState{ProjectID: project.ID, DeploymentID: deploymentID,
+			ExternalProjectID: externalID, ExternalDeploymentID: release.ExternalDeploymentID,
+			PreviousReleaseDigest: previous, PreviousRuntimeEndpoint: previousEndpoint}
+		if err := compensateCancelledActivation(ctx, proxy, state, digest); err != nil {
+			return nil, false, err
+		}
+		return nil, false, &hostingAPIError{Code: errCodeConflict, Message: "a newer routing intent superseded rollback", StatusCode: http.StatusConflict}
 	}
 	if err := markHostingProxyOperationApplied(ctx, operationID, activation.RouteRevision); err != nil {
 		return nil, false, err

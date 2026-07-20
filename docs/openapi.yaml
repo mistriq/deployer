@@ -1112,7 +1112,8 @@ paths:
   /api/internal/v1/projects/{externalProjectId}/suspend:
     post:
       tags: [internal]
-      summary: Suspend routing without deleting releases
+      summary: Accept suspended desired state without deleting releases
+      description: The response acknowledges durable desired state. Proxy convergence is generation-fenced and may complete asynchronously after an adapter outage.
       operationId: suspendInternalProject
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1120,16 +1121,16 @@ paths:
         - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
-          description: Project desired state.
+          description: Durable project desired state accepted; an identical replay returns the original acceptance.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDesiredState"}
-        "502": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/projects/{externalProjectId}/resume:
     post:
       tags: [internal]
-      summary: Resume routing for the retained active release
+      summary: Accept active desired state for the retained release
+      description: The response acknowledges durable desired state. Proxy convergence is generation-fenced and may complete asynchronously after an adapter outage.
       operationId: resumeInternalProject
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1137,11 +1138,10 @@ paths:
         - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
-          description: Project desired state.
+          description: Durable project desired state accepted; an identical replay returns the original acceptance.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDesiredState"}
-        "502": {$ref: "#/components/responses/Error"}
 
   /api/internal/v1/projects/{externalProjectId}/kill-switch:
     put:
