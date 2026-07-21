@@ -3855,6 +3855,50 @@ func TestHostingRunnerCredentialsAreSeparateHashedAndAudited(t *testing.T) {
 	}
 }
 
+func TestHostingRunnerClassAndHeartbeatLabelsStayHostingScoped(t *testing.T) {
+	withTempDB(t)
+	runner, err := createHostingRunner(t.Context(), hostingRunnerInput{
+		Name: "class-label-runner", Labels: []string{"linux"}, ExecutionClass: "hosting",
+		ProtocolVersion: hostingRunnerProtocolVersion, ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"22"},
+		Capacity: capacityDTO{CPUMillis: 2000, RAMBytes: 2 << 30, DiskBytes: 10 << 30, PIDs: 512},
+		Reserve:  capacityDTO{CPUMillis: 250, RAMBytes: 256 << 20, DiskBytes: 1 << 30, PIDs: 32},
+	}, "class-label-request")
+	if err != nil || runner.ExecutionClass != "hosting" {
+		t.Fatalf("runner class=%q err=%v", runner.ExecutionClass, err)
+	}
+	if _, err := createHostingRunner(t.Context(), hostingRunnerInput{
+		Name: "legacy-class-runner", ExecutionClass: "legacy", ProtocolVersion: hostingRunnerProtocolVersion,
+		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"22"},
+		Capacity: capacityDTO{CPUMillis: 2000, RAMBytes: 2 << 30, DiskBytes: 10 << 30, PIDs: 512},
+		Reserve:  capacityDTO{CPUMillis: 250, RAMBytes: 256 << 20, DiskBytes: 1 << 30, PIDs: 32},
+	}, "legacy-class-request"); err == nil {
+		t.Fatal("non-hosting execution class was accepted")
+	}
+	sessionID := strings.TrimPrefix(hashHostingOperation("test.runner.session", fmt.Sprint(runner.ID)), "sha256:")[:48]
+	payload, err := json.Marshal(hostingHeartbeatRequest{Free: runner.Capacity, Labels: []string{"linux", "arm64"},
+		ProtocolVersion: hostingRunnerProtocolVersion, ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"22"},
+		Operations: []string{"build", hostingRunnerInventoryOperation}, SessionID: sessionID, Sequence: 1,
+		RuntimeInventory: &[]hostingObservedRuntime{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/heartbeat", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(context.WithValue(req.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: runner.ID}))
+	rec := httptest.NewRecorder()
+	handleHostingAgentHeartbeat(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var labels string
+	if err := db.QueryRow(`SELECT execution_class, labels_json FROM hosting_runners WHERE id=?`, runner.ID).Scan(&runner.ExecutionClass, &labels); err != nil {
+		t.Fatal(err)
+	}
+	if runner.ExecutionClass != "hosting" || labels != `["linux","arm64"]` {
+		t.Fatalf("stored class/labels=%q/%s", runner.ExecutionClass, labels)
+	}
+}
+
 func TestHostingServiceAndLegacyCredentialsCannotCrossExecutionBoundaries(t *testing.T) {
 	withTempDB(t)
 	hostingRunner, err := createHostingRunner(t.Context(), hostingRunnerInput{

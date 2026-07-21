@@ -24,6 +24,7 @@ const (
 type HostingRunner struct {
 	ID               int64       `json:"id"`
 	Name             string      `json:"name"`
+	ExecutionClass   string      `json:"execution_class"`
 	Token            string      `json:"token,omitempty"`
 	Labels           []string    `json:"labels"`
 	ProtocolVersion  string      `json:"protocol_version"`
@@ -42,6 +43,7 @@ type hostingRunnerContextKey struct{}
 
 type hostingRunnerInput struct {
 	Name             string      `json:"name"`
+	ExecutionClass   string      `json:"execution_class,omitempty"`
 	Labels           []string    `json:"labels"`
 	ProtocolVersion  string      `json:"protocol_version"`
 	ManifestVersions []string    `json:"manifest_versions"`
@@ -123,6 +125,12 @@ func handleAPIHostingRunner(w http.ResponseWriter, r *http.Request) {
 
 func createHostingRunner(ctx context.Context, input hostingRunnerInput, requestID string) (*HostingRunner, error) {
 	input.Name = strings.TrimSpace(input.Name)
+	if input.ExecutionClass == "" {
+		input.ExecutionClass = "hosting"
+	}
+	if input.ExecutionClass != "hosting" {
+		return nil, fmt.Errorf("runner execution_class must be hosting")
+	}
 	if input.Name == "" || len(input.Name) > 100 {
 		return nil, fmt.Errorf("name must contain 1-100 characters")
 	}
@@ -186,7 +194,7 @@ func createHostingRunner(ctx context.Context, input hostingRunnerInput, requestI
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &HostingRunner{ID: id, Name: input.Name, Token: token, Labels: normalizeStringList(input.Labels), ProtocolVersion: input.ProtocolVersion, ManifestVersions: normalizeStringList(input.ManifestVersions), RuntimeVersions: normalizeStringList(input.RuntimeVersions), Operations: input.Operations, Capacity: input.Capacity, Reserve: input.Reserve, Status: "offline", CreatedAt: now}, nil
+	return &HostingRunner{ID: id, Name: input.Name, Token: token, ExecutionClass: input.ExecutionClass, Labels: normalizeStringList(input.Labels), ProtocolVersion: input.ProtocolVersion, ManifestVersions: normalizeStringList(input.ManifestVersions), RuntimeVersions: normalizeStringList(input.RuntimeVersions), Operations: input.Operations, Capacity: input.Capacity, Reserve: input.Reserve, Status: "offline", CreatedAt: now}, nil
 }
 
 func validateCapacity(capacity, reserve capacityDTO) error {
@@ -285,6 +293,7 @@ func hostingRunnerAuthMiddleware(next http.Handler) http.Handler {
 type hostingHeartbeatRequest struct {
 	Free             capacityDTO               `json:"free"`
 	Draining         bool                      `json:"draining"`
+	Labels           []string                  `json:"labels,omitempty"`
 	ProtocolVersion  string                    `json:"protocol_version"`
 	ManifestVersions []string                  `json:"manifest_versions"`
 	RuntimeVersions  []string                  `json:"runtime_versions"`
@@ -381,6 +390,7 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	manifests, _ := json.Marshal(normalizeStringList(input.ManifestVersions))
 	runtimes, _ := json.Marshal(normalizeStringList(input.RuntimeVersions))
 	operations, _ := json.Marshal(input.Operations)
+	labels, _ := json.Marshal(normalizeStringList(input.Labels))
 	now := time.Now().UTC()
 	conn, err := db.Conn(r.Context())
 	if err != nil {
@@ -469,9 +479,9 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	result, err := conn.ExecContext(r.Context(), `UPDATE hosting_runners SET
 		reported_free_cpu_millis=MIN(capacity_cpu_millis, ?), reported_free_ram_bytes=MIN(capacity_ram_bytes, ?),
 		reported_free_disk_bytes=MIN(capacity_disk_bytes, ?), reported_free_pids=MIN(capacity_pids, ?),
-		draining=?, protocol_version=?, manifest_versions_json=?, runtime_versions_json=?, operation_capabilities_json=?,
+		draining=?, labels_json=CASE WHEN ? <> '[]' THEN ? ELSE labels_json END, protocol_version=?, manifest_versions_json=?, runtime_versions_json=?, operation_capabilities_json=?,
 		active_session_id=?, last_heartbeat_sequence=?, status='online', last_seen=? WHERE id=?`,
-		input.Free.CPUMillis, input.Free.RAMBytes, input.Free.DiskBytes, input.Free.PIDs, input.Draining,
+		input.Free.CPUMillis, input.Free.RAMBytes, input.Free.DiskBytes, input.Free.PIDs, input.Draining, string(labels), string(labels),
 		input.ProtocolVersion, string(manifests), string(runtimes), string(operations), sessionID, sequence,
 		formatSQLiteTime(now), runner.ID)
 	if err != nil {

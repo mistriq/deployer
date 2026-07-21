@@ -43,6 +43,7 @@ type hostingAgentConfig struct {
 	SessionAccepted         *atomic.Bool
 	HeartbeatMu             *sync.Mutex
 	Draining                bool
+	Labels                  []string
 }
 
 var errHostingAgentSessionSuperseded = errors.New("hosting agent session was superseded")
@@ -71,10 +72,15 @@ func runHostingAgent() {
 	secretBrokerURL := flags.String("secret-broker", os.Getenv("DEPLOYER_HOSTING_SECRET_BROKER_URL"), "Private workload secret broker URL")
 	secretBrokerTimeout := flags.Duration("secret-broker-timeout", getenvDurationDefault("DEPLOYER_HOSTING_SECRET_BROKER_TIMEOUT", 15*time.Second), "Workload secret redemption timeout")
 	draining := flags.Bool("draining", getenvBoolDefault("DEPLOYER_HOSTING_AGENT_DRAINING", false), "Advertise drain state and do not claim new work")
+	labels := flags.String("labels", getenvDefault("DEPLOYER_HOSTING_AGENT_LABELS", "linux,hosting"), "Comma-separated hosting runner labels")
 	flags.Parse(os.Args[2:])
 	if *serverURL == "" || *token == "" || !filepath.IsAbs(*workRoot) {
 		fmt.Fprintln(os.Stderr, "Usage: deployer hosting-agent --server URL --token TOKEN --work-root ABSOLUTE_PATH")
 		os.Exit(1)
+	}
+	configuredLabels := normalizeStringList(strings.Split(*labels, ","))
+	if len(configuredLabels) == 0 {
+		logFatal("hosting_agent_config_error", "at least one runner label is required", nil, nil)
 	}
 	*serverURL = strings.TrimRight(*serverURL, "/")
 	if err := validateServerURL(*serverURL); err != nil {
@@ -116,6 +122,7 @@ func runHostingAgent() {
 		SecretBrokerURL: *secretBrokerURL, SecretBrokerTimeout: *secretBrokerTimeout, SecretMemoryRoot: secretMemoryRoot,
 		SessionID: generateToken(), HeartbeatSequence: new(atomic.Int64), SessionAccepted: new(atomic.Bool),
 		HeartbeatMu: new(sync.Mutex), Draining: *draining}
+	config.Labels = configuredLabels
 	config.PriorAcceptedSessionIDs, err = loadHostingAcceptedSessions(canonicalWorkRoot)
 	if err != nil {
 		logFatal("hosting_agent_runtime_error", "load accepted runner session", err, nil)
@@ -330,7 +337,7 @@ func publishHostingAgentHeartbeat(ctx context.Context, config hostingAgentConfig
 	if config.HeartbeatSequence != nil {
 		sequence = config.HeartbeatSequence.Add(1)
 	}
-	payload := hostingHeartbeatRequest{Free: free, Draining: config.Draining, ProtocolVersion: hostingRunnerProtocolVersion,
+	payload := hostingHeartbeatRequest{Free: free, Draining: config.Draining, Labels: normalizeStringList(config.Labels), ProtocolVersion: hostingRunnerProtocolVersion,
 		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"20", "22"},
 		Operations: hostingAgentOperations(config), SessionID: config.SessionID, Sequence: sequence,
 		RuntimeInventory: &inventory}
