@@ -17,12 +17,13 @@ type hostingMetricsResponse struct {
 		OldestAgeSeconds float64 `json:"oldest_age_seconds"`
 	} `json:"queue"`
 	Deployments struct {
-		Terminal               int     `json:"terminal"`
-		Successful             int     `json:"successful"`
-		Failed                 int     `json:"failed"`
-		Cancelled              int     `json:"cancelled"`
-		SuccessRate            float64 `json:"success_rate"`
-		AverageDurationSeconds float64 `json:"average_duration_seconds"`
+		Terminal               int            `json:"terminal"`
+		Successful             int            `json:"successful"`
+		Failed                 int            `json:"failed"`
+		Cancelled              int            `json:"cancelled"`
+		SuccessRate            float64        `json:"success_rate"`
+		AverageDurationSeconds float64        `json:"average_duration_seconds"`
+		FailureCodes           map[string]int `json:"failure_codes"`
 	} `json:"deployments"`
 	Runners struct {
 		Online   int         `json:"online"`
@@ -52,6 +53,7 @@ func handleInternalHostingMetrics(w http.ResponseWriter, r *http.Request) {
 
 func collectHostingMetrics(ctx context.Context, now time.Time) (*hostingMetricsResponse, error) {
 	result := &hostingMetricsResponse{ObservedAt: now, Window: "24h"}
+	result.Deployments.FailureCodes = make(map[string]int)
 	var oldestQueued sql.NullString
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), MIN(created_at) FROM hosting_jobs WHERE status='queued'`).Scan(&result.Queue.QueuedJobs, &oldestQueued); err != nil {
 		return nil, err
@@ -74,15 +76,36 @@ func collectHostingMetrics(ctx context.Context, now time.Time) (*hostingMetricsR
 	if result.Deployments.Terminal > 0 {
 		result.Deployments.SuccessRate = float64(result.Deployments.Successful) / float64(result.Deployments.Terminal)
 	}
+	failureRows, err := db.QueryContext(ctx, `SELECT failure_code, COUNT(*) FROM hosting_deployments
+		WHERE status IN ('failed','cancelled') AND finished_at>=? AND failure_code<>'' GROUP BY failure_code`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	for failureRows.Next() {
+		var code string
+		var count int
+		if err := failureRows.Scan(&code, &count); err != nil {
+			failureRows.Close()
+			return nil, err
+		}
+		if !validHostingEventFailureCode(code) {
+			failureRows.Close()
+			return nil, fmt.Errorf("invalid persisted hosting failure code %q", code)
+		}
+		result.Deployments.FailureCodes[code] = count
+	}
+	if err := failureRows.Close(); err != nil {
+		return nil, err
+	}
 	if err := db.QueryRowContext(ctx, `SELECT
 		COALESCE(SUM(CASE WHEN status='online' THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN status='offline' THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(capacity_cpu_millis), 0), COALESCE(SUM(capacity_ram_bytes), 0),
-		COALESCE(SUM(capacity_disk_bytes), 0), COALESCE(SUM(capacity_pids), 0),
-		COALESCE(SUM(free_cpu_millis), 0), COALESCE(SUM(free_ram_bytes), 0),
-		COALESCE(SUM(free_disk_bytes), 0), COALESCE(SUM(free_pids), 0),
-		COALESCE(SUM(reserve_cpu_millis), 0), COALESCE(SUM(reserve_ram_bytes), 0),
-		COALESCE(SUM(reserve_disk_bytes), 0), COALESCE(SUM(reserve_pids), 0)
+		COALESCE(SUM(CASE WHEN status='online' THEN capacity_cpu_millis ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status='online' THEN capacity_ram_bytes ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status='online' THEN capacity_disk_bytes ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status='online' THEN capacity_pids ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status='online' THEN free_cpu_millis ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status='online' THEN free_ram_bytes ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status='online' THEN free_disk_bytes ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status='online' THEN free_pids ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status='online' THEN reserve_cpu_millis ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status='online' THEN reserve_ram_bytes ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status='online' THEN reserve_disk_bytes ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status='online' THEN reserve_pids ELSE 0 END), 0)
 		FROM hosting_runners`).Scan(&result.Runners.Online, &result.Runners.Offline,
 		&result.Runners.Capacity.CPUMillis, &result.Runners.Capacity.RAMBytes, &result.Runners.Capacity.DiskBytes, &result.Runners.Capacity.PIDs,
 		&result.Runners.Free.CPUMillis, &result.Runners.Free.RAMBytes, &result.Runners.Free.DiskBytes, &result.Runners.Free.PIDs,

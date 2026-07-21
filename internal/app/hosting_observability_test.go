@@ -78,6 +78,34 @@ func TestCollectHostingMetricsReportsQueueCapacityAndCallbacks(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
+	insertTerminal := func(externalID, status, failureCode string, started time.Time) int64 {
+		t.Helper()
+		result, err := db.Exec(`INSERT INTO hosting_deployments
+			(hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest,
+			 status, phase, failure_code, callback_state, started_at, finished_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`, project.ID, externalID,
+			strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64), status, status,
+			failureCode, formatSQLiteTime(started), formatSQLiteTime(now), formatSQLiteTime(started), formatSQLiteTime(now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	activeID := insertTerminal("deployment_01JMETRICSUCCESS", "active", "", now.Add(-20*time.Second))
+	failedID := insertTerminal("deployment_01JMETRICFAILED", "failed", "build_failed", now.Add(-10*time.Second))
+	if _, err := db.Exec(`INSERT INTO callback_outbox
+		(event_id, hosting_deployment_id, payload_json, payload_hash, status, attempts, next_attempt_at, created_at)
+		VALUES (?, ?, '{}', ?, 'pending', 0, ?, ?)`, "evt_"+strings.Repeat("a", 32), failedID,
+		"sha256:"+strings.Repeat("c", 64), formatSQLiteTime(now), formatSQLiteTime(now.Add(-30*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	if activeID == 0 {
+		t.Fatal("missing successful deployment ID")
+	}
 	metrics, err := collectHostingMetrics(t.Context(), now)
 	if err != nil {
 		t.Fatal(err)
@@ -88,8 +116,10 @@ func TestCollectHostingMetricsReportsQueueCapacityAndCallbacks(t *testing.T) {
 	if metrics.Runners.Online != 1 || metrics.Runners.Capacity.CPUMillis != limits.CPUMillis || metrics.Runners.Free.CPUMillis != 0 {
 		t.Fatalf("runner metrics = %+v", metrics.Runners)
 	}
-	if metrics.Callbacks.Pending != 0 || metrics.Deployments.Terminal != 0 {
-		t.Fatalf("unexpected terminal metrics = %+v callbacks=%+v", metrics.Deployments, metrics.Callbacks)
+	if metrics.Callbacks.Pending != 1 || metrics.Callbacks.OldestLagSeconds < 25 || metrics.Deployments.Terminal != 2 ||
+		metrics.Deployments.Successful != 1 || metrics.Deployments.Failed != 1 || metrics.Deployments.SuccessRate != 0.5 ||
+		metrics.Deployments.FailureCodes["build_failed"] != 1 || metrics.Deployments.AverageDurationSeconds <= 0 {
+		t.Fatalf("terminal metrics = %+v callbacks=%+v", metrics.Deployments, metrics.Callbacks)
 	}
 }
 

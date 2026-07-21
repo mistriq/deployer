@@ -3377,7 +3377,7 @@ components:
             oldest_age_seconds: {type: number}
         deployments:
           type: object
-          required: [terminal, successful, failed, cancelled, success_rate, average_duration_seconds]
+          required: [terminal, successful, failed, cancelled, success_rate, average_duration_seconds, failure_codes]
           properties:
             terminal: {type: integer}
             successful: {type: integer}
@@ -3385,6 +3385,10 @@ components:
             cancelled: {type: integer}
             success_rate: {type: number, minimum: 0, maximum: 1}
             average_duration_seconds: {type: number}
+            failure_codes:
+              type: object
+              additionalProperties: {type: integer, minimum: 1}
+              description: Counts by stable HostingFailureCode during the metrics window.
         runners:
           type: object
           required: [online, offline, capacity, free, reserve]
