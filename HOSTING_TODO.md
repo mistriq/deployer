@@ -29,7 +29,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Separate hosting projects/jobs/runners from trusted admin projects.
 - [x] Exact commit SHA and immutable artifact digest on every hosting deployment.
 - [x] Atomic idempotency and one-active-deployment guard under concurrency.
-- [ ] Stable deployment phases and transition validation.
+- [x] Stable deployment phases and transition validation.
 - [x] Fence conflicting runner completion payloads before proxy activation.
 - [x] Compare-and-swap immutable release artifact attachment under concurrent uploads.
 - [ ] Idempotent cancel for queued and running deployments.
@@ -38,8 +38,8 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Immutable release persistence and selected-release rollback.
 - [x] Bind rollback and runtime recovery to each release's immutable runtime manifest.
 - [x] Make rollback identity unambiguous for content-identical release instances.
-- [ ] Candidate health gate before activation.
-- [ ] Failed candidate leaves previous healthy release untouched.
+- [x] Candidate health gate before activation.
+- [x] Failed candidate leaves previous healthy release untouched.
 - [ ] Suspend/resume without deleting releases.
 - [ ] Restart reconciliation for Deployer and runner interruptions.
 
@@ -79,7 +79,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Per-project deployment serialization tests.
 - [x] Exact commit/artifact mismatch rejection tests.
 - [ ] Callback signing, retry, replay and polling reconciliation tests.
-- [ ] Health failure preserves active release test.
+- [x] Health failure preserves active release test.
 - [ ] Cancel, rollback, suspend/resume and restart recovery tests.
 - [ ] Forbidden workload and secret-redaction security tests.
 - [x] Full `go test ./...`, `go test -race ./...`, `go vet ./...` and `git diff --check` pass.

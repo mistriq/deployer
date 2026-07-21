@@ -51,11 +51,13 @@ func setupHostingRollbackTestFixture(t *testing.T) (*hostingRollbackTestFixture,
 	project, token, runnerID, targetJob := createAndClaimHostingJob(t,
 		"project_01JRBIDEMPOTENT", targetDeploymentID)
 	targetDigest := "sha256:" + strings.Repeat("3", 64)
+	targetArtifact := attachTestReleaseArtifact(t, targetJob.JobID, targetDigest)
+	observeHostingJobEndpointForTest(t, targetJob.JobID, targetHealth.URL)
 	if err := completeHostingJob(t.Context(), runnerID, targetJob.JobID, targetJob.LeaseGeneration,
 		targetJob.LeaseToken, hostingCompletionRequest{
 			Status:                "success",
 			ReleaseDigest:         targetDigest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, targetJob.JobID, targetDigest),
+			ReleaseArtifactDigest: targetArtifact,
 			RuntimeEndpoint:       targetHealth.URL,
 			HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)},
 		}); err != nil {
@@ -73,12 +75,15 @@ func setupHostingRollbackTestFixture(t *testing.T) (*hostingRollbackTestFixture,
 	if err != nil {
 		t.Fatalf("claim current deployment: %v", err)
 	}
+	advanceHostingJobToHealthCheckingForTest(t, runnerID, currentJob)
 	currentDigest := "sha256:" + strings.Repeat("4", 64)
+	currentArtifact := attachTestReleaseArtifact(t, currentJob.JobID, currentDigest)
+	observeHostingJobEndpointForTest(t, currentJob.JobID, currentHealth.URL)
 	if err := completeHostingJob(t.Context(), runnerID, currentJob.JobID, currentJob.LeaseGeneration,
 		currentJob.LeaseToken, hostingCompletionRequest{
 			Status:                "success",
 			ReleaseDigest:         currentDigest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, currentJob.JobID, currentDigest),
+			ReleaseArtifactDigest: currentArtifact,
 			RuntimeEndpoint:       currentHealth.URL,
 			HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)},
 		}); err != nil {

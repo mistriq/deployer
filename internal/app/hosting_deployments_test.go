@@ -38,6 +38,12 @@ func insertHostingRunnerForTest(t *testing.T, name string, free hostingWorkloadL
 	if err != nil {
 		t.Fatalf("hosting runner ID: %v", err)
 	}
+	sessionID := strings.TrimPrefix(hashHostingOperation("test.runner.session", fmt.Sprint(id)), "sha256:")[:48]
+	if _, err := db.Exec(`UPDATE hosting_runners SET active_session_id=?, last_heartbeat_sequence=1,
+		operation_capabilities_json='["build","restore","runtime-secrets-v1","runtime-inventory-v1"]'
+		WHERE id=?`, sessionID, id); err != nil {
+		t.Fatalf("enable hosting runner inventory: %v", err)
+	}
 	return id
 }
 
@@ -789,7 +795,7 @@ func TestSecretHostingDeploymentRequiresSecretReadyRunnerBeforeSourceRedemption(
 	project, token := provisionDeploymentTestProject(t, "project_01JSECCAP")
 	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
 	runnerID := insertHostingRunnerForTest(t, "legacy-secret-runner", limits)
-	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, runnerID); err != nil {
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore","runtime-inventory-v1"]' WHERE id=?`, runnerID); err != nil {
 		t.Fatal(err)
 	}
 	appConfig.HostingWorkloadIdentitySecret = strings.Repeat("identity-signing-key-", 2)
@@ -826,7 +832,7 @@ func TestSecretHostingJobIsFencedAndReassignedAfterCapabilityRemoval(t *testing.
 	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JSECREASSIGN", request); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, firstRunnerID); err != nil {
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore","runtime-inventory-v1"]' WHERE id=?`, firstRunnerID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := claimHostingJob(t.Context(), firstRunnerID); !errors.Is(err, errNoHostingJob) {
@@ -1125,10 +1131,10 @@ func TestHostingMigrationsCreateDurableLifecycleSchema(t *testing.T) {
 		"hosting_projects":                             {"desired_state", "kill_switch_reason", "runner_selector_json", "route_generation"},
 		"hosting_deployments":                          {"phase", "failure_code", "cancel_requested_at", "request_hash"},
 		"hosting_idempotency":                          {"issuer_token_id", "operation", "request_hash", "response_body", "operation_reference"},
-		"hosting_jobs":                                 {"lease_generation", "lease_expires_at", "cancel_requested_at", "completion_fingerprint", "runtime_observed_at", "runtime_observed_session_id", "runtime_observed_release_digest", "runtime_observed_instance_id"},
+		"hosting_jobs":                                 {"lease_generation", "lease_expires_at", "cancel_requested_at", "completion_fingerprint", "runtime_observed_at", "runtime_observed_session_id", "runtime_observed_release_digest", "runtime_observed_instance_id", "runtime_observed_endpoint"},
 		"hosting_releases":                             {"health_evidence_json", "route_revision", "runtime_endpoint", "runtime_runner_id", "runtime_generation", "runtime_instance_id", "runtime_manifest_json", "runtime_observed_at", "runtime_observed_session_id", "runtime_missing_since", "runtime_missing_observations", "runtime_failure_code"},
 		"hosting_runners":                              {"operation_capabilities_json", "active_session_id", "last_heartbeat_sequence"},
-		"hosting_runtime_recoveries":                   {"hosting_release_id", "hosting_runner_id", "lease_generation", "lease_token_hash", "lease_expires_at", "completion_fingerprint", "runtime_owner_runner_id", "allow_owner_runner", "runtime_observed_at", "runtime_observed_session_id", "runtime_observed_release_digest", "runtime_observed_instance_id"},
+		"hosting_runtime_recoveries":                   {"hosting_release_id", "hosting_runner_id", "lease_generation", "lease_token_hash", "lease_expires_at", "completion_fingerprint", "runtime_owner_runner_id", "allow_owner_runner", "runtime_observed_at", "runtime_observed_session_id", "runtime_observed_release_digest", "runtime_observed_instance_id", "runtime_observed_endpoint"},
 		"hosting_runtime_recovery_completion_receipts": {"hosting_runtime_recovery_id", "lease_generation", "hosting_runner_id", "lease_token_hash", "completion_fingerprint", "accepted_at"},
 		"hosting_proxy_operations":                     {"hosting_runtime_recovery_id", "operation_type", "status", "expected_previous_runtime_endpoint", "route_generation", "desired_state", "target_runtime_runner_id", "target_runtime_instance_id", "target_runtime_session_id"},
 		"callback_outbox":                              {"event_id", "payload_hash", "next_attempt_at"},
@@ -1142,7 +1148,7 @@ func TestHostingMigrationsCreateDurableLifecycleSchema(t *testing.T) {
 			}
 		}
 	}
-	for _, migrationID := range []string{"017_hosting_lifecycle", "018_hosting_idempotency_events", "019_hosting_runners_jobs", "020_hosting_releases_callbacks", "021_service_credentials_audit", "022_hosting_release_runtime_endpoint", "023_callback_outbox_leases", "024_hosting_job_source_artifact", "025_hosting_audit_events", "026_hosting_recovery_invariants", "027_hosting_release_artifacts", "028_hosting_runtime_recovery", "029_hosting_runtime_capabilities", "030_hosting_recovery_completion_fingerprint", "031_hosting_recovery_completion_receipts", "032_hosting_job_completion_fingerprint", "033_hosting_release_runtime_snapshot", "034_hosting_proxy_previous_runtime", "035_hosting_proxy_route_generation", "036_hosting_runtime_inventory", "037_hosting_runner_session_handoff", "038_hosting_idempotency_operation_reference"} {
+	for _, migrationID := range []string{"017_hosting_lifecycle", "018_hosting_idempotency_events", "019_hosting_runners_jobs", "020_hosting_releases_callbacks", "021_service_credentials_audit", "022_hosting_release_runtime_endpoint", "023_callback_outbox_leases", "024_hosting_job_source_artifact", "025_hosting_audit_events", "026_hosting_recovery_invariants", "027_hosting_release_artifacts", "028_hosting_runtime_recovery", "029_hosting_runtime_capabilities", "030_hosting_recovery_completion_fingerprint", "031_hosting_recovery_completion_receipts", "032_hosting_job_completion_fingerprint", "033_hosting_release_runtime_snapshot", "034_hosting_proxy_previous_runtime", "035_hosting_proxy_route_generation", "036_hosting_runtime_inventory", "037_hosting_runner_session_handoff", "038_hosting_idempotency_operation_reference", "039_hosting_activation_previous_endpoint", "040_hosting_inventory_runtime_endpoint"} {
 		var count int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE id=?`, migrationID).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("migration %s count=%d err=%v", migrationID, count, err)

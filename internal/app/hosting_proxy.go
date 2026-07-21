@@ -106,7 +106,9 @@ func (client *httpHostingProxyClient) doJSON(ctx context.Context, method, path s
 	defer response.Body.Close()
 	limited, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 	if err != nil {
-		return fmt.Errorf("read proxy adapter response: %w", err)
+		return &hostingAPIError{Code: errCodeProxyUnavailable,
+			Message:    "reverse-proxy adapter response was ambiguous",
+			StatusCode: http.StatusServiceUnavailable, Err: err}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		if response.StatusCode >= http.StatusInternalServerError ||
@@ -124,7 +126,9 @@ func (client *httpHostingProxyClient) doJSON(ctx context.Context, method, path s
 	decoder := json.NewDecoder(bytes.NewReader(limited))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(responseBody); err != nil {
-		return fmt.Errorf("decode proxy adapter response: %w", err)
+		return &hostingAPIError{Code: errCodeProxyUnavailable,
+			Message:    "reverse-proxy adapter returned an ambiguous response",
+			StatusCode: http.StatusServiceUnavailable, Err: err}
 	}
 	return nil
 }

@@ -370,6 +370,26 @@ Deployer derives runtime namespaces from `external_project_id` and stores hostin
 state separately from trusted admin projects/builds. Hosting jobs cannot enter
 the legacy builder, Compose, Dockerfile, SSH, or `post_deploy` paths.
 
+Hosting jobs advance through `fetching_source`, `building`,
+`starting_candidate`, and `health_checking` in order; repeating the current
+phase is safe, while skips and regressions conflict. An initial successful
+completion is accepted only from `health_checking`; an exact replay of an
+already durable staged completion resumes its existing `activating` intent.
+Runner health evidence is followed by an
+exact runtime observation from the runner's current fenced inventory session,
+including the endpoint derived from the managed container's sole private port
+binding; the completion endpoint must match that observation exactly.
+Inventory-less runners are ineligible for new work. Deployer then
+applies a fresh HTTP health gate that rejects redirects before
+generation-fenced proxy activation. A terminal candidate health or activation
+failure leaves the previous active release unchanged. Activation intents retain
+the exact prior runtime endpoint so restart compensation cannot select a
+content-identical historical instance. After a Deployer restart,
+expired leases are fenced and requeued for compatible placement, repeated lease
+loss terminates with `runner_lost`, and pending activation is freshly revalidated
+before reconciliation continues; an ambiguous adapter `503` remains durable and
+the agent retries the exact completion under its current lease.
+
 The exact provision request body must be authenticated with the service token
 and sent as `Content-Type: application/json`, signed using these headers:
 

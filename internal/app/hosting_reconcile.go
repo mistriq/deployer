@@ -328,7 +328,7 @@ func reconcileHostingDesiredStateOperations(ctx context.Context) error {
 
 func reconcileHostingActivationOperations(ctx context.Context) error {
 	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.status, op.release_digest,
-		op.runtime_endpoint, op.expected_previous_release_digest, op.route_revision,
+		op.runtime_endpoint, op.expected_previous_release_digest, op.expected_previous_runtime_endpoint, op.route_revision,
 		op.route_generation, p.route_generation,
 		j.id, j.hosting_deployment_id, d.hosting_project_id, j.hosting_runner_id,
 		j.lease_generation, j.lease_token_hash, j.status, p.external_project_id,
@@ -359,7 +359,8 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 	for rows.Next() {
 		var operation pendingActivation
 		if err := rows.Scan(&operation.operationID, &operation.status, &operation.releaseDigest,
-			&operation.runtimeEndpoint, &operation.state.PreviousReleaseDigest, &operation.routeRevision,
+			&operation.runtimeEndpoint, &operation.state.PreviousReleaseDigest,
+			&operation.state.PreviousRuntimeEndpoint, &operation.routeRevision,
 			&operation.state.RouteGeneration, &operation.currentGeneration,
 			&operation.state.JobID, &operation.state.DeploymentID, &operation.state.ProjectID,
 			&operation.state.RunnerID, &operation.state.LeaseGeneration, &operation.state.LeaseTokenHash,
@@ -374,9 +375,6 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 			rows.Close()
 			return err
 		}
-		_ = db.QueryRowContext(ctx, `SELECT runtime_endpoint FROM hosting_releases
-			WHERE hosting_project_id=? AND release_digest=?`, operation.state.ProjectID,
-			operation.state.PreviousReleaseDigest).Scan(&operation.state.PreviousRuntimeEndpoint)
 		operations = append(operations, operation)
 	}
 	if err := rows.Close(); err != nil {
@@ -397,15 +395,13 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 		if err := json.Unmarshal([]byte(operation.runtimeManifestJSON), &runtimeManifest); err != nil {
 			return err
 		}
-		runnerLive := operation.runnerStatus == "online" && operation.runnerLastSeen.Valid &&
+		runnerLive := operation.activeSession != "" && operation.runnerStatus == "online" && operation.runnerLastSeen.Valid &&
 			!parseSQLiteTime(operation.runnerLastSeen.String).Before(time.Now().UTC().Add(-hostingRunnerStaleAfter))
 		expectedInstance := fmt.Sprintf("build-%d-%d", operation.state.JobID, operation.state.LeaseGeneration)
-		exactRuntimeLive := operation.runtimeFailureCode == "" && operation.runtimeInstanceID == expectedInstance
-		if operation.activeSession != "" {
-			exactRuntimeLive = exactRuntimeLive && operation.observedAt.Valid &&
-				!parseSQLiteTime(operation.observedAt.String).Before(time.Now().UTC().Add(-hostingRunnerStaleAfter)) &&
-				operation.observedSession == operation.activeSession
-		}
+		exactRuntimeLive := operation.runtimeFailureCode == "" && operation.runtimeInstanceID == expectedInstance &&
+			operation.observedAt.Valid &&
+			!parseSQLiteTime(operation.observedAt.String).Before(time.Now().UTC().Add(-hostingRunnerStaleAfter)) &&
+			operation.observedSession == operation.activeSession
 		healthPath := runtimeManifest.HealthPath
 		if healthPath == "" {
 			healthPath = "/"
@@ -532,11 +528,18 @@ func placeUnassignedHostingJobs(ctx context.Context, conn *sql.Conn, now time.Ti
 	if globallyDisabled != 0 {
 		return nil
 	}
+	staleBefore := formatSQLiteTime(now.Add(-hostingRunnerStaleAfter))
 	incompatibleRows, err := conn.QueryContext(ctx, `SELECT j.id, j.hosting_runner_id,
 		j.required_cpu_millis, j.required_ram_bytes, j.required_disk_bytes, j.required_pids
 		FROM hosting_jobs j JOIN hosting_runners runner ON runner.id=j.hosting_runner_id
-		WHERE j.status='queued' AND json_array_length(j.secret_refs_json)>0
-		  AND NOT EXISTS (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value=?)`, hostingRunnerSecretOperation)
+		WHERE j.status='queued' AND j.hosting_runner_id IS NOT NULL
+		  AND (runner.status<>'online' OR runner.draining<>0 OR runner.last_seen IS NULL OR runner.last_seen<?
+		    OR runner.active_session_id=''
+		    OR NOT EXISTS (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value='build')
+		    OR NOT EXISTS (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value=?)
+		    OR (json_array_length(j.secret_refs_json)>0 AND NOT EXISTS
+		      (SELECT 1 FROM json_each(runner.operation_capabilities_json) WHERE value=?)))`, staleBefore,
+		hostingRunnerInventoryOperation, hostingRunnerSecretOperation)
 	if err != nil {
 		return err
 	}

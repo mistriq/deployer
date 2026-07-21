@@ -1738,6 +1738,11 @@ paths:
     post:
       tags: [hosting-agent]
       summary: Report a validated workload phase using a current lease
+      description: >
+        The accepted order is fetching_source, building, starting_candidate,
+        then health_checking. Repeating the current phase is idempotent. Skips,
+        regressions, and reports for a deployment that is no longer running
+        return 409.
       operationId: reportHostingJobPhase
       security: [{hostingAgentBearerAuth: []}]
       parameters:
@@ -1757,8 +1762,15 @@ paths:
                   type: string
                   enum: [fetching_source, building, starting_candidate, health_checking]
       responses:
-        "204": {description: Phase accepted.}
+        "204": {description: Phase accepted or identical current phase repeated.}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
 
   /api/hosting-agent/v1/jobs/{hostingJobId}/logs:
     post:
@@ -1784,6 +1796,22 @@ paths:
     post:
       tags: [hosting-agent]
       summary: Complete a lease with stable structured outcome and health evidence
+      description: >
+        An initial success completion is accepted only after the deployment
+        reaches health_checking; an exact replay of an already durable staged
+        completion resumes its existing activating intent. Failed or cancelled
+        outcomes may terminate earlier.
+        Runner health evidence alone never activates a release. Deployer also
+        requires a recent exact runtime observation from the current fenced
+        runner inventory session, including an exact match between the observed
+        endpoint and completion runtime_endpoint. It then performs a fresh HTTP health check
+        without following redirects before sending a generation-fenced
+        activation to the private proxy adapter. The durable intent records the
+        exact prior runtime endpoint for restart-safe compensation. A terminal health or activation failure leaves
+        the previous active release unchanged. A transient or ambiguous adapter
+        outcome returns 503 while the persisted candidate and activation intent
+        remain pending; the agent must retry the exact completion, and restart
+        reconciliation revalidates health and resumes the same intent.
       operationId: completeHostingJob
       security: [{hostingAgentBearerAuth: []}]
       parameters:
@@ -1796,10 +1824,22 @@ paths:
           application/json:
             schema: {$ref: "#/components/schemas/HostingCompletion"}
       responses:
-        "204": {description: Completion committed or identical terminal completion replayed.}
+        "204":
+          description: Completion durably processed, or an identical terminal completion replayed. Poll deployment state for the authoritative active, failed, or cancelled outcome.
         "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "502": {$ref: "#/components/responses/Error"}
+        "503":
+          description: Candidate activation is transiently unavailable or ambiguous. Durable work remains pending; retry the exact completion under the same lease while it is current.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
 
   /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/artifact:
     get:
@@ -1906,6 +1946,12 @@ paths:
     post:
       tags: [hosting-agent]
       summary: Complete a runtime-recovery lease with retained identity and health evidence
+      description: >
+        A successful recovery requires a recent exact restore-instance
+        observation from the current fenced runner inventory session, including
+        an exact match between the observed endpoint and completion runtime_endpoint, and a
+        fresh Deployer HTTP health check that does not follow redirects before
+        the generation-fenced recovery activation is dispatched.
       operationId: completeHostingRecovery
       security: [{hostingAgentBearerAuth: []}]
       parameters:
@@ -2678,6 +2724,11 @@ components:
 
     HostingDeployment:
       type: object
+      description: >
+        Authoritative deployment state. Stable status/phase pairs are
+        queued/queued; running with queued, fetching_source, building,
+        starting_candidate, health_checking, activating, or cancelling;
+        active/active; failed/failed; and cancelled/cancelled.
       required:
         - external_deployment_id
         - external_project_id
@@ -2700,7 +2751,7 @@ components:
         status: {type: string, enum: [queued, running, active, failed, cancelled]}
         phase:
           type: string
-          enum: [queued, fetching_source, building, starting_candidate, health_checking, activating, active, failed, cancelling, cancelled, rolling_back]
+          enum: [queued, fetching_source, building, starting_candidate, health_checking, activating, active, failed, cancelling, cancelled]
         failure_code:
           type: string
           enum: [artifact_digest_mismatch, artifact_unavailable, build_failed, build_timeout, cancelled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, secret_reference_unavailable, source_fetch_failed, workload_policy_violation]
@@ -2732,6 +2783,24 @@ components:
         updated_at: {type: string, format: date-time}
         log_reference: {type: string}
         event_reference: {type: string}
+      allOf:
+        - oneOf:
+            - properties:
+                status: {const: queued}
+                phase: {const: queued}
+            - properties:
+                status: {const: running}
+                phase:
+                  enum: [queued, fetching_source, building, starting_candidate, health_checking, activating, cancelling]
+            - properties:
+                status: {const: active}
+                phase: {const: active}
+            - properties:
+                status: {const: failed}
+                phase: {const: failed}
+            - properties:
+                status: {const: cancelled}
+                phase: {const: cancelled}
 
     HostingRelease:
       type: object
@@ -2917,7 +2986,9 @@ components:
         operations:
           type: array
           description: >
-            Omitted by legacy v1 agents, which are treated as build-only.
+            Omitted by legacy v1 agents, which are ineligible for new build or
+            restore placement. All execution runners must advertise
+            runtime-inventory-v1 and hold a current accepted inventory session.
             runtime-secrets-v1 is advertised only after the agent validates its
             fixed broker URL and isolated tmpfs namespace; secret-bearing build
             and restore work requires it. runtime-inventory-v1 makes session_id,
@@ -2965,6 +3036,12 @@ components:
       type: object
       additionalProperties: false
       required: [release_digest, external_project_id, external_deployment_id, runtime_instance_id, state]
+      allOf:
+        - if:
+            properties:
+              runtime_instance_id: {pattern: '^(?:build|restore)-'}
+          then:
+            required: [runtime_endpoint]
       properties:
         release_digest: {$ref: "#/components/schemas/SHA256Digest"}
         external_project_id: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'}
@@ -2973,6 +3050,10 @@ components:
           type: string
           pattern: '^(|(?:build|restore)-[1-9][0-9]*-[1-9][0-9]*)$'
           description: Empty only for an adopted pre-inventory legacy runtime; all generated runtimes use an exact build/restore lease instance.
+        runtime_endpoint:
+          type: string
+          format: uri
+          description: Exact private HTTP endpoint derived by the runner from the managed container's sole published IPv4 binding and bound to this runtime observation.
         state: {type: string, enum: [created, restarting, running, removing, paused, exited, dead]}
 
     HostingHeartbeatResponse:
@@ -3090,7 +3171,7 @@ components:
         runtime_endpoint:
           type: string
           format: uri
-          description: Private or loopback HTTP(S) endpoint only.
+          description: Private or loopback HTTP(S) endpoint that must exactly match the endpoint in the current fenced runner inventory observation.
         health_evidence:
           type: object
           properties:
@@ -3127,7 +3208,7 @@ components:
         runtime_endpoint:
           type: string
           format: uri
-          description: Private or loopback HTTP(S) endpoint only.
+          description: Private or loopback HTTP(S) endpoint that must exactly match the endpoint in the current fenced runner inventory observation.
         health_evidence:
           type: object
           additionalProperties: true

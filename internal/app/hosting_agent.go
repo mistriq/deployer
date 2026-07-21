@@ -1018,7 +1018,7 @@ func listHostingAgentRuntimes(ctx context.Context, namespace string,
 	defer cancel()
 	output, err := exec.CommandContext(commandCtx, "docker", "ps", "-a",
 		"--filter", "label=light-apps.hosting.managed=true",
-		"--format", `{{.ID}}\t{{.Label "light-apps.hosting.agent-namespace"}}\t{{.Label "light-apps.hosting.release"}}\t{{.Label "light-apps.hosting.project"}}\t{{.Label "light-apps.hosting.deployment"}}\t{{.Label "light-apps.hosting.instance"}}\t{{.State}}`).Output()
+		"--format", `{{.ID}}\t{{.Label "light-apps.hosting.agent-namespace"}}\t{{.Label "light-apps.hosting.release"}}\t{{.Label "light-apps.hosting.project"}}\t{{.Label "light-apps.hosting.deployment"}}\t{{.Label "light-apps.hosting.instance"}}\t{{.State}}\t{{.Ports}}`).Output()
 	if err != nil {
 		return nil, fmt.Errorf("list managed hosting containers: %w", err)
 	}
@@ -1029,7 +1029,10 @@ func listHostingAgentRuntimes(ctx context.Context, namespace string,
 			continue
 		}
 		fields := strings.Split(line, "\t")
-		if len(fields) != 7 || strings.TrimSpace(fields[0]) == "" {
+		if len(fields) == 7 {
+			fields = append(fields, "")
+		}
+		if len(fields) != 8 || strings.TrimSpace(fields[0]) == "" {
 			return nil, fmt.Errorf("container runtime returned invalid managed container metadata")
 		}
 		containerNamespace := strings.TrimSpace(fields[1])
@@ -1040,6 +1043,11 @@ func listHostingAgentRuntimes(ctx context.Context, namespace string,
 			ExternalProjectID: strings.TrimSpace(fields[3]), ExternalDeploymentID: strings.TrimSpace(fields[4]),
 			RuntimeInstanceID: strings.TrimSpace(fields[5]), State: strings.TrimSpace(fields[6])}
 		legacy := containerNamespace == ""
+		if endpoint, endpointErr := parseHostingPublishedRuntimeEndpoint(fields[7]); endpointErr == nil {
+			runtime.RuntimeEndpoint = endpoint
+		} else if !legacy || runtime.RuntimeInstanceID != "" {
+			return nil, fmt.Errorf("container runtime returned invalid published endpoint: %w", endpointErr)
+		}
 		if err := validateHostingRuntimeInventory([]hostingObservedRuntime{runtime}); err != nil &&
 			!(legacy && validLegacyHostingRuntime(runtime)) {
 			return nil, fmt.Errorf("container runtime returned invalid managed container metadata: %w", err)
@@ -1072,6 +1080,29 @@ func listHostingAgentRuntimes(ctx context.Context, namespace string,
 		}
 	}
 	return containers, nil
+}
+
+func parseHostingPublishedRuntimeEndpoint(ports string) (string, error) {
+	var endpoint string
+	for _, entry := range strings.Split(ports, ",") {
+		entry = strings.TrimSpace(entry)
+		arrow := strings.Index(entry, "->")
+		if arrow < 0 {
+			continue
+		}
+		host, portText, err := net.SplitHostPort(strings.TrimSpace(entry[:arrow]))
+		ip := net.ParseIP(host)
+		port, portErr := strconv.Atoi(portText)
+		if err != nil || ip == nil || ip.To4() == nil || (!ip.IsPrivate() && !ip.IsLoopback()) ||
+			portErr != nil || port < 1024 || port > 65535 || endpoint != "" {
+			return "", fmt.Errorf("managed runtime must have one private IPv4 port binding")
+		}
+		endpoint = "http://" + net.JoinHostPort(ip.String(), strconv.Itoa(port))
+	}
+	if endpoint == "" {
+		return "", fmt.Errorf("managed runtime has no published endpoint")
+	}
+	return endpoint, nil
 }
 
 func validLegacyHostingRuntime(runtime hostingObservedRuntime) bool {
@@ -1460,7 +1491,12 @@ func parseDockerBoundPort(output, expectedAddress string) (int, error) {
 }
 
 func checkHostingCandidateHealth(ctx context.Context, target string) (int, int, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	lastStatus := 0
 	for attempt := 1; attempt <= 10; attempt++ {
 		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
@@ -1469,7 +1505,7 @@ func checkHostingCandidateHealth(ctx context.Context, target string) (int, int, 
 			lastStatus = response.StatusCode
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 			response.Body.Close()
-			if response.StatusCode >= 200 && response.StatusCode < 400 {
+			if response.StatusCode >= 200 && response.StatusCode < 300 {
 				return attempt, response.StatusCode, nil
 			}
 		}

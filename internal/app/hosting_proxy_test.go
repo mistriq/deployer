@@ -116,3 +116,25 @@ func TestHostingProxyClassifiesAdapterServerErrorAsAmbiguous(t *testing.T) {
 		t.Fatalf("error = %#v, want proxy_unavailable 503", err)
 	}
 }
+
+func TestHostingProxyClassifiesMalformedSuccessAsAmbiguous(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"route_revision":`))
+	}))
+	defer server.Close()
+	client, err := newHostingProxyClient(AppConfig{ProxyAdapterURL: server.URL, ProxyAdapterToken: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Activate(t.Context(), proxyActivationRequest{
+		OperationID: "op-malformed-2xx", ExternalProjectID: "project_01JPROXY",
+		ReleaseDigest: "sha256:" + strings.Repeat("e", 64), RuntimeEndpoint: "http://10.1.2.3:3000",
+		RouteGeneration: 1,
+	})
+	apiErr, ok := err.(*hostingAPIError)
+	if !ok || apiErr.Code != errCodeProxyUnavailable || apiErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("error = %#v, want proxy_unavailable 503", err)
+	}
+}

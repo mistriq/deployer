@@ -593,6 +593,7 @@ func selectCompatibleHostingRunner(ctx context.Context, querier hostingRunnerQue
 	rows, err := querier.QueryContext(ctx, `SELECT id, manifest_versions_json, runtime_versions_json, operation_capabilities_json
 		FROM hosting_runners
 		WHERE execution_class='hosting' AND status='online' AND draining=0 AND last_seen>=? AND id<>?
+		  AND active_session_id<>''
 		  AND free_cpu_millis-reserve_cpu_millis>=?
 		  AND free_ram_bytes-reserve_ram_bytes>=?
 		  AND free_disk_bytes-reserve_disk_bytes>=?
@@ -619,6 +620,7 @@ func selectCompatibleHostingRunner(ctx context.Context, querier hostingRunnerQue
 		if jsonStringListContains(manifestsJSON, manifest.SchemaVersion) &&
 			jsonStringListContains(runtimesJSON, manifest.Runtime.NodeVersion) &&
 			jsonStringListContains(operationsJSON, operation) &&
+			jsonStringListContains(operationsJSON, hostingRunnerInventoryOperation) &&
 			(!requireSecrets || jsonStringListContains(operationsJSON, hostingRunnerSecretOperation)) {
 			selected = id
 			break
@@ -641,7 +643,9 @@ func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingP
 	result, err := conn.ExecContext(ctx, `UPDATE hosting_runners SET
 		free_cpu_millis=free_cpu_millis-?, free_ram_bytes=free_ram_bytes-?,
 		free_disk_bytes=free_disk_bytes-?, free_pids=free_pids-?
-		WHERE id=? AND status='online' AND draining=0
+		WHERE id=? AND status='online' AND draining=0 AND active_session_id<>''
+		  AND EXISTS (SELECT 1 FROM json_each(operation_capabilities_json)
+		    WHERE value=?)
 		  AND free_cpu_millis-reserve_cpu_millis>=?
 		  AND free_ram_bytes-reserve_ram_bytes>=?
 		  AND free_disk_bytes-reserve_disk_bytes>=?
@@ -652,7 +656,7 @@ func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingP
 		          WHERE job.hosting_runner_id=hosting_runners.id AND job.status IN ('queued','leased','running'))
 		     + (SELECT COUNT(*) FROM hosting_runtime_recoveries recovery
 		          WHERE recovery.hosting_runner_id=hosting_runners.id AND recovery.status IN ('queued','leased','running'))) < ?`,
-		limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs, selected, limits.CPUMillis,
+		limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs, selected, hostingRunnerInventoryOperation, limits.CPUMillis,
 		limits.RAMBytes, limits.DiskBytes, limits.PIDs, hostingRuntimeInventorySchedulingLimit)
 	if err != nil {
 		return 0, err

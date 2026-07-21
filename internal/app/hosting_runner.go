@@ -322,6 +322,7 @@ type hostingObservedRuntime struct {
 	ExternalProjectID    string `json:"external_project_id"`
 	ExternalDeploymentID string `json:"external_deployment_id"`
 	RuntimeInstanceID    string `json:"runtime_instance_id"`
+	RuntimeEndpoint      string `json:"runtime_endpoint,omitempty"`
 	State                string `json:"state"`
 }
 
@@ -720,6 +721,13 @@ func validateHostingRuntimeInventory(inventory []hostingObservedRuntime) error {
 			(runtime.RuntimeInstanceID != "" && !hostingSecretInstancePattern.MatchString(runtime.RuntimeInstanceID)) {
 			return fmt.Errorf("runtime_inventory contains an invalid runtime identity")
 		}
+		if runtime.RuntimeEndpoint != "" {
+			if err := validateRuntimeEndpoint(runtime.RuntimeEndpoint); err != nil {
+				return fmt.Errorf("runtime_inventory contains an invalid runtime endpoint")
+			}
+		} else if runtime.RuntimeInstanceID != "" {
+			return fmt.Errorf("runtime_inventory is missing the bound runtime endpoint")
+		}
 		switch runtime.State {
 		case "created", "restarting", "running", "removing", "paused", "exited", "dead":
 		default:
@@ -758,12 +766,14 @@ func recordHostingRuntimeObservations(ctx context.Context, conn *sql.Conn, runne
 	// running below. This prevents a recently observed candidate from staying
 	// eligible after a later authoritative omission.
 	if _, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET runtime_observed_at=NULL,
-		runtime_observed_session_id='', runtime_observed_release_digest='', runtime_observed_instance_id=''
+		runtime_observed_session_id='', runtime_observed_release_digest='', runtime_observed_instance_id='',
+		runtime_observed_endpoint=''
 		WHERE hosting_runner_id=? AND status IN ('leased','running')`, runnerID); err != nil {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET runtime_observed_at=NULL,
-		runtime_observed_session_id='', runtime_observed_release_digest='', runtime_observed_instance_id=''
+		runtime_observed_session_id='', runtime_observed_release_digest='', runtime_observed_instance_id='',
+		runtime_observed_endpoint=''
 		WHERE hosting_runner_id=? AND status IN ('leased','running')`, runnerID); err != nil {
 		return err
 	}
@@ -774,12 +784,14 @@ func recordHostingRuntimeObservations(ctx context.Context, conn *sql.Conn, runne
 		if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_observed_at=?,
 			runtime_observed_session_id=?
 			WHERE runtime_runner_id=? AND release_digest=? AND runtime_instance_id=?
+			  AND runtime_endpoint=?
 			  AND status IN ('healthy','active','inactive')
 			  AND EXISTS (SELECT 1 FROM hosting_deployments deployment
 			    JOIN hosting_projects project ON project.id=deployment.hosting_project_id
 			    WHERE deployment.id=hosting_releases.hosting_deployment_id
 			      AND project.external_project_id=? AND deployment.external_deployment_id=?)`,
 			formatSQLiteTime(now), sessionID, runnerID, runtime.ReleaseDigest, runtime.RuntimeInstanceID,
+			runtime.RuntimeEndpoint,
 			runtime.ExternalProjectID, runtime.ExternalDeploymentID); err != nil {
 			return err
 		}
@@ -790,20 +802,22 @@ func recordHostingRuntimeObservations(ctx context.Context, conn *sql.Conn, runne
 		switch operation {
 		case "build":
 			if _, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET runtime_observed_at=?,
-				runtime_observed_session_id=?, runtime_observed_release_digest=?, runtime_observed_instance_id=?
+				runtime_observed_session_id=?, runtime_observed_release_digest=?, runtime_observed_instance_id=?,
+				runtime_observed_endpoint=?
 				WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND status IN ('leased','running')
 				  AND lease_expires_at>? AND EXISTS (SELECT 1 FROM hosting_deployments deployment
 				    JOIN hosting_projects project ON project.id=deployment.hosting_project_id
 				    WHERE deployment.id=hosting_jobs.hosting_deployment_id
 				      AND project.external_project_id=? AND deployment.external_deployment_id=?)`,
 				formatSQLiteTime(now), sessionID, runtime.ReleaseDigest, runtime.RuntimeInstanceID,
-				workID, runnerID, generation, formatSQLiteTime(now), runtime.ExternalProjectID,
+				runtime.RuntimeEndpoint, workID, runnerID, generation, formatSQLiteTime(now), runtime.ExternalProjectID,
 				runtime.ExternalDeploymentID); err != nil {
 				return err
 			}
 		case "restore":
 			if _, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET runtime_observed_at=?,
-				runtime_observed_session_id=?, runtime_observed_release_digest=?, runtime_observed_instance_id=?
+				runtime_observed_session_id=?, runtime_observed_release_digest=?, runtime_observed_instance_id=?,
+				runtime_observed_endpoint=?
 				WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND status IN ('leased','running')
 				  AND lease_expires_at>? AND EXISTS (SELECT 1 FROM hosting_releases release
 				    JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
@@ -811,7 +825,7 @@ func recordHostingRuntimeObservations(ctx context.Context, conn *sql.Conn, runne
 				    WHERE release.id=hosting_runtime_recoveries.hosting_release_id
 				      AND release.release_digest=? AND project.external_project_id=?
 				      AND deployment.external_deployment_id=?)`, formatSQLiteTime(now), sessionID,
-				runtime.ReleaseDigest, runtime.RuntimeInstanceID, workID, runnerID, generation,
+				runtime.ReleaseDigest, runtime.RuntimeInstanceID, runtime.RuntimeEndpoint, workID, runnerID, generation,
 				formatSQLiteTime(now), runtime.ReleaseDigest, runtime.ExternalProjectID,
 				runtime.ExternalDeploymentID); err != nil {
 				return err
@@ -943,10 +957,12 @@ func claimHostingJob(ctx context.Context, runnerID int64) (*hostingClaimedJob, e
 		JOIN hosting_settings s ON s.id=1
 		WHERE j.hosting_runner_id=? AND j.status='queued' AND j.cancel_requested_at IS NULL
 		  AND p.desired_state='active' AND p.kill_switch_reason='' AND s.global_kill_switch=0
-		  AND r.status='online' AND r.draining=0
+		  AND r.status='online' AND r.draining=0 AND r.active_session_id<>''
+		  AND EXISTS (SELECT 1 FROM json_each(r.operation_capabilities_json)
+		    WHERE value=?)
 		  AND (json_array_length(j.secret_refs_json)=0 OR EXISTS
 		    (SELECT 1 FROM json_each(r.operation_capabilities_json) WHERE value=?))
-		ORDER BY j.id LIMIT 1`, runnerID, hostingRunnerSecretOperation).Scan(&jobID, &deploymentID, &projectID, &generation, &recipeJSON, &secretsJSON)
+		ORDER BY j.id LIMIT 1`, runnerID, hostingRunnerInventoryOperation, hostingRunnerSecretOperation).Scan(&jobID, &deploymentID, &projectID, &generation, &recipeJSON, &secretsJSON)
 	if err == sql.ErrNoRows {
 		return nil, errNoHostingJob
 	}

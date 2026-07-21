@@ -7,6 +7,23 @@ import (
 	"testing"
 )
 
+func hostingContractSection(t *testing.T, document, start, end string) string {
+	t.Helper()
+	startIndex := strings.Index(document, start)
+	if startIndex < 0 {
+		t.Fatalf("OpenAPI is missing section %q", start)
+	}
+	section := document[startIndex:]
+	if end != "" {
+		endIndex := strings.Index(section[len(start):], end)
+		if endIndex < 0 {
+			t.Fatalf("OpenAPI section %q is missing boundary %q", start, end)
+		}
+		section = section[:len(start)+endIndex]
+	}
+	return section
+}
+
 func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join("..", "..", "docs", "openapi.yaml"))
 	if err != nil {
@@ -52,6 +69,7 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"source-broker-openapi.yaml", "HostingSourceReference", "source_reference",
 		"secret-broker-openapi.yaml", "HostingWorkloadIdentity", "secret_reference_unavailable",
 		"runtime-secrets-v1", "runtime-inventory-v1", "HostingObservedRuntime",
+		"ineligible for new build", "sole published IPv4 binding", "runtime_endpoint",
 		"runtime_instance_lost", "runtime_failure_code", "runtime_recovery_status",
 		"runner_session_superseded", "runtime_instance_missing_observed",
 		"runtime-adoptions.json", "cleanup_authorized", "512 KiB", "maxItems: 1024",
@@ -59,6 +77,67 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 	for _, value := range required {
 		if !strings.Contains(document, value) {
 			t.Errorf("OpenAPI is missing %q", value)
+		}
+	}
+	phaseSection := hostingContractSection(t, document,
+		"  /api/hosting-agent/v1/jobs/{hostingJobId}/phase:",
+		"  /api/hosting-agent/v1/jobs/{hostingJobId}/logs:")
+	for _, value := range []string{
+		"fetching_source, building, starting_candidate,",
+		"Repeating the current phase is idempotent",
+		"Skips,", "regressions", "return 409",
+		`        "204":`, `        "400":`, `        "401":`, `        "403":`,
+		`        "405":`, `        "409":`, `        "413":`, `        "415":`, `        "500":`,
+	} {
+		if !strings.Contains(phaseSection, value) {
+			t.Errorf("hosting phase OpenAPI contract is missing %q", value)
+		}
+	}
+	completionSection := hostingContractSection(t, document,
+		"  /api/hosting-agent/v1/jobs/{hostingJobId}/complete:",
+		"  /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/artifact:")
+	for _, value := range []string{
+		"initial success completion", "exact replay of an already durable staged",
+		"existing activating intent", "health_checking",
+		"current fenced", "exact match between the observed", "endpoint and completion runtime_endpoint",
+		"without following redirects", "exact prior runtime endpoint",
+		"fresh HTTP", "health check", "previous active release unchanged",
+		"persisted candidate and activation intent", "retry the exact completion",
+		`        "204":`, `        "400":`, `        "401":`, `        "403":`,
+		`        "405":`, `        "409":`, `        "413":`, `        "415":`,
+		`        "500":`, `        "502":`, `        "503":`,
+	} {
+		if !strings.Contains(completionSection, value) {
+			t.Errorf("hosting completion OpenAPI contract is missing %q", value)
+		}
+	}
+	deploymentSchema := hostingContractSection(t, document,
+		"    HostingDeployment:", "    HostingRelease:")
+	for _, value := range []string{
+		"Stable status/phase pairs", "status: {const: queued}",
+		"status: {const: running}", "status: {const: active}",
+		"status: {const: failed}", "status: {const: cancelled}",
+		"enum: [queued, fetching_source, building, starting_candidate, health_checking, activating, cancelling]",
+	} {
+		if !strings.Contains(deploymentSchema, value) {
+			t.Errorf("HostingDeployment schema is missing %q", value)
+		}
+	}
+	if strings.Contains(deploymentSchema, "rolling_back") {
+		t.Error("HostingDeployment phase must not advertise event-only rolling_back")
+	}
+	eventSchema := hostingContractSection(t, document, "    HostingEvent:", "    HostingLog:")
+	if !strings.Contains(eventSchema, "rolling_back") {
+		t.Error("HostingEvent phase must retain rolling_back")
+	}
+	recoveryCompletionSection := hostingContractSection(t, document,
+		"  /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/complete:",
+		"  /api/agent/poll:")
+	for _, value := range []string{"exact restore-instance", "current fenced runner inventory session",
+		"exact match between the observed endpoint", "fresh Deployer HTTP health check", "does not follow redirects",
+		"generation-fenced recovery activation"} {
+		if !strings.Contains(recoveryCompletionSection, value) {
+			t.Errorf("hosting recovery completion contract is missing %q", value)
 		}
 	}
 	readmeContent, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
@@ -70,9 +149,25 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"Pending rollback receipts do not",
 		"expire. Once reconciliation records a completed success or terminal error",
 		"replays the completed response instead of creating another routing intent",
+		"`starting_candidate`, and `health_checking` in order",
+		"repeating the current",
+		"initial successful", "accepted only from `health_checking`",
+		"exact replay of an", "existing `activating` intent",
+		"current fenced inventory session",
+		"managed container's sole private port", "completion endpoint must match that observation exactly",
+		"Inventory-less runners are ineligible",
+		"fresh HTTP health gate that rejects redirects",
+		"exact prior runtime endpoint",
+		"previous active",
+		"release unchanged",
+		"expired leases are fenced and requeued",
+		"repeated lease",
+		"loss terminates with `runner_lost`",
+		"pending activation is freshly revalidated",
+		"ambiguous adapter `503` remains durable",
 	} {
 		if !strings.Contains(string(readmeContent), value) {
-			t.Errorf("README is missing rollback contract %q", value)
+			t.Errorf("README is missing hosting contract %q", value)
 		}
 	}
 	brokerContract, err := os.ReadFile(filepath.Join("..", "..", "docs", "source-broker-openapi.yaml"))

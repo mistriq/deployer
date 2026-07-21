@@ -184,6 +184,15 @@ func TestParseLoopbackDockerPort(t *testing.T) {
 	if port, err := parseDockerBoundPort("10.20.0.15:49153", "10.20.0.15"); err != nil || port != 49153 {
 		t.Fatalf("private port=%d err=%v", port, err)
 	}
+	if endpoint, err := parseHostingPublishedRuntimeEndpoint("127.0.0.1:49154->3000/tcp, 3001/tcp"); err != nil || endpoint != "http://127.0.0.1:49154" {
+		t.Fatalf("published endpoint=%q err=%v", endpoint, err)
+	}
+	for _, value := range []string{"3000/tcp", "0.0.0.0:49154->3000/tcp", "203.0.113.10:49154->3000/tcp",
+		"127.0.0.1:49154->3000/tcp, 127.0.0.1:49155->3001/tcp"} {
+		if _, err := parseHostingPublishedRuntimeEndpoint(value); err == nil {
+			t.Fatalf("unsafe published ports %q accepted", value)
+		}
+	}
 	for _, value := range []string{"0.0.0.0", "203.0.113.10", "::1", "hostname.internal"} {
 		if err := validateHostingRuntimeBindAddress(value); err == nil {
 			t.Fatalf("unsafe runtime bind address %q was accepted", value)
@@ -206,7 +215,7 @@ func TestReconcileHostingAgentReleasesRemovesOnlyUnretainedManagedContainers(t *
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = "ps" ]; then
-  printf 'keep-container\t%s\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\trunning\ndrop-container\t%s\t%s\tproject_01JDROPX\tdeployment_01JDROPX\tbuild-2-1\trunning\nstale-container\t%s\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\texited\n'
+  printf 'keep-container\t%s\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\trunning\t127.0.0.1:49151->3000/tcp\ndrop-container\t%s\t%s\tproject_01JDROPX\tdeployment_01JDROPX\tbuild-2-1\trunning\t127.0.0.1:49152->3000/tcp\nstale-container\t%s\t%s\tproject_01JKEEPX\tdeployment_01JKEEPX\tbuild-1-1\texited\t127.0.0.1:49153->3000/tcp\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi
@@ -244,7 +253,7 @@ func TestReconcileHostingAgentReleasesScopesDockerInventoryToAgentNamespace(t *t
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = "ps" ]; then
-  printf 'owned-container\t%s\t%s\tproject_01JOWNEDX\tdeployment_01JOWNEDX\tbuild-9-1\trunning\nother-agent-container\t%s\t%s\tproject_01JOTHERX\tdeployment_01JOTHERX\tbuild-10-1\trunning\n'
+  printf 'owned-container\t%s\t%s\tproject_01JOWNEDX\tdeployment_01JOWNEDX\tbuild-9-1\trunning\t127.0.0.1:49154->3000/tcp\nother-agent-container\t%s\t%s\tproject_01JOTHERX\tdeployment_01JOTHERX\tbuild-10-1\trunning\t127.0.0.1:49155->3000/tcp\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi
@@ -305,7 +314,7 @@ func TestSupersededHostingAgentSessionRetainsThenCleansRuntimesAfterHandoff(t *t
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = "ps" ]; then
-  printf 'owned-container\t%s\t%s\tproject_01JSUPERX\tdeployment_01JSUPERX\tbuild-4-1\trunning\n'
+  printf 'owned-container\t%s\t%s\tproject_01JSUPERX\tdeployment_01JSUPERX\tbuild-4-1\trunning\t127.0.0.1:49156->3000/tcp\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi
@@ -381,7 +390,7 @@ func TestRestartedSupersededAgentUsesDurableSessionForCleanup(t *testing.T) {
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = "ps" ]; then
-  printf 'old-container\t%s\t%s\tproject_01JOLDSESS\tdeployment_01JOLDSESS\tbuild-7-1\trunning\n'
+  printf 'old-container\t%s\t%s\tproject_01JOLDSESS\tdeployment_01JOLDSESS\tbuild-7-1\trunning\t127.0.0.1:49157->3000/tcp\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi
@@ -435,7 +444,7 @@ func TestRestartedSupersededWorkRootCanTakeOverFailedReplacement(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("5", 64)
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: "http://10.99.0.1:3000",
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +469,7 @@ func TestRestartedSupersededWorkRootCanTakeOverFailedReplacement(t *testing.T) {
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = "ps" ]; then
-  printf 'retained-container\t%s\t%s\t%s\tdeployment_01JTAKEOLD\tbuild-%d-%d\trunning\n'
+  printf 'retained-container\t%s\t%s\t%s\tdeployment_01JTAKEOLD\tbuild-%d-%d\trunning\t127.0.0.1:49158->3000/tcp\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi
@@ -546,7 +555,7 @@ func TestHostingAgentSafelyAdoptsLegacyRuntimeBeforeCleanup(t *testing.T) {
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = "ps" ]; then
-  printf 'legacy-container\t\t%s\tproject_01JLEGACY\tdeployment_01JLEGACY\tbuild-11-2\trunning\n'
+  printf 'legacy-container\t\t%s\tproject_01JLEGACY\tdeployment_01JLEGACY\tbuild-11-2\trunning\t127.0.0.1:49152->3000/tcp\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi
@@ -594,7 +603,7 @@ func TestHostingAgentPublishesLegacyRuntimeOnlyAfterDurableAdoption(t *testing.T
 	digest := "sha256:" + strings.Repeat("b", 64)
 	script := fmt.Sprintf(`#!/bin/sh
 if [ "$1" = "ps" ]; then
-  printf 'legacy-container\t\t%s\tproject_01JLEGACY2\tdeployment_01JLEGACY2\tbuild-12-3\trunning\n'
+  printf 'legacy-container\t\t%s\tproject_01JLEGACY2\tdeployment_01JLEGACY2\tbuild-12-3\trunning\t127.0.0.1:49153->3000/tcp\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n'
 fi

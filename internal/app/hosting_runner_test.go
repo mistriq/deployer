@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -124,7 +125,7 @@ func withFakeProxy(t *testing.T) *fakeProxyClient {
 	return fake
 }
 
-func createAndClaimHostingJob(t *testing.T, projectExternalID, deploymentExternalID string) (*HostingProject, *ServiceToken, int64, *hostingClaimedJob) {
+func createAndClaimHostingJobAtFetching(t *testing.T, projectExternalID, deploymentExternalID string) (*HostingProject, *ServiceToken, int64, *hostingClaimedJob) {
 	t.Helper()
 	project, token := provisionDeploymentTestProject(t, projectExternalID)
 	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
@@ -147,6 +148,60 @@ func createAndClaimHostingJob(t *testing.T, projectExternalID, deploymentExterna
 	return project, token, runnerID, job
 }
 
+func createAndClaimHostingJob(t *testing.T, projectExternalID, deploymentExternalID string) (*HostingProject, *ServiceToken, int64, *hostingClaimedJob) {
+	t.Helper()
+	project, token, runnerID, job := createAndClaimHostingJobAtFetching(t, projectExternalID, deploymentExternalID)
+	advanceHostingJobToHealthCheckingForTest(t, runnerID, job)
+	return project, token, runnerID, job
+}
+
+func reportHostingJobPhaseForTest(t *testing.T, runnerID int64, job *hostingClaimedJob,
+	phase string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(hostingPhaseRequest{Phase: phase})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/phase", job.JobID), bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Deployer-Lease-Generation", fmt.Sprint(job.LeaseGeneration))
+	request.Header.Set("X-Deployer-Lease-Token", job.LeaseToken)
+	request = request.WithContext(context.WithValue(request.Context(), hostingRunnerContextKey{},
+		&HostingRunner{ID: runnerID}))
+	recorder := httptest.NewRecorder()
+	handleHostingJobPhase(recorder, request, job.JobID)
+	return recorder
+}
+
+func advanceHostingJobToHealthCheckingForTest(t *testing.T, runnerID int64, job *hostingClaimedJob) {
+	t.Helper()
+	for _, phase := range []string{hostingPhaseBuilding, hostingPhaseStarting, hostingPhaseHealth} {
+		if recorder := reportHostingJobPhaseForTest(t, runnerID, job, phase); recorder.Code != http.StatusNoContent {
+			t.Fatalf("advance hosting job to %s: status=%d body=%s", phase,
+				recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func healthyHostingEndpointForTest(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	_, _ = db.Exec(`UPDATE hosting_jobs SET runtime_observed_endpoint=?
+		WHERE status IN ('leased','running') AND runtime_observed_at IS NOT NULL`, server.URL)
+	return server.URL
+}
+
+func observeHostingJobEndpointForTest(t *testing.T, jobID int64, endpoint string) {
+	t.Helper()
+	if _, err := db.Exec(`UPDATE hosting_jobs SET runtime_observed_endpoint=? WHERE id=?`, endpoint, jobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func attachTestReleaseArtifact(t *testing.T, jobID int64, releaseDigest string) string {
 	t.Helper()
 	content := []byte("test docker image archive for " + releaseDigest)
@@ -159,8 +214,28 @@ func attachTestReleaseArtifact(t *testing.T, jobID int64, releaseDigest string) 
 	if err := os.WriteFile(path, content, 0600); err != nil {
 		t.Fatal(err)
 	}
+	var runnerID, generation int64
+	var activeSession string
+	if err := db.QueryRow(`SELECT job.hosting_runner_id, job.lease_generation, runner.active_session_id
+		FROM hosting_jobs job
+		JOIN hosting_runners runner ON runner.id=job.hosting_runner_id
+		WHERE job.id=?`, jobID).Scan(&runnerID, &generation, &activeSession); err != nil {
+		t.Fatal(err)
+	}
+	if activeSession == "" {
+		activeSession = strings.TrimPrefix(hashHostingOperation("test.runner.session", fmt.Sprint(runnerID)), "sha256:")[:48]
+		if _, err := db.Exec(`UPDATE hosting_runners SET active_session_id=?, last_heartbeat_sequence=1,
+			operation_capabilities_json='["build","restore","runtime-inventory-v1"]' WHERE id=?`,
+			activeSession, runnerID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expectedInstance := fmt.Sprintf("build-%d-%d", jobID, generation)
 	if _, err := db.Exec(`UPDATE hosting_jobs SET release_upload_digest=?, release_upload_release_digest=?,
-		release_upload_path=?, release_upload_size=? WHERE id=?`, artifactDigest, releaseDigest, path, len(content), jobID); err != nil {
+		release_upload_path=?, release_upload_size=?, runtime_observed_at=?, runtime_observed_session_id=?,
+		runtime_observed_release_digest=?, runtime_observed_instance_id=? WHERE id=?`, artifactDigest,
+		releaseDigest, path, len(content), formatSQLiteTime(time.Now().UTC()), activeSession,
+		releaseDigest, expectedInstance, jobID); err != nil {
 		t.Fatal(err)
 	}
 	var storedArtifact, storedRelease, storedPath string
@@ -176,6 +251,30 @@ func attachTestReleaseArtifact(t *testing.T, jobID int64, releaseDigest string) 
 	return artifactDigest
 }
 
+func observeHostingRecoveryForTest(t *testing.T, runnerID int64, recovery *hostingClaimedJob,
+	releaseDigest, endpoint string) {
+	t.Helper()
+	var activeSession string
+	if err := db.QueryRow(`SELECT active_session_id FROM hosting_runners WHERE id=?`, runnerID).Scan(&activeSession); err != nil {
+		t.Fatal(err)
+	}
+	if activeSession == "" {
+		activeSession = strings.TrimPrefix(hashHostingOperation("test.runner.session", fmt.Sprint(runnerID)), "sha256:")[:48]
+		if _, err := db.Exec(`UPDATE hosting_runners SET active_session_id=?, last_heartbeat_sequence=1,
+			operation_capabilities_json='["build","restore","runtime-inventory-v1"]' WHERE id=?`,
+			activeSession, runnerID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE hosting_runtime_recoveries SET runtime_observed_at=?,
+		runtime_observed_session_id=?, runtime_observed_release_digest=?, runtime_observed_instance_id=?,
+		runtime_observed_endpoint=?
+		WHERE id=?`, formatSQLiteTime(time.Now().UTC()), activeSession, releaseDigest,
+		fmt.Sprintf("restore-%d-%d", recovery.JobID, recovery.LeaseGeneration), endpoint, recovery.JobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHostingRunnerHealthyCandidateRetainsRuntimeCapacity(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
@@ -185,7 +284,7 @@ func TestHostingRunnerHealthyCandidateRetainsRuntimeCapacity(t *testing.T) {
 		Status:                "success",
 		ReleaseDigest:         releaseDigest,
 		ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, releaseDigest),
-		RuntimeEndpoint:       "http://10.10.0.5:3000",
+		RuntimeEndpoint:       healthyHostingEndpointForTest(t),
 		HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(3), "status_code": float64(200)},
 	}
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err != nil {
@@ -240,7 +339,7 @@ func TestConflictingHostingJobCompletionsCannotRaceProxyActivation(t *testing.T)
 		Status:                "success",
 		ReleaseDigest:         releaseDigest,
 		ReleaseArtifactDigest: artifactDigest,
-		RuntimeEndpoint:       "http://127.0.0.1:4111",
+		RuntimeEndpoint:       healthyHostingEndpointForTest(t),
 		HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)},
 	}
 	successResult := make(chan error, 1)
@@ -291,13 +390,10 @@ func TestHostingHeartbeatCannotEraseOutstandingReservations(t *testing.T) {
 	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JHEARTB", request); err != nil {
 		t.Fatal(err)
 	}
-	runner := &HostingRunner{ID: runnerID}
-	payload, _ := json.Marshal(hostingHeartbeatRequest{Free: capacityDTO{CPUMillis: capacity.CPUMillis, RAMBytes: capacity.RAMBytes, DiskBytes: capacity.DiskBytes, PIDs: capacity.PIDs}, ProtocolVersion: "v1", ManifestVersions: []string{"v1"}, RuntimeVersions: []string{"20", "22"}})
-	httpRequest := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/heartbeat", bytes.NewReader(payload))
-	httpRequest.Header.Set("Content-Type", "application/json")
-	httpRequest = httpRequest.WithContext(context.WithValue(httpRequest.Context(), hostingRunnerContextKey{}, runner))
-	recorder := httptest.NewRecorder()
-	handleHostingAgentHeartbeat(recorder, httpRequest)
+	recorder := postHostingInventoryHeartbeat(t, runnerID, capacityDTO{CPUMillis: capacity.CPUMillis,
+		RAMBytes: capacity.RAMBytes, DiskBytes: capacity.DiskBytes, PIDs: capacity.PIDs},
+		strings.TrimPrefix(hashHostingOperation("test.runner.session", fmt.Sprint(runnerID)), "sha256:")[:48],
+		2, []hostingObservedRuntime{})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -327,6 +423,106 @@ func TestHostingRunnerPlacementReservesInventoryHeadroom(t *testing.T) {
 	var capacityErr *hostingAPIError
 	if !errors.As(err, &capacityErr) || capacityErr.Code != errCodeRunnerCapacityUnavailable {
 		t.Fatalf("runner %d exceeded inventory scheduling limit: %v", runnerID, err)
+	}
+}
+
+func TestHostingBuildClaimRequiresActiveInventoryCapability(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JINVCAP")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	runnerID := insertHostingRunnerForTest(t, "inventory-required", limits)
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build"]' WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := selectCompatibleHostingRunner(t.Context(), db, project.Manifest, limits, "build", false, 0); err == nil {
+		t.Fatal("inventory-less runner was eligible for placement")
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","runtime-inventory-v1"]',
+		active_session_id='' WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := selectCompatibleHostingRunner(t.Context(), db, project.Manifest, limits, "build", false, 0); err == nil {
+		t.Fatal("runner without an active inventory session was eligible for placement")
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET active_session_id=? WHERE id=?`, strings.Repeat("a", 48), runnerID); err != nil {
+		t.Fatal(err)
+	}
+	request := validHostingDeploymentRequest("deployment_01JINVCAP")
+	request.ManifestDigest = project.ManifestDigest
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID,
+		"create_01JINVCAP", request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build"]' WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimHostingJob(t.Context(), runnerID); !errors.Is(err, errNoHostingJob) {
+		t.Fatalf("inventory-less runner claimed build: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","runtime-inventory-v1"]',
+		active_session_id='' WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimHostingJob(t.Context(), runnerID); !errors.Is(err, errNoHostingJob) {
+		t.Fatalf("runner without an active inventory session claimed build: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET active_session_id=? WHERE id=?`, strings.Repeat("a", 48), runnerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimHostingJob(t.Context(), runnerID); err != nil {
+		t.Fatalf("active inventory runner could not claim build: %v", err)
+	}
+}
+
+func TestQueuedHostingBuildReassignsWhenRunnerLosesInventoryEligibility(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JINVREASSIGN")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	initialCapacity := hostingWorkloadLimits{CPUMillis: limits.CPUMillis * 2,
+		RAMBytes: limits.RAMBytes * 2, DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2}
+	initialRunnerID := insertHostingRunnerForTest(t, "inventory-reassign-initial", initialCapacity)
+	replacementRunnerID := insertHostingRunnerForTest(t, "inventory-reassign-replacement", limits)
+	request := validHostingDeploymentRequest("deployment_01JINVREASSIGN")
+	request.ManifestDigest = project.ManifestDigest
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID,
+		"create_01JINVREASSIGN", request); err != nil {
+		t.Fatal(err)
+	}
+	var jobID, assignedRunnerID int64
+	if err := db.QueryRow(`SELECT job.id, job.hosting_runner_id FROM hosting_jobs job
+		JOIN hosting_deployments deployment ON deployment.id=job.hosting_deployment_id
+		WHERE deployment.external_deployment_id=?`, request.ExternalDeploymentID).Scan(
+		&jobID, &assignedRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if assignedRunnerID != initialRunnerID {
+		t.Fatalf("initial assignment runner=%d want=%d", assignedRunnerID, initialRunnerID)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build"]'
+		WHERE id=?`, initialRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT hosting_runner_id FROM hosting_jobs WHERE id=?`, jobID).Scan(&assignedRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if assignedRunnerID != replacementRunnerID {
+		t.Fatalf("reassigned runner=%d want=%d", assignedRunnerID, replacementRunnerID)
+	}
+	var freeCPU, freeRAM, freeDisk, freePIDs int64
+	if err := db.QueryRow(`SELECT free_cpu_millis, free_ram_bytes, free_disk_bytes, free_pids
+		FROM hosting_runners WHERE id=?`, initialRunnerID).Scan(&freeCPU, &freeRAM, &freeDisk, &freePIDs); err != nil {
+		t.Fatal(err)
+	}
+	if freeCPU != initialCapacity.CPUMillis || freeRAM != initialCapacity.RAMBytes ||
+		freeDisk != initialCapacity.DiskBytes || freePIDs != initialCapacity.PIDs {
+		t.Fatalf("initial capacity was not restored: cpu=%d ram=%d disk=%d pids=%d",
+			freeCPU, freeRAM, freeDisk, freePIDs)
+	}
+	if _, err := claimHostingJob(t.Context(), replacementRunnerID); err != nil {
+		t.Fatalf("replacement runner could not claim reassigned build: %v", err)
 	}
 }
 
@@ -468,7 +664,7 @@ func TestHostingRuntimeInventoryRequiresCompleteFencedSessionSnapshots(t *testin
 	}
 	duplicate := []hostingObservedRuntime{{ReleaseDigest: "sha256:" + strings.Repeat("c", 64),
 		ExternalProjectID: "project_01JINVLDX", ExternalDeploymentID: "deployment_01JINVLDX",
-		RuntimeInstanceID: "build-1-1", State: "running"}}
+		RuntimeInstanceID: "build-1-1", RuntimeEndpoint: "http://127.0.0.1:3000", State: "running"}}
 	duplicate = append(duplicate, duplicate[0])
 	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, secondSession, 3, duplicate); recorder.Code != http.StatusBadRequest {
 		t.Fatalf("duplicate inventory status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -482,7 +678,7 @@ func TestNewInventorySessionDoesNotTreatEnrollmentAsRuntimeAbsence(t *testing.T)
 	digest := "sha256:" + strings.Repeat("1", 64)
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: "http://10.72.0.1:3000",
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -542,9 +738,23 @@ func TestHostingCompletionRequiresExactCurrentSessionRuntimeObservation(t *testi
 		t.Fatalf("unobserved candidate err=%v", err)
 	}
 	instanceID := fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration)
+	wrongEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(wrongEndpoint.Close)
+	wrongInventory := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
+		ExternalDeploymentID: "deployment_01JOBSERVE", RuntimeInstanceID: instanceID,
+		RuntimeEndpoint: wrongEndpoint.URL, State: "running"}}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, wrongInventory); recorder.Code != http.StatusOK {
+		t.Fatalf("observe wrong candidate endpoint status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); !errors.As(err, &notObserved) || notObserved.Code != errCodeReleaseNotHealthy {
+		t.Fatalf("endpoint-mismatched observation err=%v", err)
+	}
 	inventory := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
-		ExternalDeploymentID: "deployment_01JOBSERVE", RuntimeInstanceID: instanceID, State: "running"}}
-	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, inventory); recorder.Code != http.StatusOK {
+		ExternalDeploymentID: "deployment_01JOBSERVE", RuntimeInstanceID: instanceID,
+		RuntimeEndpoint: healthServer.URL, State: "running"}}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 3, inventory); recorder.Code != http.StatusOK {
 		t.Fatalf("observe candidate status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err != nil {
@@ -577,7 +787,8 @@ func TestHostingActivationCompensatesIfCandidateDisappearsAfterProxyCallStarts(t
 	}
 	instanceID := fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration)
 	inventory := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
-		ExternalDeploymentID: "deployment_01JOBCASXX", RuntimeInstanceID: instanceID, State: "running"}}
+		ExternalDeploymentID: "deployment_01JOBCASXX", RuntimeInstanceID: instanceID,
+		RuntimeEndpoint: healthServer.URL, State: "running"}}
 	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, inventory); recorder.Code != http.StatusOK {
 		t.Fatalf("observe candidate status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -613,15 +824,17 @@ func TestHostingRuntimeInventorySelfHealsAndFencesReappearingInstance(t *testing
 	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JINVENT", "deployment_01JINVENT")
 	digest := "sha256:" + strings.Repeat("7", 64)
 	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	activeEndpoint := healthyHostingEndpointForTest(t)
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
-			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.72.0.1:3000",
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: activeEndpoint,
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
 	instanceID := fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration)
 	running := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
-		ExternalDeploymentID: "deployment_01JINVENT", RuntimeInstanceID: instanceID, State: "running"}}
+		ExternalDeploymentID: "deployment_01JINVENT", RuntimeInstanceID: instanceID,
+		RuntimeEndpoint: activeEndpoint, State: "running"}}
 	start := time.Now().UTC()
 	reconcileHostingRuntimeInventoryAt(t, runnerID, nil, start)
 	var missingCount, recoveryCount int
@@ -683,9 +896,11 @@ func TestHostingRuntimeInventorySelfHealsAndFencesReappearingInstance(t *testing
 	if detachedOwner.Valid {
 		t.Fatalf("old runtime reappearance after claim regained ownership: %v", detachedOwner)
 	}
+	recoveryEndpoint := healthyHostingEndpointForTest(t)
+	observeHostingRecoveryForTest(t, runnerID, recovery, digest, recoveryEndpoint)
 	if err := completeHostingRuntimeRecovery(t.Context(), runnerID, recovery.JobID,
 		recovery.LeaseGeneration, recovery.LeaseToken, hostingCompletionRequest{Status: "success",
-			ReleaseDigest: digest, ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.72.0.2:3000",
+			ReleaseDigest: digest, ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: recoveryEndpoint,
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -715,7 +930,8 @@ func TestHostingHeartbeatRetainsObservedCurrentLeaseCandidate(t *testing.T) {
 	}
 	digest := "sha256:" + strings.Repeat("8", 64)
 	inventory := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
-		ExternalDeploymentID: "deployment_01JINFLGT", RuntimeInstanceID: fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration), State: "running"}}
+		ExternalDeploymentID: "deployment_01JINFLGT", RuntimeInstanceID: fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration),
+		RuntimeEndpoint: "http://127.0.0.1:3000", State: "running"}}
 	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`, runnerID); err != nil {
 		t.Fatal(err)
 	}
@@ -760,7 +976,7 @@ func TestMissingInactiveHostingRuntimeReleasesPhantomCapacity(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("4", 64)
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: "http://10.73.0.1:3000",
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -791,7 +1007,7 @@ func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) 
 	releaseDigest := "sha256:" + strings.Repeat("6", 64)
 	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
 	completion := hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
-		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.70.0.1:3000",
+		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1), "status_code": float64(200)}}
 	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err != nil {
 		t.Fatal(err)
@@ -810,7 +1026,7 @@ func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) 
 	capacity := hostingWorkloadLimits{CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
 		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2}
 	recoveryRunnerID := insertHostingRunnerForTest(t, "runtime-recovery-target", capacity)
-	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build"]' WHERE id=?`, recoveryRunnerID); err != nil {
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","runtime-inventory-v1"]' WHERE id=?`, recoveryRunnerID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=? WHERE id=?`,
@@ -830,7 +1046,7 @@ func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) 
 	if _, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID); !errors.Is(err, errNoHostingJob) {
 		t.Fatalf("build-only runner claimed recovery: %v", err)
 	}
-	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, recoveryRunnerID); err != nil {
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore","runtime-inventory-v1"]' WHERE id=?`, recoveryRunnerID); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
@@ -842,7 +1058,7 @@ func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) 
 	if !assignedRecoveryRunner.Valid || assignedRecoveryRunner.Int64 != recoveryRunnerID {
 		t.Fatalf("restore-capable runner was not assigned: %v", assignedRecoveryRunner)
 	}
-	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build"]' WHERE id=?`, recoveryRunnerID); err != nil {
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","runtime-inventory-v1"]' WHERE id=?`, recoveryRunnerID); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
@@ -858,7 +1074,7 @@ func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) 
 	if assignedRecoveryRunner.Valid || unassignedFreeCPU != capacity.CPUMillis {
 		t.Fatalf("incompatible queued assignment was not released: runner=%v free CPU=%d", assignedRecoveryRunner, unassignedFreeCPU)
 	}
-	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, recoveryRunnerID); err != nil {
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore","runtime-inventory-v1"]' WHERE id=?`, recoveryRunnerID); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
@@ -866,15 +1082,12 @@ func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) 
 	}
 	oldCapacity := capacityDTO{CPUMillis: limits.CPUMillis * 3, RAMBytes: limits.RAMBytes * 3,
 		DiskBytes: limits.DiskBytes * 3, PIDs: limits.PIDs * 3}
-	heartbeatBody, _ := json.Marshal(hostingHeartbeatRequest{Free: oldCapacity, ProtocolVersion: "v1",
-		ManifestVersions: []string{"v1"}, RuntimeVersions: []string{"20", "22"},
-		Operations: []string{"build", "restore"}})
-	heartbeatRequest := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/heartbeat", bytes.NewReader(heartbeatBody))
-	heartbeatRequest.Header.Set("Content-Type", "application/json")
-	heartbeatRequest = heartbeatRequest.WithContext(context.WithValue(heartbeatRequest.Context(),
-		hostingRunnerContextKey{}, &HostingRunner{ID: lostRunnerID}))
-	heartbeatRecorder := httptest.NewRecorder()
-	handleHostingAgentHeartbeat(heartbeatRecorder, heartbeatRequest)
+	returningInventory := []hostingObservedRuntime{{ReleaseDigest: releaseDigest,
+		ExternalProjectID: project.ExternalProjectID, ExternalDeploymentID: "deployment_01JRESTORX",
+		RuntimeInstanceID: fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration),
+		RuntimeEndpoint:   completion.RuntimeEndpoint, State: "running"}}
+	heartbeatRecorder := postHostingInventoryHeartbeat(t, lostRunnerID, oldCapacity,
+		strings.Repeat("f", 48), 1, returningInventory)
 	if heartbeatRecorder.Code != http.StatusOK {
 		t.Fatalf("returning runner heartbeat status=%d body=%s", heartbeatRecorder.Code, heartbeatRecorder.Body.String())
 	}
@@ -933,8 +1146,9 @@ func TestHostingRuntimeLossRestoresRetainedReleaseOnAnotherRunner(t *testing.T) 
 		t.Fatal(err)
 	}
 	restored := hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
-		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.70.0.2:3000",
+		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(2), "status_code": float64(200)}}
+	observeHostingRecoveryForTest(t, recoveryRunnerID, recovery, releaseDigest, restored.RuntimeEndpoint)
 	if err := completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, recovery.JobID,
 		recovery.LeaseGeneration, recovery.LeaseToken, restored); err != nil {
 		t.Fatalf("complete runtime recovery: %v", err)
@@ -1025,7 +1239,7 @@ func TestHostingRuntimeRecoveryProxyIntentSurvivesDatabaseRestart(t *testing.T) 
 	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
 	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{
 		Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
-		RuntimeEndpoint: "http://10.71.0.1:3000", HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
+		RuntimeEndpoint: healthyHostingEndpointForTest(t), HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1044,6 +1258,7 @@ func TestHostingRuntimeRecoveryProxyIntentSurvivesDatabaseRestart(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	observeHostingRecoveryForTest(t, recoveryRunnerID, recovery, releaseDigest, healthServer.URL)
 	fake.fail = true
 	err = completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, recovery.JobID,
 		recovery.LeaseGeneration, recovery.LeaseToken, hostingCompletionRequest{
@@ -1057,17 +1272,16 @@ func TestHostingRuntimeRecoveryProxyIntentSurvivesDatabaseRestart(t *testing.T) 
 	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE hosting_runtime_recovery_id=?`, recovery.JobID).Scan(&operationStatus); err != nil || operationStatus != "pending" {
 		t.Fatalf("durable recovery proxy intent status=%q err=%v", operationStatus, err)
 	}
-	heartbeatBody, _ := json.Marshal(hostingHeartbeatRequest{Free: capacityDTO{
+	recoveryFree := capacityDTO{
 		CPUMillis: limits.CPUMillis * 2, RAMBytes: limits.RAMBytes * 2,
 		DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2,
-	}, ProtocolVersion: "v1", ManifestVersions: []string{"v1"}, RuntimeVersions: []string{"20", "22"},
-		Operations: []string{"build", "restore"}})
-	heartbeatRequest := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/heartbeat", bytes.NewReader(heartbeatBody))
-	heartbeatRequest.Header.Set("Content-Type", "application/json")
-	heartbeatRequest = heartbeatRequest.WithContext(context.WithValue(heartbeatRequest.Context(),
-		hostingRunnerContextKey{}, &HostingRunner{ID: recoveryRunnerID}))
-	heartbeatRecorder := httptest.NewRecorder()
-	handleHostingAgentHeartbeat(heartbeatRecorder, heartbeatRequest)
+	}
+	recoveryInventory := []hostingObservedRuntime{{ReleaseDigest: releaseDigest,
+		ExternalProjectID: "project_01JRECRST", ExternalDeploymentID: "deployment_01JRECRST",
+		RuntimeInstanceID: fmt.Sprintf("restore-%d-%d", recovery.JobID, recovery.LeaseGeneration),
+		RuntimeEndpoint:   healthServer.URL, State: "running"}}
+	heartbeatRecorder := postHostingInventoryHeartbeat(t, recoveryRunnerID, recoveryFree,
+		strings.TrimPrefix(hashHostingOperation("test.runner.session", fmt.Sprint(recoveryRunnerID)), "sha256:")[:48], 2, recoveryInventory)
 	if heartbeatRecorder.Code != http.StatusOK {
 		t.Fatalf("recovery candidate heartbeat status=%d body=%s", heartbeatRecorder.Code, heartbeatRecorder.Body.String())
 	}
@@ -1113,7 +1327,7 @@ func TestHostingRuntimeRecoveryProxyIntentFencesConcurrentFailure(t *testing.T) 
 	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
 	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
-			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.71.1.1:3000",
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: healthyHostingEndpointForTest(t),
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1135,12 +1349,14 @@ func TestHostingRuntimeRecoveryProxyIntentFencesConcurrentFailure(t *testing.T) 
 	fake.activateStarted = make(chan struct{}, 2)
 	fake.activateContinue = make(chan struct{})
 	successResult := make(chan error, 2)
+	recoveryEndpoint := healthyHostingEndpointForTest(t)
+	observeHostingRecoveryForTest(t, recoveryRunnerID, recovery, releaseDigest, recoveryEndpoint)
 	for range 2 {
 		go func() {
 			successResult <- completeHostingRuntimeRecovery(context.Background(), recoveryRunnerID, recovery.JobID,
 				recovery.LeaseGeneration, recovery.LeaseToken, hostingCompletionRequest{Status: "success",
 					ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
-					RuntimeEndpoint: "http://10.71.1.2:3000",
+					RuntimeEndpoint: recoveryEndpoint,
 					HealthEvidence:  map[string]any{"healthy": true, "attempts": float64(1)}})
 		}()
 	}
@@ -1173,6 +1389,87 @@ func TestHostingRuntimeRecoveryProxyIntentFencesConcurrentFailure(t *testing.T) 
 	}
 }
 
+func TestHostingRuntimeRecoveryRejectsEndpointChangedDuringProxyDispatch(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, lostRunnerID, job := createAndClaimHostingJob(t,
+		"project_01JRECENDPOINT", "deployment_01JRECENDPOINT")
+	digest := "sha256:" + strings.Repeat("d", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	activeEndpoint := healthyHostingEndpointForTest(t)
+	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: activeEndpoint,
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	recoveryCapacity := hostingWorkloadLimits{CPUMillis: limits.CPUMillis * 2,
+		RAMBytes: limits.RAMBytes * 2, DiskBytes: limits.DiskBytes * 2, PIDs: limits.PIDs * 2}
+	recoveryRunnerID := insertHostingRunnerForTest(t, "recovery-endpoint-swap", recoveryCapacity)
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`, lostRunnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := claimHostingRuntimeRecovery(t.Context(), recoveryRunnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpointAServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(endpointAServer.Close)
+	endpointBServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(endpointBServer.Close)
+	observeHostingRecoveryForTest(t, recoveryRunnerID, recovery, digest, endpointAServer.URL)
+	fake.activateStarted = make(chan struct{}, 1)
+	fake.activateContinue = make(chan struct{})
+	completionResult := make(chan error, 1)
+	go func() {
+		completionResult <- completeHostingRuntimeRecovery(context.Background(), recoveryRunnerID,
+			recovery.JobID, recovery.LeaseGeneration, recovery.LeaseToken, hostingCompletionRequest{
+				Status: "success", ReleaseDigest: digest, ReleaseArtifactDigest: artifactDigest,
+				RuntimeEndpoint: endpointAServer.URL,
+				HealthEvidence:  map[string]any{"healthy": true, "attempts": float64(1)}})
+	}()
+	<-fake.activateStarted
+	var sessionID string
+	if err := db.QueryRow(`SELECT active_session_id FROM hosting_runners WHERE id=?`, recoveryRunnerID).Scan(&sessionID); err != nil {
+		t.Fatal(err)
+	}
+	free := capacityDTO{CPUMillis: recoveryCapacity.CPUMillis, RAMBytes: recoveryCapacity.RAMBytes,
+		DiskBytes: recoveryCapacity.DiskBytes, PIDs: recoveryCapacity.PIDs}
+	inventory := []hostingObservedRuntime{{ReleaseDigest: digest,
+		ExternalProjectID: project.ExternalProjectID, ExternalDeploymentID: "deployment_01JRECENDPOINT",
+		RuntimeInstanceID: fmt.Sprintf("restore-%d-%d", recovery.JobID, recovery.LeaseGeneration),
+		RuntimeEndpoint:   endpointBServer.URL, State: "running"}}
+	if recorder := postHostingInventoryHeartbeat(t, recoveryRunnerID, free, sessionID, 2, inventory); recorder.Code != http.StatusOK {
+		t.Fatalf("recovery endpoint-change heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	close(fake.activateContinue)
+	completionErr := <-completionResult
+	var apiErr *hostingAPIError
+	if !errors.As(completionErr, &apiErr) || apiErr.Code != errCodeReleaseNotHealthy {
+		t.Fatalf("endpoint-change completion error=%v", completionErr)
+	}
+	var recoveryStatus, operationStatus string
+	if err := db.QueryRow(`SELECT status FROM hosting_runtime_recoveries WHERE id=?`, recovery.JobID).Scan(&recoveryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations
+		WHERE hosting_runtime_recovery_id=?`, recovery.JobID).Scan(&operationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryStatus != "failed" || operationStatus != "failed" || !fake.currentSuspended {
+		t.Fatalf("recovery endpoint swap committed: recovery=%q operation=%q suspended=%v",
+			recoveryStatus, operationStatus, fake.currentSuspended)
+	}
+}
+
 func TestExpiredHostingRuntimeRecoveryLeaseIsReassignedAndFenced(t *testing.T) {
 	withTempDB(t)
 	withFakeProxy(t)
@@ -1181,7 +1478,7 @@ func TestExpiredHostingRuntimeRecoveryLeaseIsReassignedAndFenced(t *testing.T) {
 	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
 	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{
 		Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
-		RuntimeEndpoint: "http://10.72.0.1:3000", HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
+		RuntimeEndpoint: healthyHostingEndpointForTest(t), HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1259,10 +1556,12 @@ func TestExpiredHostingRuntimeRecoveryLeaseIsReassignedAndFenced(t *testing.T) {
 	if third.LeaseGeneration != second.LeaseGeneration+1 {
 		t.Fatalf("retry generation=%d want=%d", third.LeaseGeneration, second.LeaseGeneration+1)
 	}
+	thirdEndpoint := healthyHostingEndpointForTest(t)
+	observeHostingRecoveryForTest(t, recoveryRunnerID, third, releaseDigest, thirdEndpoint)
 	if err := completeHostingRuntimeRecovery(t.Context(), recoveryRunnerID, third.JobID,
 		third.LeaseGeneration, third.LeaseToken, hostingCompletionRequest{Status: "success",
 			ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
-			RuntimeEndpoint: "http://10.72.0.2:3000",
+			RuntimeEndpoint: thirdEndpoint,
 			HealthEvidence:  map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatalf("complete recovery after failed generation: %v", err)
 	}
@@ -1276,7 +1575,7 @@ func TestHostingRuntimeRecoveryHonorsDurableProjectSuspension(t *testing.T) {
 	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
 	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{
 		Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: artifactDigest,
-		RuntimeEndpoint: "http://10.73.0.1:3000", HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
+		RuntimeEndpoint: healthyHostingEndpointForTest(t), HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1295,8 +1594,9 @@ func TestHostingRuntimeRecoveryHonorsDurableProjectSuspension(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored := hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
-		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.73.0.2:3000",
+		ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}
+	observeHostingRecoveryForTest(t, recoveryRunnerID, recovery, releaseDigest, restored.RuntimeEndpoint)
 	fake.activateStarted = make(chan struct{}, 1)
 	fake.activateContinue = make(chan struct{})
 	completionResult := make(chan error, 1)
@@ -1367,7 +1667,7 @@ func TestHostingRuntimeLossWithSecretReferencesIssuesFreshRecoveryIdentity(t *te
 	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
 	if err := completeHostingJob(t.Context(), lostRunnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest,
-			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: "http://10.73.1.1:3000",
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: healthyHostingEndpointForTest(t),
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1386,7 +1686,7 @@ func TestHostingRuntimeLossWithSecretReferencesIssuesFreshRecoveryIdentity(t *te
 	}
 	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
 	recoveryRunnerID := insertHostingRunnerForTest(t, "secret-recovery-runner", limits)
-	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore"]' WHERE id=?`, recoveryRunnerID); err != nil {
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore","runtime-inventory-v1"]' WHERE id=?`, recoveryRunnerID); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
@@ -1402,7 +1702,7 @@ func TestHostingRuntimeLossWithSecretReferencesIssuesFreshRecoveryIdentity(t *te
 	if incompatibleAssignment.Valid {
 		t.Fatalf("secret recovery assigned to legacy runner %d", incompatibleAssignment.Int64)
 	}
-	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore","runtime-secrets-v1"]' WHERE id=?`, recoveryRunnerID); err != nil {
+	if _, err := db.Exec(`UPDATE hosting_runners SET operation_capabilities_json='["build","restore","runtime-secrets-v1","runtime-inventory-v1"]' WHERE id=?`, recoveryRunnerID); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
@@ -1562,6 +1862,7 @@ func TestContentIdenticalRedeploymentCreatesDistinctReleaseInstances(t *testing.
 	project, token, runnerID, firstJob := createAndClaimHostingJob(t, "project_01JSAMEIM", "deployment_01JSAME01")
 	digest := "sha256:" + strings.Repeat("8", 64)
 	firstArtifact := attachTestReleaseArtifact(t, firstJob.JobID, digest)
+	observeHostingJobEndpointForTest(t, firstJob.JobID, healthServer.URL)
 	if err := completeHostingJob(t.Context(), runnerID, firstJob.JobID, firstJob.LeaseGeneration, firstJob.LeaseToken, hostingCompletionRequest{
 		Status: "success", ReleaseDigest: digest, ReleaseArtifactDigest: firstArtifact,
 		RuntimeEndpoint: healthServer.URL, HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
@@ -1577,7 +1878,9 @@ func TestContentIdenticalRedeploymentCreatesDistinctReleaseInstances(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	advanceHostingJobToHealthCheckingForTest(t, runnerID, secondJob)
 	secondArtifact := attachTestReleaseArtifact(t, secondJob.JobID, digest)
+	observeHostingJobEndpointForTest(t, secondJob.JobID, healthServer.URL)
 	if secondArtifact != firstArtifact {
 		t.Fatal("identical image content produced different fixture artifacts")
 	}
@@ -1636,23 +1939,357 @@ func TestExpiredLeaseRecoversWhileRunnerRemainsOnlineAndFencesCompletion(t *test
 
 func TestHostingPhaseReportsCannotRegress(t *testing.T) {
 	withTempDB(t)
-	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JPHASES", "deployment_01JPHASES")
-	report := func(phase string) *httptest.ResponseRecorder {
-		body, _ := json.Marshal(hostingPhaseRequest{Phase: phase})
-		request := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/hosting-agent/v1/jobs/%d/phase", job.JobID), bytes.NewReader(body))
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("X-Deployer-Lease-Generation", fmt.Sprint(job.LeaseGeneration))
-		request.Header.Set("X-Deployer-Lease-Token", job.LeaseToken)
-		request = request.WithContext(context.WithValue(request.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: runnerID}))
-		recorder := httptest.NewRecorder()
-		handleHostingJobPhase(recorder, request, job.JobID)
-		return recorder
-	}
-	if recorder := report(hostingPhaseBuilding); recorder.Code != http.StatusNoContent {
+	_, _, runnerID, job := createAndClaimHostingJobAtFetching(t, "project_01JPHASES", "deployment_01JPHASES")
+	if recorder := reportHostingJobPhaseForTest(t, runnerID, job, hostingPhaseBuilding); recorder.Code != http.StatusNoContent {
 		t.Fatalf("building phase status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
-	if recorder := report(hostingPhaseFetching); recorder.Code != http.StatusConflict {
+	if recorder := reportHostingJobPhaseForTest(t, runnerID, job, hostingPhaseFetching); recorder.Code != http.StatusConflict {
 		t.Fatalf("regressed phase status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHostingSuccessfulCompletionRequiresHealthCheckingPhase(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		advanceThrough []string
+		wantCode       string
+	}{
+		{name: "fetching_source", wantCode: errCodeConflict},
+		{name: "building", advanceThrough: []string{hostingPhaseBuilding}, wantCode: errCodeConflict},
+		{name: "starting_candidate", advanceThrough: []string{hostingPhaseBuilding, hostingPhaseStarting}, wantCode: errCodeConflict},
+		{name: "health_checking", advanceThrough: []string{hostingPhaseBuilding, hostingPhaseStarting, hostingPhaseHealth}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			withTempDB(t)
+			withFakeProxy(t)
+			_, _, runnerID, job := createAndClaimHostingJobAtFetching(t,
+				"project_01JPHASEOK"+strings.ToUpper(test.name[:1]),
+				"deployment_01JPHASEOK"+strings.ToUpper(test.name[:1]))
+			for _, phase := range test.advanceThrough {
+				if recorder := reportHostingJobPhaseForTest(t, runnerID, job, phase); recorder.Code != http.StatusNoContent {
+					t.Fatalf("advance to %s: status=%d body=%s", phase, recorder.Code, recorder.Body.String())
+				}
+			}
+			digest := "sha256:" + strings.Repeat("a", 64)
+			err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+				job.LeaseToken, hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+					ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest),
+					RuntimeEndpoint:       healthyHostingEndpointForTest(t),
+					HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}})
+			if test.wantCode == "" {
+				if err != nil {
+					t.Fatalf("health-checking completion: %v", err)
+				}
+				return
+			}
+			var apiErr *hostingAPIError
+			if !errors.As(err, &apiErr) || apiErr.Code != test.wantCode {
+				t.Fatalf("completion from %s err=%v, want %s", test.name, err, test.wantCode)
+			}
+		})
+	}
+}
+
+func TestHostingCandidateRequiresControlPlaneHealth(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JNOSESS", "deployment_01JNOSESS")
+	unhealthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(unhealthy.Close)
+	oldTimeout := hostingActivationReconcileHealthTimeout
+	hostingActivationReconcileHealthTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { hostingActivationReconcileHealthTimeout = oldTimeout })
+	digest := "sha256:" + strings.Repeat("b", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	observeHostingJobEndpointForTest(t, job.JobID, unhealthy.URL)
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: artifactDigest,
+			RuntimeEndpoint:       unhealthy.URL,
+			HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatalf("persist no-session health failure: %v", err)
+	}
+	deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JNOSESS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deployment.Status != hostingStatusFailed || deployment.FailureCode != "health_check_failed" {
+		t.Fatalf("unhealthy no-session deployment=%+v", deployment)
+	}
+	if len(fake.activations) != 0 {
+		t.Fatalf("unhealthy candidate reached proxy: %+v", fake.activations)
+	}
+	var operationStatus string
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations
+		WHERE hosting_deployment_id=(SELECT hosting_deployment_id FROM hosting_jobs WHERE id=?)
+		AND operation_type='activate'`, job.JobID).Scan(&operationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if operationStatus != "failed" {
+		t.Fatalf("terminal health failure left activation intent %q", operationStatus)
+	}
+}
+
+func TestHostingCandidateRequiresAuthoritativeInventorySession(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JREQSESS", "deployment_01JREQSESS")
+	digest := "sha256:" + strings.Repeat("c", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	if _, err := db.Exec(`UPDATE hosting_runners SET active_session_id='' WHERE id=?`, runnerID); err != nil {
+		t.Fatal(err)
+	}
+	err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: artifactDigest,
+			RuntimeEndpoint:       healthyHostingEndpointForTest(t),
+			HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}})
+	var apiErr *hostingAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeReleaseNotHealthy {
+		t.Fatalf("completion without inventory session err=%v", err)
+	}
+	if len(fake.activations) != 0 {
+		t.Fatalf("candidate without inventory identity reached proxy: %+v", fake.activations)
+	}
+	var operations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations
+		WHERE hosting_deployment_id=(SELECT hosting_deployment_id FROM hosting_jobs WHERE id=?)`,
+		job.JobID).Scan(&operations); err != nil || operations != 0 {
+		t.Fatalf("unbound candidate operations=%d err=%v", operations, err)
+	}
+}
+
+func TestHostingCandidateEndpointMustMatchAuthoritativeInventory(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JEPBIND", "deployment_01JEPBIND")
+	digest := "sha256:" + strings.Repeat("2", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	observedEndpoint := healthyHostingEndpointForTest(t)
+	otherEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(otherEndpoint.Close)
+	err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: otherEndpoint.URL,
+			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}})
+	var apiErr *hostingAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != errCodeReleaseNotHealthy {
+		t.Fatalf("completion endpoint mismatch observed=%q supplied=%q err=%v",
+			observedEndpoint, otherEndpoint.URL, err)
+	}
+	if len(fake.activations) != 0 {
+		t.Fatalf("endpoint-mismatched candidate reached proxy: %+v", fake.activations)
+	}
+}
+
+func TestHostingHealthCheckRejectsRedirects(t *testing.T) {
+	var redirectedRequests atomic.Int64
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectedRequests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(redirectTarget.Close)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL, http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	if _, _, err := checkHostingCandidateHealth(ctx, redirector.URL); err == nil {
+		t.Fatal("redirect response was accepted as healthy")
+	}
+	if got := redirectedRequests.Load(); got != 0 {
+		t.Fatalf("health checker followed workload redirect %d times", got)
+	}
+}
+
+func TestHostingRecoveryCandidateRequiresAuthoritativeInventorySession(t *testing.T) {
+	var healthRequests atomic.Int64
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		healthRequests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(health.Close)
+	now := time.Now().UTC()
+	state := &hostingRuntimeRecoveryState{ID: 42, LeaseGeneration: 3, RunnerStatus: "online",
+		RunnerLastSeen: sql.NullString{String: formatSQLiteTime(now), Valid: true},
+		ReleaseDigest:  "sha256:" + strings.Repeat("f", 64)}
+	if err := verifyHostingRecoveryCandidate(t.Context(), state, health.URL); err == nil {
+		t.Fatal("recovery without an inventory session was accepted")
+	}
+	if healthRequests.Load() != 0 {
+		t.Fatal("unbound recovery reached the HTTP health gate")
+	}
+	state.RunnerActiveSession = strings.Repeat("a", 48)
+	state.RuntimeObservedAt = sql.NullString{String: formatSQLiteTime(now), Valid: true}
+	state.RuntimeObservedSession = state.RunnerActiveSession
+	state.RuntimeObservedDigest = state.ReleaseDigest
+	state.RuntimeObservedInstance = "restore-42-3"
+	state.RuntimeObservedEndpoint = health.URL
+	if err := verifyHostingRecoveryCandidate(t.Context(), state, health.URL); err != nil {
+		t.Fatalf("observed recovery candidate: %v", err)
+	}
+	if healthRequests.Load() != 1 {
+		t.Fatalf("observed recovery health requests=%d", healthRequests.Load())
+	}
+}
+
+func TestHostingSuccessfulCompletionExactRetryResumesStagedActivation(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JCOMPRET", "deployment_01JCOMPRET")
+	digest := "sha256:" + strings.Repeat("d", 64)
+	completion := hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+		ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest),
+		RuntimeEndpoint:       healthyHostingEndpointForTest(t),
+		HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}}
+	fake.fail = true
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, completion); err == nil {
+		t.Fatal("transient adapter failure unexpectedly completed")
+	}
+	fake.fail = false
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, completion); err != nil {
+		t.Fatalf("exact staged completion retry: %v", err)
+	}
+	var operations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations
+		WHERE hosting_deployment_id=(SELECT hosting_deployment_id FROM hosting_jobs WHERE id=?)
+		AND operation_type='activate'`, job.JobID).Scan(&operations); err != nil {
+		t.Fatal(err)
+	}
+	if operations != 1 || len(fake.activations) != 2 {
+		t.Fatalf("operations=%d adapter attempts=%d", operations, len(fake.activations))
+	}
+}
+
+func TestHostingConcurrentIdenticalSuccessCompletionsShareActivationIntent(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JCOMPDUP", "deployment_01JCOMPDUP")
+	digest := "sha256:" + strings.Repeat("e", 64)
+	completion := hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+		ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest),
+		RuntimeEndpoint:       healthyHostingEndpointForTest(t),
+		HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}}
+	fake.activateStarted = make(chan struct{}, 2)
+	fake.activateContinue = make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		results <- completeHostingJob(context.Background(), runnerID, job.JobID,
+			job.LeaseGeneration, job.LeaseToken, completion)
+	}()
+	select {
+	case <-fake.activateStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first completion did not reach activation")
+	}
+	go func() {
+		results <- completeHostingJob(context.Background(), runnerID, job.JobID,
+			job.LeaseGeneration, job.LeaseToken, completion)
+	}()
+	select {
+	case <-fake.activateStarted:
+	case <-time.After(3 * time.Second):
+		close(fake.activateContinue)
+		t.Fatal("identical completion did not adopt staged activation")
+	}
+	close(fake.activateContinue)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("identical completion result: %v", err)
+		}
+	}
+	var operations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations
+		WHERE hosting_deployment_id=(SELECT hosting_deployment_id FROM hosting_jobs WHERE id=?)
+		AND operation_type='activate'`, job.JobID).Scan(&operations); err != nil {
+		t.Fatal(err)
+	}
+	if operations != 1 {
+		t.Fatalf("durable activation intents=%d", operations)
+	}
+}
+
+func TestHostingHealthFailureFencesConcurrentAmbiguousActivation(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JHLTRACE", "deployment_01JHLTRACE")
+	var healthRequests atomic.Int64
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if healthRequests.Add(1) == 1 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(health.Close)
+	oldTimeout := hostingActivationReconcileHealthTimeout
+	hostingActivationReconcileHealthTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { hostingActivationReconcileHealthTimeout = oldTimeout })
+	digest := "sha256:" + strings.Repeat("1", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	observeHostingJobEndpointForTest(t, job.JobID, health.URL)
+	completion := hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+		ReleaseArtifactDigest: artifactDigest,
+		RuntimeEndpoint:       health.URL,
+		HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}}
+	started := make(chan struct{}, 1)
+	continued := make(chan struct{})
+	fake.activateStarted = started
+	fake.activateContinue = continued
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- completeHostingJob(context.Background(), runnerID, job.JobID,
+			job.LeaseGeneration, job.LeaseToken, completion)
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first completion did not dispatch activation")
+	}
+	fake.mu.Lock()
+	fake.activateStarted = nil
+	fake.activateContinue = nil
+	fake.mu.Unlock()
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, completion); err != nil {
+		close(continued)
+		t.Fatalf("concurrent health failure did not converge: %v", err)
+	}
+	close(continued)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("superseded activation completion: %v", err)
+	}
+	deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JHLTRACE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deployment.Status != hostingStatusFailed || deployment.FailureCode != "health_check_failed" {
+		t.Fatalf("deployment after mixed health race=%+v", deployment)
+	}
+	fake.mu.Lock()
+	currentSuspended := fake.currentSuspended
+	fake.mu.Unlock()
+	if !currentSuspended {
+		t.Fatal("ambiguous candidate activation was not fenced by suspension")
+	}
+	var failedActivations, committedCompensations int
+	if err := db.QueryRow(`SELECT
+		SUM(CASE WHEN operation_type='activate' AND status='failed' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN operation_type='compensate' AND status='committed' THEN 1 ELSE 0 END)
+		FROM hosting_proxy_operations
+		WHERE hosting_deployment_id=(SELECT hosting_deployment_id FROM hosting_jobs WHERE id=?)`,
+		job.JobID).Scan(&failedActivations, &committedCompensations); err != nil {
+		t.Fatal(err)
+	}
+	if failedActivations != 1 || committedCompensations != 1 {
+		t.Fatalf("activation failures=%d committed compensations=%d", failedActivations, committedCompensations)
 	}
 }
 
@@ -1666,6 +2303,7 @@ func TestHostingRestartReconcilesPendingActivationAndPreservesDurableState(t *te
 	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JREOPEN", "deployment_01JREOPEN")
 	digest := "sha256:" + strings.Repeat("9", 64)
 	releaseArtifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	observeHostingJobEndpointForTest(t, job.JobID, healthServer.URL)
 	state, err := getHostingCompletionState(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken)
 	if err != nil {
 		t.Fatal(err)
@@ -1747,6 +2385,7 @@ func TestHostingRestartRefusesDeadPendingCandidateActivation(t *testing.T) {
 			_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JDEADPX", "deployment_01JDEADPX")
 			digest := "sha256:" + strings.Repeat("3", 64)
 			artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+			observeHostingJobEndpointForTest(t, job.JobID, healthServer.URL)
 			state, err := getHostingCompletionState(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken)
 			if err != nil {
 				t.Fatal(err)
@@ -1779,13 +2418,184 @@ func TestHostingRestartRefusesDeadPendingCandidateActivation(t *testing.T) {
 	}
 }
 
+func TestHostingActivationRejectsEndpointChangedDuringProxyDispatch(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t,
+		"project_01JENDPOINTSWAP", "deployment_01JENDPOINTSWAP")
+	digest := "sha256:" + strings.Repeat("4", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	endpointA := healthyHostingEndpointForTest(t)
+	endpointBServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(endpointBServer.Close)
+	fake.activateStarted = make(chan struct{}, 1)
+	fake.activateContinue = make(chan struct{})
+	completionResult := make(chan error, 1)
+	go func() {
+		completionResult <- completeHostingJob(context.Background(), runnerID, job.JobID,
+			job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{Status: "success",
+				ReleaseDigest: digest, ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: endpointA,
+				HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}})
+	}()
+	<-fake.activateStarted
+	var sessionID string
+	var free capacityDTO
+	if err := db.QueryRow(`SELECT active_session_id, capacity_cpu_millis, capacity_ram_bytes,
+		capacity_disk_bytes, capacity_pids FROM hosting_runners WHERE id=?`, runnerID).Scan(
+		&sessionID, &free.CPUMillis, &free.RAMBytes, &free.DiskBytes, &free.PIDs); err != nil {
+		t.Fatal(err)
+	}
+	inventory := []hostingObservedRuntime{{ReleaseDigest: digest,
+		ExternalProjectID: project.ExternalProjectID, ExternalDeploymentID: "deployment_01JENDPOINTSWAP",
+		RuntimeInstanceID: fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration),
+		RuntimeEndpoint:   endpointBServer.URL, State: "running"}}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, inventory); recorder.Code != http.StatusOK {
+		t.Fatalf("endpoint-change heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	close(fake.activateContinue)
+	if err := <-completionResult; err != nil {
+		t.Fatal(err)
+	}
+	var deploymentStatus, failureCode, operationStatus string
+	if err := db.QueryRow(`SELECT status, failure_code FROM hosting_deployments
+		WHERE external_deployment_id=?`, "deployment_01JENDPOINTSWAP").Scan(&deploymentStatus, &failureCode); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations
+		WHERE hosting_deployment_id=(SELECT id FROM hosting_deployments WHERE external_deployment_id=?)`,
+		"deployment_01JENDPOINTSWAP").Scan(&operationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if deploymentStatus != hostingStatusFailed || failureCode != "health_check_failed" ||
+		operationStatus != "failed" || !fake.currentSuspended {
+		t.Fatalf("endpoint swap committed: deployment=%q failure=%q operation=%q suspended=%v",
+			deploymentStatus, failureCode, operationStatus, fake.currentSuspended)
+	}
+}
+
+func TestHostingRestartCompensatesToExactPreviousRuntimeEndpoint(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	firstEndpoint := healthyHostingEndpointForTest(t)
+	secondEndpoint := healthyHostingEndpointForTest(t)
+	project, token, runnerID, firstJob := createAndClaimHostingJob(t,
+		"project_01JEXACTEP", "deployment_01JEXACTE1")
+	sharedDigest := "sha256:" + strings.Repeat("6", 64)
+	firstArtifact := attachTestReleaseArtifact(t, firstJob.JobID, sharedDigest)
+	observeHostingJobEndpointForTest(t, firstJob.JobID, firstEndpoint)
+	if err := completeHostingJob(t.Context(), runnerID, firstJob.JobID, firstJob.LeaseGeneration,
+		firstJob.LeaseToken, hostingCompletionRequest{Status: "success", ReleaseDigest: sharedDigest,
+			ReleaseArtifactDigest: firstArtifact,
+			RuntimeEndpoint:       firstEndpoint,
+			HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	request := validHostingDeploymentRequest("deployment_01JEXACTE2")
+	request.ManifestDigest = project.ManifestDigest
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID,
+		"create_01JEXACTE2", request); err != nil {
+		t.Fatal(err)
+	}
+	secondJob, err := claimHostingJob(t.Context(), runnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceHostingJobToHealthCheckingForTest(t, runnerID, secondJob)
+	secondArtifact := attachTestReleaseArtifact(t, secondJob.JobID, sharedDigest)
+	observeHostingJobEndpointForTest(t, secondJob.JobID, secondEndpoint)
+	if err := completeHostingJob(t.Context(), runnerID, secondJob.JobID, secondJob.LeaseGeneration,
+		secondJob.LeaseToken, hostingCompletionRequest{Status: "success", ReleaseDigest: sharedDigest,
+			ReleaseArtifactDigest: secondArtifact,
+			RuntimeEndpoint:       secondEndpoint,
+			HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	request = validHostingDeploymentRequest("deployment_01JEXACTE3")
+	request.ManifestDigest = project.ManifestDigest
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID,
+		"create_01JEXACTE3", request); err != nil {
+		t.Fatal(err)
+	}
+	candidateJob, err := claimHostingJob(t.Context(), runnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceHostingJobToHealthCheckingForTest(t, runnerID, candidateJob)
+	candidateDigest := "sha256:" + strings.Repeat("7", 64)
+	candidateArtifact := attachTestReleaseArtifact(t, candidateJob.JobID, candidateDigest)
+	unhealthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(unhealthy.Close)
+	observeHostingJobEndpointForTest(t, candidateJob.JobID, unhealthy.URL)
+	state, err := getHostingCompletionState(t.Context(), runnerID, candidateJob.JobID,
+		candidateJob.LeaseGeneration, candidateJob.LeaseToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stageHealthyHostingRelease(t.Context(), state, hostingCompletionRequest{Status: "success",
+		ReleaseDigest: candidateDigest, ReleaseArtifactDigest: candidateArtifact,
+		RuntimeEndpoint: unhealthy.URL,
+		HealthEvidence:  map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	var persistedPreviousEndpoint string
+	if err := db.QueryRow(`SELECT expected_previous_runtime_endpoint FROM hosting_proxy_operations
+		WHERE hosting_deployment_id=(SELECT hosting_deployment_id FROM hosting_jobs WHERE id=?)
+		AND operation_type='activate'`, candidateJob.JobID).Scan(&persistedPreviousEndpoint); err != nil {
+		t.Fatal(err)
+	}
+	if persistedPreviousEndpoint != secondEndpoint {
+		t.Fatalf("persisted previous endpoint=%q want %q", persistedPreviousEndpoint, secondEndpoint)
+	}
+	if _, err := db.Exec(`UPDATE hosting_proxy_operations SET expected_previous_runtime_endpoint=''
+		WHERE hosting_deployment_id=(SELECT hosting_deployment_id FROM hosting_jobs WHERE id=?)
+		AND operation_type='activate'`, candidateJob.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM schema_migrations WHERE id='039_hosting_activation_previous_endpoint'`); err != nil {
+		t.Fatal(err)
+	}
+	var sequence int
+	var databaseName, databasePath string
+	if err := db.QueryRow(`PRAGMA database_list`).Scan(&sequence, &databaseName, &databasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT expected_previous_runtime_endpoint FROM hosting_proxy_operations
+		WHERE hosting_deployment_id=(SELECT hosting_deployment_id FROM hosting_jobs WHERE id=?)
+		AND operation_type='activate'`, candidateJob.JobID).Scan(&persistedPreviousEndpoint); err != nil {
+		t.Fatal(err)
+	}
+	if persistedPreviousEndpoint != secondEndpoint {
+		t.Fatalf("backfilled previous endpoint=%q want %q", persistedPreviousEndpoint, secondEndpoint)
+	}
+	oldTimeout := hostingActivationReconcileHealthTimeout
+	hostingActivationReconcileHealthTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { hostingActivationReconcileHealthTimeout = oldTimeout })
+	initialActivations := len(fake.activations)
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.activations) != initialActivations+1 || fake.activations[len(fake.activations)-1].RuntimeEndpoint != secondEndpoint {
+		t.Fatalf("restart compensation activations=%+v want endpoint %q", fake.activations, secondEndpoint)
+	}
+}
+
 func TestHealthFailurePreservesPreviousActiveRelease(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
 	project, token, runnerID, firstJob := createAndClaimHostingJob(t, "project_01JHEALTH", "deployment_01JGOOD")
 	firstDigest := "sha256:" + strings.Repeat("e", 64)
 	if err := completeHostingJob(t.Context(), runnerID, firstJob.JobID, firstJob.LeaseGeneration, firstJob.LeaseToken, hostingCompletionRequest{
-		Status: "success", ReleaseDigest: firstDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, firstJob.JobID, firstDigest), RuntimeEndpoint: "http://10.11.0.5:3000",
+		Status: "success", ReleaseDigest: firstDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, firstJob.JobID, firstDigest), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatalf("activate first release: %v", err)
@@ -1799,9 +2609,10 @@ func TestHealthFailurePreservesPreviousActiveRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim second job: %v", err)
 	}
+	advanceHostingJobToHealthCheckingForTest(t, runnerID, secondJob)
 	secondDigest := "sha256:" + strings.Repeat("f", 64)
 	if err := completeHostingJob(t.Context(), runnerID, secondJob.JobID, secondJob.LeaseGeneration, secondJob.LeaseToken, hostingCompletionRequest{
-		Status: "success", ReleaseDigest: secondDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, secondJob.JobID, secondDigest), RuntimeEndpoint: "http://10.11.0.6:3000",
+		Status: "success", ReleaseDigest: secondDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, secondJob.JobID, secondDigest), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": false, "attempts": float64(5)},
 	}); err != nil {
 		t.Fatalf("record health failure: %v", err)
@@ -1834,7 +2645,7 @@ func TestDurableCancelBeforeCompletionNeverActivatesCandidate(t *testing.T) {
 		t.Fatalf("cancellation intent was not durable: %+v", cancelled)
 	}
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{
-		Status: "success", ReleaseDigest: "sha256:" + strings.Repeat("a", 64), RuntimeEndpoint: "http://10.12.0.5:3000",
+		Status: "success", ReleaseDigest: "sha256:" + strings.Repeat("a", 64), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatalf("complete cancelled job: %v", err)
@@ -1945,7 +2756,7 @@ func TestProxyActivationFailurePreservesPreviousRelease(t *testing.T) {
 	project, token, runnerID, firstJob := createAndClaimHostingJob(t, "project_01JPROXYF", "deployment_01JPROXY1")
 	firstDigest := "sha256:" + strings.Repeat("1", 64)
 	if err := completeHostingJob(t.Context(), runnerID, firstJob.JobID, firstJob.LeaseGeneration, firstJob.LeaseToken, hostingCompletionRequest{
-		Status: "success", ReleaseDigest: firstDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, firstJob.JobID, firstDigest), RuntimeEndpoint: "http://10.20.0.1:3000",
+		Status: "success", ReleaseDigest: firstDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, firstJob.JobID, firstDigest), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)
@@ -1959,10 +2770,11 @@ func TestProxyActivationFailurePreservesPreviousRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	advanceHostingJobToHealthCheckingForTest(t, runnerID, secondJob)
 	fake.reject = true
 	secondDigest := "sha256:" + strings.Repeat("2", 64)
 	if err := completeHostingJob(t.Context(), runnerID, secondJob.JobID, secondJob.LeaseGeneration, secondJob.LeaseToken, hostingCompletionRequest{
-		Status: "success", ReleaseDigest: secondDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, secondJob.JobID, secondDigest), RuntimeEndpoint: "http://10.20.0.2:3000",
+		Status: "success", ReleaseDigest: secondDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, secondJob.JobID, secondDigest), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatalf("proxy failure should be persisted as terminal state: %v", err)
@@ -1990,8 +2802,10 @@ func TestRollbackSelectedReleaseIsIdempotent(t *testing.T) {
 	t.Cleanup(healthServer.Close)
 	project, token, runnerID, firstJob := createAndClaimHostingJob(t, "project_01JROLLBK", "deployment_01JROLLB1")
 	firstDigest := "sha256:" + strings.Repeat("3", 64)
+	firstArtifact := attachTestReleaseArtifact(t, firstJob.JobID, firstDigest)
+	observeHostingJobEndpointForTest(t, firstJob.JobID, healthServer.URL)
 	if err := completeHostingJob(t.Context(), runnerID, firstJob.JobID, firstJob.LeaseGeneration, firstJob.LeaseToken, hostingCompletionRequest{
-		Status: "success", ReleaseDigest: firstDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, firstJob.JobID, firstDigest), RuntimeEndpoint: healthServer.URL,
+		Status: "success", ReleaseDigest: firstDigest, ReleaseArtifactDigest: firstArtifact, RuntimeEndpoint: healthServer.URL,
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)
@@ -2005,9 +2819,10 @@ func TestRollbackSelectedReleaseIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	advanceHostingJobToHealthCheckingForTest(t, runnerID, secondJob)
 	secondDigest := "sha256:" + strings.Repeat("4", 64)
 	if err := completeHostingJob(t.Context(), runnerID, secondJob.JobID, secondJob.LeaseGeneration, secondJob.LeaseToken, hostingCompletionRequest{
-		Status: "success", ReleaseDigest: secondDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, secondJob.JobID, secondDigest), RuntimeEndpoint: "http://10.30.0.2:3000",
+		Status: "success", ReleaseDigest: secondDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, secondJob.JobID, secondDigest), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)
@@ -2043,9 +2858,11 @@ func TestRollbackCompensatesWhenExactRuntimeDisappearsDuringProxyActivation(t *t
 	defer currentHealth.Close()
 	project, token, runnerID, firstJob := createAndClaimHostingJob(t, "project_01JROLLRACE", "deployment_01JROLLR1")
 	firstDigest := "sha256:" + strings.Repeat("7", 64)
+	firstArtifact := attachTestReleaseArtifact(t, firstJob.JobID, firstDigest)
+	observeHostingJobEndpointForTest(t, firstJob.JobID, targetHealth.URL)
 	if err := completeHostingJob(t.Context(), runnerID, firstJob.JobID, firstJob.LeaseGeneration, firstJob.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: firstDigest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, firstJob.JobID, firstDigest), RuntimeEndpoint: targetHealth.URL,
+			ReleaseArtifactDigest: firstArtifact, RuntimeEndpoint: targetHealth.URL,
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -2058,10 +2875,13 @@ func TestRollbackCompensatesWhenExactRuntimeDisappearsDuringProxyActivation(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
+	advanceHostingJobToHealthCheckingForTest(t, runnerID, secondJob)
 	secondDigest := "sha256:" + strings.Repeat("8", 64)
+	secondArtifact := attachTestReleaseArtifact(t, secondJob.JobID, secondDigest)
+	observeHostingJobEndpointForTest(t, secondJob.JobID, currentHealth.URL)
 	if err := completeHostingJob(t.Context(), runnerID, secondJob.JobID, secondJob.LeaseGeneration, secondJob.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: secondDigest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, secondJob.JobID, secondDigest), RuntimeEndpoint: currentHealth.URL,
+			ReleaseArtifactDigest: secondArtifact, RuntimeEndpoint: currentHealth.URL,
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -2075,10 +2895,12 @@ func TestRollbackCompensatesWhenExactRuntimeDisappearsDuringProxyActivation(t *t
 	inventory := []hostingObservedRuntime{
 		{ReleaseDigest: firstDigest, ExternalProjectID: project.ExternalProjectID,
 			ExternalDeploymentID: "deployment_01JROLLR1",
-			RuntimeInstanceID:    fmt.Sprintf("build-%d-%d", firstJob.JobID, firstJob.LeaseGeneration), State: "running"},
+			RuntimeInstanceID:    fmt.Sprintf("build-%d-%d", firstJob.JobID, firstJob.LeaseGeneration),
+			RuntimeEndpoint:      targetHealth.URL, State: "running"},
 		{ReleaseDigest: secondDigest, ExternalProjectID: project.ExternalProjectID,
 			ExternalDeploymentID: "deployment_01JROLLR2",
-			RuntimeInstanceID:    fmt.Sprintf("build-%d-%d", secondJob.JobID, secondJob.LeaseGeneration), State: "running"},
+			RuntimeInstanceID:    fmt.Sprintf("build-%d-%d", secondJob.JobID, secondJob.LeaseGeneration),
+			RuntimeEndpoint:      currentHealth.URL, State: "running"},
 	}
 	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 1, inventory); recorder.Code != http.StatusOK {
 		t.Fatalf("rollback inventory session status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -2152,9 +2974,11 @@ func TestResumeCompensatesRuntimeLossAndRemainsPendingUntilAvailable(t *testing.
 	fake := withFakeProxy(t)
 	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JRESUMEC", "deployment_01JRESUMEC")
 	digest := "sha256:" + strings.Repeat("a", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	activeEndpoint := healthyHostingEndpointForTest(t)
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: "http://10.91.0.1:3000",
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: activeEndpoint,
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -2167,7 +2991,8 @@ func TestResumeCompensatesRuntimeLossAndRemainsPendingUntilAvailable(t *testing.
 	sessionID := strings.Repeat("b", 48)
 	running := []hostingObservedRuntime{{ReleaseDigest: digest, ExternalProjectID: project.ExternalProjectID,
 		ExternalDeploymentID: "deployment_01JRESUMEC",
-		RuntimeInstanceID:    fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration), State: "running"}}
+		RuntimeInstanceID:    fmt.Sprintf("build-%d-%d", job.JobID, job.LeaseGeneration),
+		RuntimeEndpoint:      activeEndpoint, State: "running"}}
 	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 1, running); recorder.Code != http.StatusOK {
 		t.Fatalf("resume inventory session status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -2352,10 +3177,11 @@ func TestHostingCompensationSuspendsIfExactFallbackDisappearsDuringProxyActivati
 	fake := withFakeProxy(t)
 	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JCOMPLOS", "deployment_01JCOMPLOS")
 	digest := "sha256:" + strings.Repeat("7", 64)
-	endpoint := "http://10.88.1.1:3000"
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	endpoint := healthyHostingEndpointForTest(t)
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: endpoint,
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: endpoint,
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -2424,10 +3250,11 @@ func TestSupersededPendingCompensationCannotStageNewerSuspension(t *testing.T) {
 	fake := withFakeProxy(t)
 	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JCOMPNEW", "deployment_01JCOMPNEW")
 	digest := "sha256:" + strings.Repeat("2", 64)
-	endpoint := "http://10.88.2.1:3000"
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, digest)
+	endpoint := healthyHostingEndpointForTest(t)
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken,
 		hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
-			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest), RuntimeEndpoint: endpoint,
+			ReleaseArtifactDigest: artifactDigest, RuntimeEndpoint: endpoint,
 			HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -2550,7 +3377,7 @@ func TestSupersededStagedResumeCompensationCannotCreateRetry(t *testing.T) {
 func TestSuspendDuringBuildPreventsLateActivation(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
-	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JSUSRUN", "deployment_01JSUSRUN")
+	project, _, runnerID, job := createAndClaimHostingJobAtFetching(t, "project_01JSUSRUN", "deployment_01JSUSRUN")
 	operator, err := createServiceToken("suspend-running-operator", []string{serviceScopeProjectsWrite})
 	if err != nil {
 		t.Fatal(err)
@@ -2559,7 +3386,7 @@ func TestSuspendDuringBuildPreventsLateActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, hostingCompletionRequest{
-		Status: "success", ReleaseDigest: "sha256:" + strings.Repeat("9", 64), RuntimeEndpoint: "http://10.40.0.1:3000",
+		Status: "success", ReleaseDigest: "sha256:" + strings.Repeat("9", 64), RuntimeEndpoint: healthyHostingEndpointForTest(t),
 		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)},
 	}); err != nil {
 		t.Fatal(err)

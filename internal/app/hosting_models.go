@@ -547,6 +547,31 @@ func applyHostingMigrations() error {
 					ON hosting_idempotency(operation_reference) WHERE operation_reference<>''`,
 			},
 		},
+		{
+			id: "039_hosting_activation_previous_endpoint",
+			statements: []string{
+				`UPDATE hosting_proxy_operations SET expected_previous_runtime_endpoint=COALESCE((
+					SELECT release.runtime_endpoint FROM hosting_releases release
+					WHERE release.hosting_project_id=hosting_proxy_operations.hosting_project_id
+					  AND release.release_digest=hosting_proxy_operations.expected_previous_release_digest
+					  AND release.status='active' LIMIT 1
+				), '')
+				WHERE operation_type='activate' AND status IN ('pending','applied')
+				  AND expected_previous_release_digest<>'' AND expected_previous_runtime_endpoint=''`,
+			},
+		},
+		{
+			id: "040_hosting_inventory_runtime_endpoint",
+			statements: []string{
+				`ALTER TABLE hosting_jobs ADD COLUMN runtime_observed_endpoint TEXT NOT NULL DEFAULT ''`,
+				`ALTER TABLE hosting_runtime_recoveries ADD COLUMN runtime_observed_endpoint TEXT NOT NULL DEFAULT ''`,
+				`UPDATE hosting_jobs SET runtime_observed_at=NULL, runtime_observed_session_id='',
+					runtime_observed_release_digest='', runtime_observed_instance_id='', runtime_observed_endpoint=''`,
+				`UPDATE hosting_runtime_recoveries SET runtime_observed_at=NULL, runtime_observed_session_id='',
+					runtime_observed_release_digest='', runtime_observed_instance_id='', runtime_observed_endpoint=''`,
+				`UPDATE hosting_releases SET runtime_observed_at=NULL, runtime_observed_session_id=''`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {
