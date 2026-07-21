@@ -54,11 +54,11 @@ The primary agent owns this checklist and updates it only after implementation a
 
 ## P1 — runner and capacity
 
-- [ ] Hosting runner class, capability/version negotiation and labels.
-- [ ] Heartbeat includes free CPU/RAM/disk/PID capacity and drain state.
-- [ ] Scheduler refuses placement below configured reserve.
-- [ ] Structured workload limits propagated and enforced.
-- [ ] Deny public host ports, privileged mode, capabilities, host mounts and Docker socket.
+- [x] Hosting runner class, capability/version negotiation and labels.
+- [x] Heartbeat includes free CPU/RAM/disk/PID capacity and drain state.
+- [x] Scheduler refuses placement below configured reserve.
+- [x] Structured workload limits propagated and enforced.
+- [x] Deny public host ports, privileged mode, capabilities, host mounts and Docker socket.
 - [x] Runtime receives secrets by short-lived reference/identity; Deployer/build DB and logs never persist plaintext.
 - [x] Runner loss and recovery state are deterministic.
 - [x] Per-project and global execution kill switches with audit reason.
