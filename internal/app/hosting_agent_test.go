@@ -148,6 +148,33 @@ func TestGeneratedHostingRecipesIgnoreCustomerDockerfile(t *testing.T) {
 	}
 }
 
+func TestHostingWorkloadLimitsAreFailClosedAtExecutionBoundary(t *testing.T) {
+	valid, err := hostingLimitsForProfile("starter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateHostingWorkloadLimits(valid); err != nil {
+		t.Fatalf("profile limits rejected: %v", err)
+	}
+	for name, limits := range map[string]hostingWorkloadLimits{
+		"zero cpu":      valid,
+		"negative ram":  valid,
+		"oversized ram": valid,
+	} {
+		switch name {
+		case "zero cpu":
+			limits.CPUMillis = 0
+		case "negative ram":
+			limits.RAMBytes = -1
+		case "oversized ram":
+			limits.RAMBytes = 1 << 41
+		}
+		if err := validateHostingWorkloadLimits(limits); err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+	}
+}
+
 func TestGeneratedHostingRecipeRejectsOutputDirectoryInjection(t *testing.T) {
 	for _, output := range []string{
 		"dist\nRUN touch /owned",

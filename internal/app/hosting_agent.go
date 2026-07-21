@@ -761,6 +761,9 @@ func runHostingWorkload(ctx context.Context, config hostingAgentConfig, job *hos
 	fail := func(code string, err error) hostingCompletionRequest {
 		return hostingCompletionRequest{Status: "failed", FailureCode: code, FailureMessage: redactSecrets(err.Error())}
 	}
+	if err := validateHostingWorkloadLimits(job.Recipe.Limits); err != nil {
+		return fail("workload_policy_violation", err)
+	}
 	workDir := filepath.Join(config.WorkRoot, fmt.Sprintf("job-%d-%d", job.JobID, job.LeaseGeneration))
 	if err := os.RemoveAll(workDir); err != nil {
 		return fail("workload_policy_violation", err)
@@ -873,6 +876,9 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 	fail := func(code string, err error) hostingCompletionRequest {
 		return hostingCompletionRequest{Status: "failed", FailureCode: code, FailureMessage: redactSecrets(err.Error())}
 	}
+	if err := validateHostingWorkloadLimits(job.Recipe.Limits); err != nil {
+		return fail("workload_policy_violation", err)
+	}
 	instanceID := hostingAgentInstanceID(job)
 	containerName := "deployer-hosting-" + safeFileName(job.Recipe.ExternalDeploymentID) + "-" + safeFileName(instanceID)
 	agentNamespace := hostingAgentRuntimeNamespace(config.WorkRoot)
@@ -950,6 +956,16 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 		go cleanupHostingSecretsAfterContainerExit(containerName, secretDirectory)
 	}
 	return hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: releaseArtifactDigest, RuntimeEndpoint: endpoint, HealthEvidence: map[string]any{"healthy": true, "attempts": attempts, "status_code": statusCode}}
+}
+
+func validateHostingWorkloadLimits(limits hostingWorkloadLimits) error {
+	if limits.CPUMillis <= 0 || limits.RAMBytes <= 0 || limits.DiskBytes <= 0 || limits.PIDs <= 0 {
+		return fmt.Errorf("workload limits must be positive")
+	}
+	if limits.RAMBytes > 1<<40 || limits.DiskBytes > 1<<44 || limits.PIDs > 1<<20 {
+		return fmt.Errorf("workload limits exceed the hosting policy")
+	}
+	return nil
 }
 
 func removeStaleHostingContainer(ctx context.Context, containerName, agentNamespace, releaseDigest,
