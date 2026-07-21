@@ -257,6 +257,90 @@ func TestCleanupHostingRecordsPreservesExpiredIncompleteIdempotencyReceipts(t *t
 	}
 }
 
+func TestCleanupHostingRecordsRemovesExpiredInactiveReleaseArtifactsOnly(t *testing.T) {
+	withTempDB(t)
+	oldConfig := appConfig
+	oldStorage := artifactStorage
+	t.Cleanup(func() {
+		appConfig = oldConfig
+		artifactStorage = oldStorage
+	})
+	appConfig.ArtifactDir = filepath.Join(t.TempDir(), "artifacts")
+	appConfig.SnapshotDir = filepath.Join(t.TempDir(), "snapshots")
+	configureArtifactStorage(appConfig)
+	if err := currentArtifactStorage().Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	project, token := provisionDeploymentTestProject(t, "project_01JRELEASEGC")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	insertHostingRunnerForTest(t, "release-gc-runner", limits)
+	request := validHostingDeploymentRequest("deployment_01JRELEASEGC")
+	request.ManifestDigest = project.ManifestDigest
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JRELEASEGC", request); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := getHostingDeploymentByExternalID(t.Context(), request.ExternalDeploymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	old := formatSQLiteTime(now.Add(-48 * time.Hour))
+	activeDeployment, err := db.Exec(`INSERT INTO hosting_deployments
+		(hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest,
+		 status, phase, callback_state, created_at, updated_at)
+		VALUES (?, 'deployment_01JRELEASEGCA', ?, ?, ?, 'active', 'active', 'delivered', ?, ?)`,
+		project.ID, request.CommitSHA, project.ManifestDigest, request.ArtifactDigest, old, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeDeploymentID, err := activeDeployment.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertRelease := func(deploymentID int64, status, letter string) (string, string) {
+		t.Helper()
+		releaseDigest := "sha256:" + strings.Repeat(letter, 64)
+		artifactDigest := "sha256:" + strings.Repeat(strings.ToUpper(letter), 64)
+		path := managedArtifactPath("hosting-release-" + letter + ".tar")
+		if err := os.WriteFile(path, []byte(status), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO hosting_release_artifacts
+			(artifact_digest, release_digest, artifact_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?)`,
+			artifactDigest, releaseDigest, path, int64(len(status)), old); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO hosting_releases
+			(hosting_project_id, hosting_deployment_id, release_digest, release_artifact_digest, commit_sha,
+			 artifact_digest, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, project.ID, deploymentID,
+			releaseDigest, artifactDigest, request.CommitSHA, request.ArtifactDigest, status, old); err != nil {
+			t.Fatal(err)
+		}
+		return artifactDigest, path
+	}
+	expiredArtifact, expiredPath := insertRelease(deployment.ID, "inactive", "a")
+	activeArtifact, activePath := insertRelease(activeDeploymentID, "active", "b")
+	if err := cleanupHostingRecords(t.Context(), AppConfig{HostingReleaseRetentionDays: 1}, now); err != nil {
+		t.Fatal(err)
+	}
+	var expiredRows, activeRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_release_artifacts WHERE artifact_digest=?`, expiredArtifact).Scan(&expiredRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_release_artifacts WHERE artifact_digest=?`, activeArtifact).Scan(&activeRows); err != nil {
+		t.Fatal(err)
+	}
+	if expiredRows != 0 || activeRows != 1 {
+		t.Fatalf("release artifact records expired=%d active=%d", expiredRows, activeRows)
+	}
+	if _, err := os.Stat(expiredPath); !os.IsNotExist(err) {
+		t.Fatalf("expired artifact remains: %v", err)
+	}
+	if _, err := os.Stat(activePath); err != nil {
+		t.Fatalf("active artifact was removed: %v", err)
+	}
+}
+
 func TestProtectActiveHostingArtifactsRefreshesReferencedSourceAndRelease(t *testing.T) {
 	withTempDB(t)
 	oldConfig := appConfig

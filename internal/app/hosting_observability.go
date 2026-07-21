@@ -237,7 +237,9 @@ func cleanupHostingRecords(ctx context.Context, cfg AppConfig, now time.Time) er
 		return err
 	}
 	for _, path := range orphanArtifacts {
-		removeManagedArtifact(path)
+		if err := currentArtifactStorage().Remove(path); err != nil {
+			return fmt.Errorf("remove expired hosting release artifact: %w", err)
+		}
 	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
