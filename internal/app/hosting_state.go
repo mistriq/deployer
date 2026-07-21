@@ -15,12 +15,13 @@ import (
 )
 
 type hostingEventResponse struct {
-	ID          int64          `json:"id"`
-	EventType   string         `json:"event_type"`
-	Phase       string         `json:"phase"`
-	FailureCode string         `json:"failure_code,omitempty"`
-	Metadata    map[string]any `json:"metadata"`
-	CreatedAt   time.Time      `json:"created_at"`
+	ID                   int64          `json:"id"`
+	EventType            string         `json:"event_type"`
+	Phase                string         `json:"phase"`
+	FailureCode          string         `json:"failure_code,omitempty"`
+	Metadata             map[string]any `json:"metadata"`
+	CreatedAt            time.Time      `json:"created_at"`
+	PhaseDurationSeconds float64        `json:"phase_duration_seconds"`
 }
 
 type hostingLogResponse struct {
@@ -175,6 +176,12 @@ func handleInternalDeploymentEvents(w http.ResponseWriter, r *http.Request, exte
 			jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
 			return
 		}
+	}
+	for index := range events {
+		if index+1 >= len(events) {
+			continue
+		}
+		events[index].PhaseDurationSeconds = maxFloat(0, events[index+1].CreatedAt.Sub(events[index].CreatedAt).Seconds())
 	}
 	jsonResponse(w, events)
 }
@@ -392,6 +399,9 @@ func restoreHostingRunnerCapacity(ctx context.Context, conn *sql.Conn, runnerID 
 }
 
 func recordHostingEvent(ctx context.Context, conn *sql.Conn, projectID, deploymentID int64, eventType, phase, failureCode string, metadata map[string]any, now time.Time) error {
+	if !validHostingEventFailureCode(failureCode) {
+		return fmt.Errorf("unknown hosting failure code %q", failureCode)
+	}
 	if metadata == nil {
 		metadata = map[string]any{}
 	}
@@ -408,6 +418,14 @@ func recordHostingEvent(ctx context.Context, conn *sql.Conn, projectID, deployme
 		(hosting_project_id, hosting_deployment_id, event_type, phase, failure_code, metadata_json, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, projectID, deployment, eventType, phase, failureCode, string(encoded), formatSQLiteTime(now))
 	return err
+}
+
+func validHostingEventFailureCode(code string) bool {
+	if code == "" || code == "runtime_instance_lost" {
+		return true
+	}
+	_, ok := allowedHostingFailureCodes[code]
+	return ok
 }
 
 func enqueueTerminalCallback(ctx context.Context, conn *sql.Conn, deploymentID int64, now time.Time) (resultErr error) {

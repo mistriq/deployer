@@ -2926,7 +2926,7 @@ components:
 
     HostingEvent:
       type: object
-      required: [id, event_type, phase, metadata, created_at]
+      required: [id, event_type, phase, metadata, created_at, phase_duration_seconds]
       properties:
         id: {type: integer, format: int64}
         event_type:
@@ -2941,6 +2941,10 @@ components:
         failure_code: {$ref: "#/components/schemas/HostingFailureCode"}
         metadata: {type: object, description: Redacted structured metadata.}
         created_at: {type: string, format: date-time}
+        phase_duration_seconds:
+          type: number
+          minimum: 0
+          description: Elapsed wall-clock time until the next ordered event. The final event has zero duration.
 
     HostingLog:
       type: object

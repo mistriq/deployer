@@ -1,12 +1,71 @@
 package app
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestHostingEventTimelineReportsPhaseDurationsAndStableFailureCodes(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JTIMELINE")
+	now := time.Now().UTC().Truncate(time.Second)
+	result, err := db.Exec(`INSERT INTO hosting_deployments
+		(hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest,
+		 status, phase, callback_state, created_at, updated_at)
+		VALUES (?, 'deployment_01JTIMELINE', ?, ?, ?, 'failed', 'failed', 'pending', ?, ?)`,
+		project.ID, strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64),
+		formatSQLiteTime(now), formatSQLiteTime(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := recordHostingEvent(t.Context(), conn, project.ID, deploymentID, "deployment_created", hostingPhaseQueued, "", nil, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordHostingEvent(t.Context(), conn, project.ID, deploymentID, "phase_changed", hostingPhaseBuilding, "", nil, now.Add(7*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordHostingEvent(t.Context(), conn, project.ID, deploymentID, "deployment_failed", hostingPhaseFailed, "build_failed", nil, now.Add(19*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordHostingEvent(t.Context(), conn, project.ID, deploymentID, "invalid", hostingPhaseFailed, "arbitrary text", nil, now); err == nil {
+		t.Fatal("arbitrary failure code was accepted")
+	}
+
+	handler := serviceTokenAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleInternalDeploymentEvents(w, r, "deployment_01JTIMELINE")
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JTIMELINE/events", nil)
+	req.Header.Set("Authorization", "Bearer "+token.Token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("timeline status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var events []hostingEventResponse
+	if err := json.NewDecoder(bytes.NewReader(rec.Body.Bytes())).Decode(&events); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 || events[0].PhaseDurationSeconds != 7 || events[1].PhaseDurationSeconds != 12 ||
+		events[2].PhaseDurationSeconds != 0 || events[2].FailureCode != "build_failed" {
+		t.Fatalf("timeline events=%+v", events)
+	}
+}
 
 func TestCollectHostingMetricsReportsQueueCapacityAndCallbacks(t *testing.T) {
 	withTempDB(t)
