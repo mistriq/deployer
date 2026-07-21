@@ -358,8 +358,32 @@ created by rotation share one namespace. Completed status and body are retained
 for 24 hours. An identical request during that window returns the original
 response with `Idempotency-Replayed: true`; a different payload conflicts.
 After expiry, the key may execute a new request.
+Deployment cancellation is immediate and terminal for queued work, restoring
+the runner reservation and enqueueing the terminal callback atomically. A
+leased or running deployment durably becomes `running`/`cancelling`. Its agent
+heartbeat then returns `cancel_requested=true` without extending the lease; the
+agent stops the workload, persists an exact `cancelled` completion, and retries
+delivery until acknowledged or permanently lease-fenced. If the agent does not
+complete, lease-expiry reconciliation terminalizes cancellation and restores
+capacity after a restart, once any current-generation routing fence has settled.
+Exact-key cancel replays return the original accepted
+response snapshot (which can remain `running`/`cancelling`); poll the deployment
+GET endpoint for authoritative current state. Cancellation wins over stale
+failure reports. Admission of a cancellation against a pending or applied
+activation atomically persists a newer route-generation compensation before
+returning; adapter dispatch is attempted immediately and restart reconciliation
+retries the exact intent. The deployment cannot become terminal until both the
+candidate activation and the current routing compensation are settled.
 Suspend/resume responses acknowledge durable desired state; adapter
 convergence is asynchronous and generation-fenced during an adapter outage.
+Enabling a project or global execution kill switch likewise atomically cancels
+affected work and persists one newer suspension intent per desired-active
+project. Disabling it resumes routing only when the project remains desired
+active and no other kill switch is enabled; unavailable runtimes keep the
+durable resume pending instead of exposing an unhealthy route. Resume is an
+exact generation-fenced activation of the authoritative active release and
+runtime endpoint, never a bare unsuspend; a project with no active release
+remains suspended until a later healthy activation supersedes the intent.
 
 Provision accepts only the versioned hosting manifest documented in OpenAPI:
 GitHub App installation/repository IDs, `static` or `node`, an allowlisted Node
@@ -385,7 +409,7 @@ generation-fenced proxy activation. A terminal candidate health or activation
 failure leaves the previous active release unchanged. Activation intents retain
 the exact prior runtime endpoint so restart compensation cannot select a
 content-identical historical instance. After a Deployer restart,
-expired leases are fenced and requeued for compatible placement, repeated lease
+expired uncancelled leases are fenced and requeued for compatible placement, repeated lease
 loss terminates with `runner_lost`, and pending activation is freshly revalidated
 before reconciliation continues; an ambiguous adapter `503` remains durable and
 the agent retries the exact completion under its current lease.

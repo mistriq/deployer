@@ -1317,7 +1317,15 @@ paths:
     post:
       tags: [internal]
       summary: Accept active desired state for the retained release
-      description: Requires projects:write. The response acknowledges durable desired state. Proxy convergence is generation-fenced and may complete asynchronously after an adapter outage.
+      description: >
+        Requires projects:write. The response acknowledges durable desired
+        state. When no kill switch is enabled, resume generation-fences and
+        reactivates the exact authoritative active release and runtime endpoint;
+        it is never a bare unsuspend. A missing or unavailable active runtime
+        remains suspended with durable convergence pending. If a kill switch is
+        enabled, desired state becomes active without admitting a resume route
+        intent. Proxy convergence may complete asynchronously after an adapter
+        outage.
       operationId: resumeInternalProject
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1343,7 +1351,17 @@ paths:
     put:
       tags: [internal]
       summary: Change a project's execution kill switch
-      description: Requires projects:write. Enabling cancels queued work and durably requests cancellation of leased work. The JSON request body is limited to 8 KiB.
+      description: >
+        Requires projects:write. Enabling atomically cancels queued work,
+        durably requests cancellation of leased work, and persists a newer
+        generation-fenced proxy suspension for a desired-active project before
+        returning. Disabling persists a generation-fenced resume only when the
+        project remains desired active and neither the project nor global kill
+        switch is enabled. Resume reactivates the exact authoritative active
+        release and endpoint rather than blindly exposing the adapter's retained
+        target; a missing or unavailable active runtime remains suspended with
+        convergence pending. Routing convergence may complete asynchronously
+        after an adapter outage. The JSON request body is limited to 8 KiB.
       operationId: setInternalProjectKillSwitch
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1397,7 +1415,19 @@ paths:
     post:
       tags: [internal]
       summary: Idempotently cancel queued or running work
-      description: Requires deployments:write.
+      description: >
+        Requires deployments:write. A queued job is atomically terminalized as
+        cancelled, its reservation is restored, and its terminal callback is
+        enqueued. A leased or running job durably becomes running/cancelling;
+        cancellation wins over later runner failure or activation reconciliation
+        and survives process restart. If activation is already pending or
+        applied, cancellation admission atomically persists a newer
+        route-generation compensation, and terminalization waits for both
+        routing intents to settle. An identical Idempotency-Key replay returns
+        the original accepted response snapshot with Idempotency-Replayed=true,
+        which may still show running/cancelling after terminal convergence. Poll
+        GET /api/internal/v1/deployments/{externalDeploymentId} for authoritative
+        current state.
       operationId: cancelInternalDeployment
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1405,7 +1435,7 @@ paths:
         - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
-          description: Current deployment, including durable cancellation intent.
+          description: Original accepted cancellation response, including durable cancellation intent; exact-key replays return this stored snapshot.
           headers:
             Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
@@ -1525,7 +1555,17 @@ paths:
     put:
       tags: [internal]
       summary: Change the global hosting execution kill switch
-      description: Requires hosting:admin. Enabling cancels queued work and durably requests cancellation of leased work. The JSON request body is limited to 8 KiB.
+      description: >
+        Requires hosting:admin. Enabling atomically cancels queued work,
+        durably requests cancellation of leased work, and persists one newer
+        generation-fenced proxy suspension for every desired-active project.
+        Disabling persists generation-fenced resumes only for projects that
+        remain desired active and have no project kill switch. Each resume
+        reactivates the exact authoritative active release and endpoint rather
+        than blindly exposing the adapter's retained target; a missing or
+        unavailable active runtime remains suspended with convergence pending.
+        Routing convergence may complete asynchronously after an adapter outage.
+        The JSON request body is limited to 8 KiB.
       operationId: setInternalGlobalKillSwitch
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1655,6 +1695,14 @@ paths:
     post:
       tags: [hosting-agent]
       summary: Renew a current job lease and receive durable cancellation intent
+      description: >
+        Before cancellation this renews the current lease. Once cancellation is
+        durable, it returns cancel_requested=true without extending the lease.
+        The agent must stop the workload, persist an exact cancelled completion,
+        and retry delivery until Deployer acknowledges it or permanently fences
+        the expired lease. If the agent does not complete, expiry reconciliation
+        terminalizes the deployment as cancelled and restores capacity after
+        any current-generation routing fence has settled.
       operationId: heartbeatHostingJob
       security: [{hostingAgentBearerAuth: []}]
       parameters:
@@ -1869,6 +1917,13 @@ paths:
     post:
       tags: [hosting-agent]
       summary: Renew a current runtime-recovery lease and receive cancellation intent
+      description: >
+        Before cancellation this renews the current recovery lease. Once
+        cancellation is durable, it returns cancel_requested=true without
+        extending the lease. The agent must stop restoration, persist an exact
+        cancelled completion, and retry delivery until it is acknowledged or
+        permanently fenced; expiry reconciliation terminalizes cancellation and
+        restores capacity after any current-generation routing fence has settled.
       operationId: heartbeatHostingRecovery
       security: [{hostingAgentBearerAuth: []}]
       parameters:

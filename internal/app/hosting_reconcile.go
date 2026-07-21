@@ -36,20 +36,21 @@ func runHostingReconciler(ctx context.Context) {
 }
 
 func reconcileHostingState(ctx context.Context, now time.Time) error {
+	var externalErr error
 	if err := reconcileHostingCompensationOperations(ctx); err != nil {
-		return err
+		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting compensation: %w", err))
 	}
 	if err := reconcileHostingDesiredStateOperations(ctx); err != nil {
-		return err
+		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting desired state: %w", err))
 	}
 	if err := reconcileHostingRollbackOperations(ctx); err != nil {
-		return err
+		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting rollback: %w", err))
 	}
 	if err := reconcileHostingRecoveryProxyOperations(ctx); err != nil {
-		return err
+		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting recovery routing: %w", err))
 	}
 	if err := reconcileHostingActivationOperations(ctx); err != nil {
-		return err
+		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting activation: %w", err))
 	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -98,7 +99,12 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 		JOIN hosting_runners r ON r.id=j.hosting_runner_id
 		WHERE j.status IN ('leased','running') AND j.lease_expires_at<?
 		  AND NOT EXISTS (SELECT 1 FROM hosting_proxy_operations op
-			WHERE op.hosting_deployment_id=j.hosting_deployment_id AND op.status IN ('pending','applied'))`, formatSQLiteTime(now))
+			WHERE op.hosting_deployment_id=j.hosting_deployment_id AND op.status IN ('pending','applied'))
+		  AND NOT EXISTS (SELECT 1 FROM hosting_proxy_operations current_route
+			JOIN hosting_projects route_project ON route_project.id=current_route.hosting_project_id
+			WHERE current_route.hosting_project_id=d.hosting_project_id
+			  AND current_route.status IN ('pending','applied')
+			  AND current_route.route_generation=route_project.route_generation)`, formatSQLiteTime(now))
 	if err != nil {
 		return err
 	}
@@ -179,7 +185,7 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 		return err
 	}
 	committed = true
-	return nil
+	return externalErr
 }
 
 func reconcileHostingCompensationOperations(ctx context.Context) error {
@@ -226,6 +232,13 @@ func reconcileHostingCompensationOperations(ctx context.Context) error {
 			continue
 		}
 		if operation.desiredState == "resume_after_runtime" {
+			_, _, available, err := hostingProjectActiveRoute(ctx, operation.projectID)
+			if err != nil {
+				return err
+			}
+			if !available {
+				continue
+			}
 			if err := stageHostingResumeRetry(ctx, operation.projectID, operation.operationID); err != nil {
 				return err
 			}
@@ -235,22 +248,24 @@ func reconcileHostingCompensationOperations(ctx context.Context) error {
 }
 
 func reconcileHostingDesiredStateOperations(ctx context.Context) error {
-	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.hosting_project_id, op.operation_type, op.route_generation, op.desired_state,
+	rows, err := db.QueryContext(ctx, `SELECT op.operation_id, op.hosting_project_id, op.operation_type,
+		op.status, op.route_generation, op.desired_state,
 		p.external_project_id, p.route_generation, p.desired_state
 		FROM hosting_proxy_operations op JOIN hosting_projects p ON p.id=op.hosting_project_id
-		WHERE op.operation_type IN ('suspend','resume') AND op.status='pending' ORDER BY op.id`)
+		WHERE op.operation_type IN ('suspend','resume') AND op.status IN ('pending','applied') ORDER BY op.id`)
 	if err != nil {
 		return err
 	}
 	type desiredOperation struct {
-		operationID, operationType, operationDesiredState, externalProjectID string
-		projectID, routeGeneration, currentGeneration                        int64
-		desiredState                                                         string
+		operationID, operationType, operationStatus, operationDesiredState, externalProjectID string
+		projectID, routeGeneration, currentGeneration                                         int64
+		desiredState                                                                          string
 	}
 	var operations []desiredOperation
 	for rows.Next() {
 		var operation desiredOperation
-		if err := rows.Scan(&operation.operationID, &operation.projectID, &operation.operationType, &operation.routeGeneration, &operation.operationDesiredState,
+		if err := rows.Scan(&operation.operationID, &operation.projectID, &operation.operationType,
+			&operation.operationStatus, &operation.routeGeneration, &operation.operationDesiredState,
 			&operation.externalProjectID, &operation.currentGeneration, &operation.desiredState); err != nil {
 			rows.Close()
 			return err
@@ -272,12 +287,39 @@ func reconcileHostingDesiredStateOperations(ctx context.Context) error {
 			}
 			continue
 		}
+		if operation.operationType == "resume" && operation.operationStatus == "applied" {
+			resumeState, commitErr := commitHostingResumeOperation(ctx, operation.projectID,
+				operation.operationID)
+			if commitErr != nil {
+				return commitErr
+			}
+			if resumeState == hostingResumeCommitted {
+				continue
+			}
+			if resumeState == hostingResumeSuperseded {
+				if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeConflict); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := fenceUnavailableHostingResume(ctx, nil, operation.projectID,
+				operation.externalProjectID, operation.operationID); err != nil {
+				return err
+			}
+			continue
+		}
+		var resumeDigest, resumeEndpoint string
 		if operation.operationType == "resume" {
-			available, err := hostingProjectRuntimeAvailable(ctx, operation.projectID)
+			var available bool
+			resumeDigest, resumeEndpoint, available, err = hostingProjectActiveRoute(ctx, operation.projectID)
 			if err != nil {
 				return err
 			}
 			if !available {
+				if err := fenceUnavailableHostingResume(ctx, nil, operation.projectID,
+					operation.externalProjectID, operation.operationID); err != nil {
+					return err
+				}
 				continue
 			}
 		}
@@ -286,12 +328,22 @@ func reconcileHostingDesiredStateOperations(ctx context.Context) error {
 			_ = markHostingProxyOperationError(ctx, operation.operationID, errCodeProxyUnavailable)
 			continue
 		}
-		err = proxy.SetSuspended(ctx, proxySuspendRequest{
-			OperationID:       operation.operationID,
-			ExternalProjectID: operation.externalProjectID,
-			Suspended:         operation.operationType == "suspend",
-			RouteGeneration:   operation.routeGeneration,
-		})
+		if operation.operationType == "resume" {
+			var activation *proxyActivationResponse
+			activation, err = proxy.Activate(ctx, proxyActivationRequest{
+				OperationID: operation.operationID, ExternalProjectID: operation.externalProjectID,
+				ReleaseDigest: resumeDigest, RuntimeEndpoint: resumeEndpoint,
+				RouteGeneration: operation.routeGeneration,
+			})
+			if err == nil {
+				err = markHostingProxyOperationApplied(ctx, operation.operationID, activation.RouteRevision)
+			}
+		} else {
+			err = proxy.SetSuspended(ctx, proxySuspendRequest{
+				OperationID: operation.operationID, ExternalProjectID: operation.externalProjectID,
+				Suspended: true, RouteGeneration: operation.routeGeneration,
+			})
+		}
 		if err != nil {
 			code := errCodeProxyUnavailable
 			var apiErr *hostingAPIError
@@ -381,6 +433,13 @@ func reconcileHostingActivationOperations(ctx context.Context) error {
 		return err
 	}
 	for _, operation := range operations {
+		if operation.state.CancelRequestedAt.Valid {
+			if err := cancelStagedHostingActivation(ctx, &operation.state, operation.releaseDigest,
+				"durable cancellation intent won during activation reconciliation"); err != nil {
+				return err
+			}
+			continue
+		}
 		if operation.state.RouteGeneration != operation.currentGeneration {
 			if err := markHostingProxyOperationFailed(ctx, operation.operationID, errCodeConflict); err != nil {
 				return err

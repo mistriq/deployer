@@ -286,27 +286,26 @@ func handleHostingRecoveryHeartbeat(w http.ResponseWriter, r *http.Request, reco
 		return
 	}
 	now := time.Now().UTC()
-	result, err := db.ExecContext(r.Context(), `UPDATE hosting_runtime_recoveries SET status='running',
-		lease_expires_at=? WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?
-		AND status IN ('leased','running') AND lease_expires_at>?`, formatSQLiteTime(now.Add(hostingJobLeaseDuration)),
-		recoveryID, runner.ID, generation, hashToken(token), formatSQLiteTime(now))
-	if err != nil {
-		jsonErrorCode(w, errCodeInternal, "extend runtime recovery lease failed", http.StatusInternalServerError)
+	var cancelled sql.NullString
+	err := db.QueryRowContext(r.Context(), `UPDATE hosting_runtime_recoveries SET
+		status=CASE WHEN cancel_requested_at IS NULL THEN 'running' ELSE status END,
+		lease_expires_at=CASE WHEN cancel_requested_at IS NULL THEN ? ELSE lease_expires_at END
+		WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?
+		  AND status IN ('leased','running') AND lease_expires_at>?
+		RETURNING cancel_requested_at`, formatSQLiteTime(now.Add(hostingJobLeaseDuration)), recoveryID,
+		runner.ID, generation, hashToken(token), formatSQLiteTime(now)).Scan(&cancelled)
+	if err == sql.ErrNoRows {
+		jsonErrorCode(w, errCodeJobForbidden, "valid recovery lease is required", http.StatusForbidden)
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		jsonErrorCode(w, errCodeJobForbidden, "valid recovery lease is required", http.StatusForbidden)
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "extend runtime recovery lease failed", http.StatusInternalServerError)
 		return
 	}
 	if _, err := db.ExecContext(r.Context(), `UPDATE hosting_runners SET status='online', last_seen=?
 		WHERE id=? AND active_session_id=''`,
 		formatSQLiteTime(now), runner.ID); err != nil {
 		jsonErrorCode(w, errCodeInternal, "update recovery runner liveness failed", http.StatusInternalServerError)
-		return
-	}
-	var cancelled sql.NullString
-	if err := db.QueryRowContext(r.Context(), `SELECT cancel_requested_at FROM hosting_runtime_recoveries WHERE id=?`, recoveryID).Scan(&cancelled); err != nil {
-		jsonErrorCode(w, errCodeInternal, "read runtime recovery cancellation failed", http.StatusInternalServerError)
 		return
 	}
 	jsonResponse(w, map[string]bool{"cancel_requested": cancelled.Valid})
@@ -808,7 +807,12 @@ func reconcileExpiredHostingRecoveries(ctx context.Context, conn *sql.Conn, now 
 		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
 		WHERE recovery.status IN ('leased','running') AND recovery.lease_expires_at<?
 		  AND NOT EXISTS (SELECT 1 FROM hosting_proxy_operations operation
-			WHERE operation.hosting_runtime_recovery_id=recovery.id AND operation.status IN ('pending','applied'))`, formatSQLiteTime(now))
+			WHERE operation.hosting_runtime_recovery_id=recovery.id AND operation.status IN ('pending','applied'))
+		  AND NOT EXISTS (SELECT 1 FROM hosting_proxy_operations current_route
+			JOIN hosting_projects route_project ON route_project.id=current_route.hosting_project_id
+			WHERE current_route.hosting_project_id=release.hosting_project_id
+			  AND current_route.status IN ('pending','applied')
+			  AND current_route.route_generation=route_project.route_generation)`, formatSQLiteTime(now))
 	if err != nil {
 		return err
 	}
@@ -945,11 +949,16 @@ func completeHostingRuntimeRecovery(ctx context.Context, runnerID, recoveryID, g
 			return receiptErr
 		}
 		var terminalStatus, storedFingerprint string
-		terminalErr := db.QueryRowContext(ctx, `SELECT status, completion_fingerprint FROM hosting_runtime_recoveries
+		var terminalCancellation sql.NullString
+		terminalErr := db.QueryRowContext(ctx, `SELECT status, completion_fingerprint, cancel_requested_at
+			FROM hosting_runtime_recoveries
 			WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?
 			AND status IN ('succeeded','failed','cancelled')`, recoveryID, runnerID, generation,
-			hashToken(leaseToken)).Scan(&terminalStatus, &storedFingerprint)
+			hashToken(leaseToken)).Scan(&terminalStatus, &storedFingerprint, &terminalCancellation)
 		if terminalErr == nil {
+			if terminalStatus == "cancelled" && terminalCancellation.Valid {
+				return nil
+			}
 			if storedFingerprint != "" && storedFingerprint != completionFingerprint {
 				return &hostingAPIError{Code: errCodeIdempotencyConflict,
 					Message: "terminal recovery completion conflicts with the committed result", StatusCode: http.StatusConflict}
@@ -1196,6 +1205,32 @@ func cancelHostingRuntimeRecovery(ctx context.Context, state *hostingRuntimeReco
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return err
 	}
+	var persistedStatus string
+	if err := conn.QueryRowContext(ctx, `SELECT status FROM hosting_runtime_recoveries WHERE id=?`,
+		state.ID).Scan(&persistedStatus); err != nil {
+		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		return err
+	}
+	if persistedStatus == "cancelled" {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return err
+		}
+		return nil
+	}
+	var unsettledRouting int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM hosting_proxy_operations operation
+		JOIN hosting_projects project ON project.id=operation.hosting_project_id
+		WHERE operation.hosting_project_id=? AND operation.status IN ('pending','applied')
+		  AND operation.route_generation=project.route_generation`, state.ProjectID).Scan(&unsettledRouting); err != nil {
+		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		return err
+	}
+	if unsettledRouting != 0 {
+		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		return &hostingAPIError{Code: errCodeProjectBusy,
+			Message:    "runtime recovery cancellation routing fence is still pending",
+			StatusCode: http.StatusConflict}
+	}
 	result, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET status='cancelled',
 		cancel_requested_at=COALESCE(cancel_requested_at, ?), completed_at=?, lease_expires_at=NULL,
 		completion_fingerprint=CASE WHEN completion_fingerprint='' THEN ? ELSE completion_fingerprint END
@@ -1351,14 +1386,37 @@ func failHostingRuntimeRecovery(ctx context.Context, state *hostingRuntimeRecove
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return err
 	}
+	var persistedCancellation sql.NullString
+	if err := conn.QueryRowContext(ctx, `SELECT cancel_requested_at FROM hosting_runtime_recoveries
+		WHERE id=?`, state.ID).Scan(&persistedCancellation); err != nil {
+		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		return err
+	}
 	status := "queued"
-	if state.Attempts >= hostingMaxJobAttempts {
+	if persistedCancellation.Valid {
+		var unsettledRouting int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM hosting_proxy_operations operation
+			JOIN hosting_projects project ON project.id=operation.hosting_project_id
+			WHERE operation.hosting_project_id=? AND operation.status IN ('pending','applied')
+			  AND operation.route_generation=project.route_generation`, state.ProjectID).Scan(&unsettledRouting); err != nil {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+			return err
+		}
+		if unsettledRouting != 0 {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+			return &hostingAPIError{Code: errCodeProjectBusy,
+				Message:    "runtime recovery cancellation routing fence is still pending",
+				StatusCode: http.StatusConflict}
+		}
+		status, failureCode, message = "cancelled", "cancelled", "cancelled by control plane"
+		state.CancelRequested = persistedCancellation
+	} else if state.Attempts >= hostingMaxJobAttempts {
 		status = "failed"
 	}
 	result, err := conn.ExecContext(ctx, `UPDATE hosting_runtime_recoveries SET status=?,
 		hosting_runner_id=CASE WHEN ?='queued' THEN NULL ELSE hosting_runner_id END,
 		lease_token_hash=CASE WHEN ?='queued' THEN '' ELSE lease_token_hash END,
-		lease_expires_at=NULL, completed_at=CASE WHEN ?='failed' THEN ? ELSE completed_at END,
+		lease_expires_at=NULL, completed_at=CASE WHEN ? IN ('failed','cancelled') THEN ? ELSE completed_at END,
 		completion_fingerprint=CASE WHEN ?='queued' THEN ''
 			WHEN completion_fingerprint='' THEN ? ELSE completion_fingerprint END
 		WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?
@@ -1426,8 +1484,13 @@ func failHostingRuntimeRecovery(ctx context.Context, state *hostingRuntimeRecove
 			}
 		}
 	}
+	eventPhase := hostingPhaseFailed
+	if status == "cancelled" {
+		eventPhase = hostingPhaseCancelled
+	}
 	if err := recordHostingEvent(ctx, conn, state.ProjectID, state.DeploymentID,
-		"runtime_recovery_"+status, hostingPhaseFailed, failureCode, map[string]any{"message": redactSecrets(message)}, now); err != nil {
+		"runtime_recovery_"+status, eventPhase, failureCode,
+		map[string]any{"message": redactSecrets(message)}, now); err != nil {
 		_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
 		return err
 	}

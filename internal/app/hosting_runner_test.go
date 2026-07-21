@@ -29,10 +29,10 @@ type fakeProxyClient struct {
 	rejectOnce       bool
 	activateStarted  chan struct{}
 	activateContinue chan struct{}
+	activateApplied  chan struct{}
+	activateReturn   chan struct{}
 	suspendStarted   chan struct{}
 	suspendContinue  chan struct{}
-	resumeStarted    chan struct{}
-	resumeContinue   chan struct{}
 	suspendedOps     map[string]struct{}
 	routeGenerations map[string]int64
 	currentSuspended bool
@@ -72,7 +72,13 @@ func (fake *fakeProxyClient) Activate(_ context.Context, request proxyActivation
 	fake.routeGenerations[request.ExternalProjectID] = request.RouteGeneration
 	fake.currentSuspended = false
 	fake.currentEndpoint = request.RuntimeEndpoint
+	applied := fake.activateApplied
+	returned := fake.activateReturn
 	fake.mu.Unlock()
+	if applied != nil {
+		applied <- struct{}{}
+		<-returned
+	}
 	return &proxyActivationResponse{RouteRevision: "route-rev-" + request.ReleaseDigest[len(request.ReleaseDigest)-8:], ActiveReleaseDigest: request.ReleaseDigest}, nil
 }
 
@@ -82,16 +88,10 @@ func (fake *fakeProxyClient) SetSuspended(_ context.Context, request proxySuspen
 	fail := fake.fail
 	started := fake.suspendStarted
 	continued := fake.suspendContinue
-	resumeStarted := fake.resumeStarted
-	resumeContinued := fake.resumeContinue
 	fake.mu.Unlock()
 	if started != nil && request.Suspended {
 		started <- struct{}{}
 		<-continued
-	}
-	if resumeStarted != nil && !request.Suspended {
-		resumeStarted <- struct{}{}
-		<-resumeContinued
 	}
 	if fail {
 		return errors.New("adapter unavailable")
@@ -1652,8 +1652,9 @@ func TestHostingRuntimeRecoveryHonorsDurableProjectSuspension(t *testing.T) {
 	if err := reconcileHostingDesiredStateOperations(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if len(fake.activations) != 2 || len(fake.suspensions) != 1 ||
-		!fake.suspensions[0].Suspended || !fake.currentSuspended {
+	if len(fake.activations) != 2 || len(fake.suspensions) != 2 ||
+		!fake.suspensions[0].Suspended || !fake.suspensions[1].Suspended ||
+		fake.suspensions[1].RouteGeneration <= fake.suspensions[0].RouteGeneration || !fake.currentSuspended {
 		t.Fatalf("late recovery activation=%#v suspensions=%#v", fake.activations, fake.suspensions)
 	}
 }
@@ -2964,7 +2965,21 @@ func TestSuspendIntentPersistsAndReconcilesAfterProxyFailure(t *testing.T) {
 	if err != nil || stored.DesiredState != "active" {
 		t.Fatalf("resume state=%+v err=%v", stored, err)
 	}
-	if len(fake.suspensions) != 4 || !fake.suspensions[1].Suspended || !fake.suspensions[2].Suspended || fake.suspensions[3].Suspended {
+	var failedResume, committedCompensation int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations
+		WHERE hosting_project_id=? AND operation_type='resume' AND status='failed'`,
+		project.ID).Scan(&failedResume); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations
+		WHERE hosting_project_id=? AND operation_type='compensate' AND status='committed'
+		  AND desired_state='resume_after_runtime'`, project.ID).Scan(&committedCompensation); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.suspensions) != 4 || !fake.suspensions[0].Suspended ||
+		!fake.suspensions[1].Suspended || !fake.suspensions[2].Suspended ||
+		!fake.suspensions[3].Suspended || failedResume != 1 ||
+		committedCompensation != 1 || !fake.currentSuspended {
 		t.Fatalf("proxy suspension calls=%#v", fake.suspensions)
 	}
 }
@@ -3004,19 +3019,19 @@ func TestResumeCompensatesRuntimeLossAndRemainsPendingUntilAvailable(t *testing.
 		"suspended", "suspend_resume_race_01"); err != nil {
 		t.Fatal(err)
 	}
-	fake.resumeStarted = make(chan struct{}, 1)
-	fake.resumeContinue = make(chan struct{})
+	fake.activateApplied = make(chan struct{}, 1)
+	fake.activateReturn = make(chan struct{})
 	resumeResult := make(chan error, 1)
 	go func() {
 		_, _, resumeErr := setHostingProjectDesiredState(context.Background(), operator, project.ExternalProjectID,
 			"active", "resume_runtime_race_01")
 		resumeResult <- resumeErr
 	}()
-	<-fake.resumeStarted
+	<-fake.activateApplied
 	if recorder := postHostingInventoryHeartbeat(t, runnerID, free, sessionID, 2, []hostingObservedRuntime{}); recorder.Code != http.StatusOK {
 		t.Fatalf("resume-loss heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
-	close(fake.resumeContinue)
+	close(fake.activateReturn)
 	if err := <-resumeResult; err != nil {
 		t.Fatalf("durable resume race result: %v", err)
 	}
@@ -3032,9 +3047,172 @@ func TestResumeCompensatesRuntimeLossAndRemainsPendingUntilAvailable(t *testing.
 		&pendingResume, &failedResume, &committedCompensation); err != nil {
 		t.Fatal(err)
 	}
-	if pendingResume != 1 || failedResume != 1 || committedCompensation != 1 {
+	if pendingResume != 0 || failedResume != 1 || committedCompensation != 1 {
 		t.Fatalf("resume operations pending=%d failed=%d compensation=%d",
 			pendingResume, failedResume, committedCompensation)
+	}
+}
+
+func TestAppliedResumeCommitsAfterRestartWithoutRedispatch(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t,
+		"project_01JRESAPPLIED", "deployment_01JRESAPPLIED")
+	digest := "sha256:" + strings.Repeat("4", 64)
+	endpoint := healthyHostingEndpointForTest(t)
+	observeHostingJobEndpointForTest(t, job.JobID, endpoint)
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest),
+			RuntimeEndpoint:       endpoint,
+			HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	operator, err := createServiceToken("applied-resume-operator", []string{serviceScopeProjectsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := setHostingProjectDesiredState(t.Context(), operator, project.ExternalProjectID,
+		"suspended", "applied_resume_suspend_01"); err != nil {
+		t.Fatal(err)
+	}
+	fake.fail = true
+	if _, _, err := setHostingProjectDesiredState(t.Context(), operator, project.ExternalProjectID,
+		"active", "applied_resume_active_01"); err != nil {
+		t.Fatal(err)
+	}
+	var operationID string
+	var generation int64
+	if err := db.QueryRow(`SELECT operation_id, route_generation FROM hosting_proxy_operations
+		WHERE hosting_project_id=? AND operation_type='resume' AND status='pending'`,
+		project.ID).Scan(&operationID, &generation); err != nil {
+		t.Fatal(err)
+	}
+	fake.fail = false
+	activation, err := fake.Activate(t.Context(), proxyActivationRequest{OperationID: operationID,
+		ExternalProjectID: project.ExternalProjectID, ReleaseDigest: digest,
+		RuntimeEndpoint: endpoint, RouteGeneration: generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := markHostingProxyOperationApplied(t.Context(), operationID, activation.RouteRevision); err != nil {
+		t.Fatal(err)
+	}
+	beforeRestartActivations := len(fake.activations)
+	restartHostingDatabaseForCancellationTest(t)
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE operation_id=?`,
+		operationID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "committed" || len(fake.activations) != beforeRestartActivations ||
+		fake.currentEndpoint != endpoint || fake.currentSuspended {
+		t.Fatalf("resume status=%s activations=%d/%d endpoint=%q suspended=%v", status,
+			len(fake.activations), beforeRestartActivations, fake.currentEndpoint, fake.currentSuspended)
+	}
+}
+
+func TestResumeAfterSuspensionOutageStaysFencedUntilRuntimeAvailable(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t,
+		"project_01JRESOUTAGE", "deployment_01JRESOUTAGE")
+	digest := "sha256:" + strings.Repeat("5", 64)
+	endpoint := healthyHostingEndpointForTest(t)
+	observeHostingJobEndpointForTest(t, job.JobID, endpoint)
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration,
+		job.LeaseToken, hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+			ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest),
+			RuntimeEndpoint:       endpoint,
+			HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	operator, err := createServiceToken("resume-outage-operator", []string{serviceScopeProjectsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.fail = true
+	if _, _, err := setHostingProjectDesiredState(t.Context(), operator, project.ExternalProjectID,
+		"suspended", "resume_outage_suspend_01"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_runners SET status='offline', last_seen=NULL WHERE id=?`,
+		runnerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := setHostingProjectDesiredState(t.Context(), operator, project.ExternalProjectID,
+		"active", "resume_outage_active_01"); err != nil {
+		t.Fatal(err)
+	}
+	restartHostingDatabaseForCancellationTest(t)
+	fake.fail = false
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var projectDesired, compensationStatus, compensationMarker string
+	var pendingResume int
+	if err := db.QueryRow(`SELECT desired_state FROM hosting_projects WHERE id=?`, project.ID).Scan(
+		&projectDesired); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status, desired_state FROM hosting_proxy_operations
+		WHERE hosting_project_id=? AND operation_type='compensate' ORDER BY id DESC LIMIT 1`,
+		project.ID).Scan(&compensationStatus, &compensationMarker); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations
+		WHERE hosting_project_id=? AND operation_type='resume' AND status='pending'`,
+		project.ID).Scan(&pendingResume); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	fencedEndpoint, fencedSuspended := fake.currentEndpoint, fake.currentSuspended
+	fake.mu.Unlock()
+	if projectDesired != "active" || compensationStatus != "committed" ||
+		compensationMarker != "resume_after_runtime" || pendingResume != 0 ||
+		fencedEndpoint != endpoint || !fencedSuspended {
+		t.Fatalf("desired=%s compensation=%s/%s pending=%d endpoint=%q suspended=%v",
+			projectDesired, compensationStatus, compensationMarker, pendingResume,
+			fencedEndpoint, fencedSuspended)
+	}
+	var sessionID, deploymentExternalID, instanceID string
+	var sequence int64
+	var capacity capacityDTO
+	if err := db.QueryRow(`SELECT runner.active_session_id, runner.last_heartbeat_sequence,
+		runner.capacity_cpu_millis, runner.capacity_ram_bytes, runner.capacity_disk_bytes, runner.capacity_pids,
+		deployment.external_deployment_id, release.runtime_instance_id
+		FROM hosting_runners runner
+		JOIN hosting_releases release ON release.runtime_runner_id=runner.id
+		JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+		WHERE runner.id=? AND release.hosting_project_id=? AND release.status='active'`, runnerID, project.ID).Scan(
+		&sessionID, &sequence, &capacity.CPUMillis, &capacity.RAMBytes, &capacity.DiskBytes,
+		&capacity.PIDs, &deploymentExternalID, &instanceID); err != nil {
+		t.Fatal(err)
+	}
+	inventory := []hostingObservedRuntime{{ExternalProjectID: project.ExternalProjectID,
+		ExternalDeploymentID: deploymentExternalID, ReleaseDigest: digest, RuntimeInstanceID: instanceID,
+		RuntimeEndpoint: endpoint, State: "running"}}
+	if recorder := postHostingInventoryHeartbeat(t, runnerID, capacity, sessionID, sequence+1, inventory); recorder.Code != http.StatusOK {
+		t.Fatalf("runner return heartbeat status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var committedResume int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations
+		WHERE hosting_project_id=? AND operation_type='resume' AND status='committed'`,
+		project.ID).Scan(&committedResume); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	resumedEndpoint, resumedSuspended := fake.currentEndpoint, fake.currentSuspended
+	fake.mu.Unlock()
+	if committedResume != 1 || resumedEndpoint != endpoint || resumedSuspended {
+		t.Fatalf("committed resumes=%d endpoint=%q suspended=%v", committedResume,
+			resumedEndpoint, resumedSuspended)
 	}
 }
 
@@ -3081,7 +3259,7 @@ func TestCommittedResumeCompensationMarkerRecoversPendingRetry(t *testing.T) {
 		&pendingResume, &currentPendingResume, &markedCompensation); err != nil {
 		t.Fatal(err)
 	}
-	if pendingResume != 2 || currentPendingResume != 1 || markedCompensation != 0 || !fake.currentSuspended {
+	if pendingResume != 1 || currentPendingResume != 0 || markedCompensation != 1 || !fake.currentSuspended {
 		t.Fatalf("recovered marker pending resumes=%d current=%d marked compensations=%d suspended=%v",
 			pendingResume, currentPendingResume, markedCompensation, fake.currentSuspended)
 	}
@@ -3092,6 +3270,7 @@ func TestDesiredStateRouteGenerationFencesLateSuspend(t *testing.T) {
 	fake := withFakeProxy(t)
 	fake.suspendStarted = make(chan struct{})
 	fake.suspendContinue = make(chan struct{})
+	suspendStarted, suspendContinue := fake.suspendStarted, fake.suspendContinue
 	project, token := provisionDeploymentTestProject(t, "project_01JSTATEGEN")
 	suspendResult := make(chan error, 1)
 	go func() {
@@ -3099,12 +3278,16 @@ func TestDesiredStateRouteGenerationFencesLateSuspend(t *testing.T) {
 			"suspended", "suspend_01JSTATEGEN")
 		suspendResult <- err
 	}()
-	<-fake.suspendStarted
+	<-suspendStarted
+	fake.mu.Lock()
+	fake.suspendStarted = nil
+	fake.suspendContinue = nil
+	fake.mu.Unlock()
 	if _, _, err := setHostingProjectDesiredState(t.Context(), token, project.ExternalProjectID,
 		"active", "resume_01JSTATEGEN"); err != nil {
 		t.Fatalf("resume while suspend is delayed: %v", err)
 	}
-	fake.suspendContinue <- struct{}{}
+	suspendContinue <- struct{}{}
 	if err := <-suspendResult; err != nil {
 		t.Fatalf("superseded suspend request: %v", err)
 	}
@@ -3112,10 +3295,10 @@ func TestDesiredStateRouteGenerationFencesLateSuspend(t *testing.T) {
 	suspended := fake.currentSuspended
 	requests := append([]proxySuspendRequest(nil), fake.suspensions...)
 	fake.mu.Unlock()
-	if suspended {
-		t.Fatal("late lower-generation suspend overrode the newer resume")
+	if !suspended {
+		t.Fatal("project without an active release was unsuspended")
 	}
-	if len(requests) != 2 || requests[0].RouteGeneration != 1 || requests[1].RouteGeneration != 2 {
+	if len(requests) != 2 || requests[0].RouteGeneration != 1 || requests[1].RouteGeneration != 3 {
 		t.Fatalf("ordered suspension requests=%+v", requests)
 	}
 	var desired string
@@ -3123,18 +3306,19 @@ func TestDesiredStateRouteGenerationFencesLateSuspend(t *testing.T) {
 	if err := db.QueryRow(`SELECT desired_state, route_generation FROM hosting_projects WHERE id=?`, project.ID).Scan(&desired, &generation); err != nil {
 		t.Fatal(err)
 	}
-	if desired != "active" || generation != 2 {
+	if desired != "active" || generation != 3 {
 		t.Fatalf("desired state=%q generation=%d", desired, generation)
 	}
-	var failed, committed int
+	var failed, committed, pending int
 	if err := db.QueryRow(`SELECT
 		SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),
-		SUM(CASE WHEN status='committed' THEN 1 ELSE 0 END)
-		FROM hosting_proxy_operations WHERE hosting_project_id=? AND operation_type IN ('suspend','resume')`, project.ID).Scan(&failed, &committed); err != nil {
+		SUM(CASE WHEN status='committed' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END)
+		FROM hosting_proxy_operations WHERE hosting_project_id=? AND operation_type IN ('suspend','resume')`, project.ID).Scan(&failed, &committed, &pending); err != nil {
 		t.Fatal(err)
 	}
-	if failed != 1 || committed != 1 {
-		t.Fatalf("desired-state operations failed=%d committed=%d", failed, committed)
+	if failed != 2 || committed != 0 || pending != 0 {
+		t.Fatalf("desired-state operations failed=%d committed=%d pending=%d", failed, committed, pending)
 	}
 }
 

@@ -32,16 +32,16 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Stable deployment phases and transition validation.
 - [x] Fence conflicting runner completion payloads before proxy activation.
 - [x] Compare-and-swap immutable release artifact attachment under concurrent uploads.
-- [ ] Idempotent cancel for queued and running deployments.
-- [ ] Cancellation intent and recovery remain durable after process restart.
+- [x] Idempotent cancel for queued and running deployments.
+- [x] Cancellation intent and recovery remain durable after process restart.
 - [x] Generation-fence all proxy intents and persist compensations before external calls.
 - [x] Immutable release persistence and selected-release rollback.
 - [x] Bind rollback and runtime recovery to each release's immutable runtime manifest.
 - [x] Make rollback identity unambiguous for content-identical release instances.
 - [x] Candidate health gate before activation.
 - [x] Failed candidate leaves previous healthy release untouched.
-- [ ] Suspend/resume without deleting releases.
-- [ ] Restart reconciliation for Deployer and runner interruptions.
+- [x] Suspend/resume without deleting releases.
+- [x] Restart reconciliation for Deployer and runner interruptions.
 
 ## P0 — callbacks and reconciliation
 
@@ -61,7 +61,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [ ] Deny public host ports, privileged mode, capabilities, host mounts and Docker socket.
 - [x] Runtime receives secrets by short-lived reference/identity; Deployer/build DB and logs never persist plaintext.
 - [x] Runner loss and recovery state are deterministic.
-- [ ] Per-project and global execution kill switches with audit reason.
+- [x] Per-project and global execution kill switches with audit reason.
 
 ## P1 — observability and operations
 
@@ -80,7 +80,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Exact commit/artifact mismatch rejection tests.
 - [ ] Callback signing, retry, replay and polling reconciliation tests.
 - [x] Health failure preserves active release test.
-- [ ] Cancel, rollback, suspend/resume and restart recovery tests.
+- [x] Cancel, rollback, suspend/resume and restart recovery tests.
 - [ ] Forbidden workload and secret-redaction security tests.
 - [x] Full `go test ./...`, `go test -race ./...`, `go vet ./...` and `git diff --check` pass.
 - [ ] `govulncheck ./...` passes when available or blocker is documented.

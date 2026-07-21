@@ -138,6 +138,11 @@ func setHostingExecutionKillSwitch(ctx context.Context, token *ServiceToken, ext
 			return nil, false, err
 		}
 	}
+	routeIntentCount, err := stageHostingKillSwitchRouteIntents(ctx, conn, token.ID, operation,
+		key, projectID, input.Enabled, now)
+	if err != nil {
+		return nil, false, err
+	}
 	if input.Enabled {
 		if err := cancelHostingJobsForKillSwitch(ctx, conn, projectID, input.Reason, now); err != nil {
 			return nil, false, err
@@ -166,7 +171,70 @@ func setHostingExecutionKillSwitch(ctx context.Context, token *ServiceToken, ext
 		return nil, false, err
 	}
 	committed = true
+	if routeIntentCount != 0 {
+		if err := reconcileHostingDesiredStateOperations(ctx); err != nil {
+			logOperationalError("dispatch durable kill-switch route intent", err)
+		}
+	}
 	return response, false, nil
+}
+
+func stageHostingKillSwitchRouteIntents(ctx context.Context, conn *sql.Conn, tokenID int64,
+	operation, key string, projectID sql.NullInt64, enabled bool,
+	now time.Time) (int, error) {
+	query := `SELECT project.id, project.external_project_id
+		FROM hosting_projects project JOIN hosting_settings settings ON settings.id=1
+		WHERE project.desired_state='active'`
+	var args []any
+	if projectID.Valid {
+		query += ` AND project.id=?`
+		args = append(args, projectID.Int64)
+	}
+	if !enabled {
+		query += ` AND project.kill_switch_reason='' AND settings.global_kill_switch=0`
+	}
+	rows, err := conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	type projectRoute struct {
+		id         int64
+		externalID string
+	}
+	var projects []projectRoute
+	for rows.Next() {
+		var project projectRoute
+		if err := rows.Scan(&project.id, &project.externalID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		projects = append(projects, project)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	operationType := "resume"
+	operationDesiredState := "active"
+	if enabled {
+		operationType = "suspend"
+		operationDesiredState = ""
+	}
+	for _, project := range projects {
+		operationID := hashHostingOperation("kill-switch-route", fmt.Sprint(tokenID), operation,
+			key, project.externalID, operationType, formatSQLiteTime(now))
+		generation, err := nextHostingRouteGeneration(ctx, conn, project.id)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
+			(operation_id, hosting_project_id, operation_type, route_generation, desired_state,
+			 status, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`, operationID, project.id, operationType,
+			generation, operationDesiredState, formatSQLiteTime(now), formatSQLiteTime(now)); err != nil {
+			return 0, err
+		}
+	}
+	return len(projects), nil
 }
 
 func cancelHostingJobsForKillSwitch(ctx context.Context, conn *sql.Conn, projectID sql.NullInt64, reason string, now time.Time) error {
@@ -204,16 +272,30 @@ func cancelHostingJobsForKillSwitch(ctx context.Context, conn *sql.Conn, project
 	}
 	for _, job := range jobs {
 		if job.status == "queued" {
+			result, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET status='cancelled',
+				cancel_requested_at=?, completed_at=?, hosting_runner_id=NULL WHERE id=? AND status='queued'`,
+				formatSQLiteTime(now), formatSQLiteTime(now), job.jobID)
+			if err != nil {
+				return err
+			}
+			if affected, _ := result.RowsAffected(); affected != 1 {
+				return errHostingStateConflict
+			}
 			if job.runnerID.Valid {
 				if err := restoreHostingRunnerCapacity(ctx, conn, job.runnerID.Int64, job.limits); err != nil {
 					return err
 				}
 			}
-			if _, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET status='cancelled', cancel_requested_at=?, completed_at=?, hosting_runner_id=NULL WHERE id=? AND status='queued'`, formatSQLiteTime(now), formatSQLiteTime(now), job.jobID); err != nil {
+			result, err = conn.ExecContext(ctx, `UPDATE hosting_deployments SET status='cancelled',
+				phase='cancelled', failure_code='cancelled', failure_message=?, cancel_requested_at=?,
+				finished_at=?, updated_at=? WHERE id=?
+				AND ((status='queued' AND phase='queued') OR (status='running' AND phase='queued'))`,
+				redactSecrets(reason), formatSQLiteTime(now), formatSQLiteTime(now), formatSQLiteTime(now), job.deploymentID)
+			if err != nil {
 				return err
 			}
-			if _, err := conn.ExecContext(ctx, `UPDATE hosting_deployments SET status='cancelled', phase='cancelled', failure_code='cancelled', failure_message=?, cancel_requested_at=?, finished_at=?, updated_at=? WHERE id=? AND status='queued'`, redactSecrets(reason), formatSQLiteTime(now), formatSQLiteTime(now), formatSQLiteTime(now), job.deploymentID); err != nil {
-				return err
+			if affected, _ := result.RowsAffected(); affected != 1 {
+				return errHostingStateConflict
 			}
 			if err := recordHostingEvent(ctx, conn, job.projectID, job.deploymentID, "deployment_cancelled_by_kill_switch", hostingPhaseCancelled, "cancelled", map[string]any{"reason": reason}, now); err != nil {
 				return err

@@ -93,6 +93,68 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 			t.Errorf("hosting phase OpenAPI contract is missing %q", value)
 		}
 	}
+	cancelSection := hostingContractSection(t, document,
+		"  /api/internal/v1/deployments/{externalDeploymentId}/cancel:",
+		"  /api/internal/v1/deployments/{externalDeploymentId}/events:")
+	for _, value := range []string{"queued job is atomically terminalized", "running/cancelling",
+		"cancellation wins", "atomically persists a newer", "route-generation compensation",
+		"routing intents to settle", "original accepted response snapshot", "Idempotency-Replayed=true",
+		"authoritative", "current state"} {
+		if !strings.Contains(cancelSection, value) {
+			t.Errorf("hosting cancellation OpenAPI contract is missing %q", value)
+		}
+	}
+	resumeSection := hostingContractSection(t, document,
+		"  /api/internal/v1/projects/{externalProjectId}/resume:",
+		"  /api/internal/v1/projects/{externalProjectId}/kill-switch:")
+	for _, value := range []string{"exact authoritative active", "never a bare unsuspend",
+		"remains suspended", "kill switch is enabled", "without admitting a resume route",
+		"convergence may complete asynchronously"} {
+		if !strings.Contains(resumeSection, value) {
+			t.Errorf("project resume OpenAPI contract is missing %q", value)
+		}
+	}
+	projectKillSection := hostingContractSection(t, document,
+		"  /api/internal/v1/projects/{externalProjectId}/kill-switch:",
+		"  /api/internal/v1/deployments/{externalDeploymentId}:")
+	for _, value := range []string{"atomically cancels queued work", "newer",
+		"generation-fenced proxy suspension", "neither the project nor global kill",
+		"exact authoritative active", "rather than blindly exposing",
+		"convergence may complete asynchronously"} {
+		if !strings.Contains(projectKillSection, value) {
+			t.Errorf("project kill-switch OpenAPI contract is missing %q", value)
+		}
+	}
+	globalKillSection := hostingContractSection(t, document,
+		"  /api/internal/v1/settings/kill-switch:",
+		"  /api/hosting-agent/v1/heartbeat:")
+	for _, value := range []string{"atomically cancels queued work", "one newer",
+		"generation-fenced proxy suspension for every desired-active project",
+		"have no project kill switch", "exact authoritative active",
+		"blindly exposing", "convergence may complete asynchronously"} {
+		if !strings.Contains(globalKillSection, value) {
+			t.Errorf("global kill-switch OpenAPI contract is missing %q", value)
+		}
+	}
+	jobHeartbeatSection := hostingContractSection(t, document,
+		"  /api/hosting-agent/v1/jobs/{hostingJobId}/heartbeat:",
+		"  /api/hosting-agent/v1/jobs/{hostingJobId}/workload-identity:")
+	for _, value := range []string{"cancel_requested=true without extending the lease",
+		"persist an exact cancelled completion", "terminalizes the deployment as cancelled",
+		"current-generation routing fence"} {
+		if !strings.Contains(jobHeartbeatSection, value) {
+			t.Errorf("hosting job heartbeat cancellation contract is missing %q", value)
+		}
+	}
+	recoveryHeartbeatSection := hostingContractSection(t, document,
+		"  /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/heartbeat:",
+		"  /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/workload-identity:")
+	for _, value := range []string{"cancel_requested=true without", "persist an exact",
+		"cancelled completion", "restores capacity", "current-generation routing fence"} {
+		if !strings.Contains(recoveryHeartbeatSection, value) {
+			t.Errorf("hosting recovery heartbeat cancellation contract is missing %q", value)
+		}
+	}
 	completionSection := hostingContractSection(t, document,
 		"  /api/hosting-agent/v1/jobs/{hostingJobId}/complete:",
 		"  /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/artifact:")
@@ -158,9 +220,17 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"Inventory-less runners are ineligible",
 		"fresh HTTP health gate that rejects redirects",
 		"exact prior runtime endpoint",
+		"Deployment cancellation is immediate and terminal for queued work",
+		"cancel_requested=true", "without extending the lease",
+		"Exact-key cancel replays return the original accepted",
+		"Cancellation wins over stale",
+		"atomically persists a newer route-generation compensation",
+		"cannot become terminal until both",
+		"one newer suspension intent per desired-active",
+		"never a bare unsuspend", "no active release",
 		"previous active",
 		"release unchanged",
-		"expired leases are fenced and requeued",
+		"expired uncancelled leases are fenced and requeued",
 		"repeated lease",
 		"loss terminates with `runner_lost`",
 		"pending activation is freshly revalidated",

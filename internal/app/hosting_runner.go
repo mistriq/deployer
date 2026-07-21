@@ -1216,26 +1216,25 @@ func handleHostingJobLeaseHeartbeat(w http.ResponseWriter, r *http.Request, jobI
 		jsonErrorCode(w, errCodeJobForbidden, "valid job lease is required", http.StatusForbidden)
 		return
 	}
-	result, err := db.ExecContext(r.Context(), `UPDATE hosting_jobs SET lease_expires_at=? WHERE id=? AND hosting_runner_id=?
-		AND lease_generation=? AND lease_token_hash=? AND status IN ('leased','running') AND lease_expires_at>?`,
-		formatSQLiteTime(time.Now().UTC().Add(hostingJobLeaseDuration)), jobID, runner.ID, generation, hashToken(token), formatSQLiteTime(time.Now().UTC()))
+	now := time.Now().UTC()
+	var cancelRequested sql.NullString
+	err := db.QueryRowContext(r.Context(), `UPDATE hosting_jobs SET
+		lease_expires_at=CASE WHEN cancel_requested_at IS NULL THEN ? ELSE lease_expires_at END
+		WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?
+		  AND status IN ('leased','running') AND lease_expires_at>?
+		RETURNING cancel_requested_at`, formatSQLiteTime(now.Add(hostingJobLeaseDuration)), jobID,
+		runner.ID, generation, hashToken(token), formatSQLiteTime(now)).Scan(&cancelRequested)
+	if err == sql.ErrNoRows {
+		jsonErrorCode(w, errCodeJobForbidden, "valid job lease is required", http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "extend hosting job lease failed", http.StatusInternalServerError)
 		return
 	}
-	affected, _ := result.RowsAffected()
-	if affected != 1 {
-		jsonErrorCode(w, errCodeJobForbidden, "valid job lease is required", http.StatusForbidden)
-		return
-	}
 	if _, err := db.ExecContext(r.Context(), `UPDATE hosting_runners SET status='online', last_seen=?
-		WHERE id=? AND active_session_id=''`, formatSQLiteTime(time.Now().UTC()), runner.ID); err != nil {
+		WHERE id=? AND active_session_id=''`, formatSQLiteTime(now), runner.ID); err != nil {
 		jsonErrorCode(w, errCodeInternal, "update hosting runner liveness failed", http.StatusInternalServerError)
-		return
-	}
-	var cancelRequested sql.NullString
-	if err := db.QueryRowContext(r.Context(), `SELECT cancel_requested_at FROM hosting_jobs WHERE id=?`, jobID).Scan(&cancelRequested); err != nil {
-		jsonErrorCode(w, errCodeInternal, "read hosting job cancellation failed", http.StatusInternalServerError)
 		return
 	}
 	jsonResponse(w, map[string]bool{"cancel_requested": cancelRequested.Valid})

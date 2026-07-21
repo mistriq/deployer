@@ -3,8 +3,10 @@ package app
 import (
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1036,6 +1038,45 @@ func columnExists(table, column string) (bool, error) {
 	return false, rows.Err()
 }
 
+var migratedTestDatabaseTemplate struct {
+	sync.Once
+	contents []byte
+	err      error
+}
+
+func currentTestDatabaseTemplate() ([]byte, error) {
+	migratedTestDatabaseTemplate.Do(func() {
+		directory, err := os.MkdirTemp("", "deployer-test-database-template-")
+		if err != nil {
+			migratedTestDatabaseTemplate.err = err
+			return
+		}
+		defer os.RemoveAll(directory)
+		path := filepath.Join(directory, "deployer-test.db")
+		previousDB := db
+		defer func() { db = previousDB }()
+		if err := initDB(path); err != nil {
+			if db != nil && db != previousDB {
+				_ = db.Close()
+			}
+			migratedTestDatabaseTemplate.err = err
+			return
+		}
+		if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			_ = db.Close()
+			migratedTestDatabaseTemplate.err = err
+			return
+		}
+		if err := db.Close(); err != nil {
+			migratedTestDatabaseTemplate.err = err
+			return
+		}
+		db = previousDB
+		migratedTestDatabaseTemplate.contents, migratedTestDatabaseTemplate.err = os.ReadFile(path)
+	})
+	return migratedTestDatabaseTemplate.contents, migratedTestDatabaseTemplate.err
+}
+
 func withTempDB(t *testing.T) {
 	t.Helper()
 
@@ -1047,6 +1088,13 @@ func withTempDB(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "deployer-test.db")
+	template, err := currentTestDatabaseTemplate()
+	if err != nil {
+		t.Fatalf("create migrated test db template: %v", err)
+	}
+	if err := os.WriteFile(path, template, 0600); err != nil {
+		t.Fatalf("copy migrated test db template: %v", err)
+	}
 	if err := initDB(path); err != nil {
 		t.Fatalf("init temp db: %v", err)
 	}
