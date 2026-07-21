@@ -913,6 +913,9 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 			"--mount", "type=bind,source="+secretDirectory+",target=/run/secrets/deployer,readonly,bind-propagation=rprivate", "--env", "DEPLOYER_SECRETS_DIR=/run/secrets/deployer")
 	}
 	runArgs = append(runArgs, imageRef)
+	if err := validateHostingRuntimeContainerArgs(runArgs, config.RuntimeBindAddress, secretDirectory); err != nil {
+		return fail("workload_policy_violation", err)
+	}
 	if err := runHostingCommand(ctx, config, job, "", "docker", runArgs...); err != nil {
 		return fail("runtime_start_failed", err)
 	}
@@ -956,6 +959,34 @@ func startHostingRuntime(ctx context.Context, config hostingAgentConfig, job *ho
 		go cleanupHostingSecretsAfterContainerExit(containerName, secretDirectory)
 	}
 	return hostingCompletionRequest{Status: "success", ReleaseDigest: releaseDigest, ReleaseArtifactDigest: releaseArtifactDigest, RuntimeEndpoint: endpoint, HealthEvidence: map[string]any{"healthy": true, "attempts": attempts, "status_code": statusCode}}
+}
+
+func validateHostingRuntimeContainerArgs(args []string, bindAddress, secretDirectory string) error {
+	if err := validateHostingRuntimeBindAddress(bindAddress); err != nil {
+		return err
+	}
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if strings.Contains(strings.ToLower(arg), "docker.sock") || arg == "--privileged" ||
+			arg == "--cap-add" || strings.HasPrefix(arg, "--cap-add=") || arg == "--device" ||
+			strings.HasPrefix(arg, "--device=") || arg == "-v" || arg == "--volume" || strings.HasPrefix(arg, "--volume=") {
+			return fmt.Errorf("hosting runtime contains a forbidden container privilege, socket, device, or host volume")
+		}
+		if arg == "--mount" {
+			if index+1 >= len(args) || secretDirectory == "" ||
+				args[index+1] != "type=bind,source="+secretDirectory+",target=/run/secrets/deployer,readonly,bind-propagation=rprivate" {
+				return fmt.Errorf("hosting runtime contains a forbidden host mount")
+			}
+			index++
+		}
+		if arg == "-p" || arg == "--publish" {
+			if index+1 >= len(args) || !strings.HasPrefix(args[index+1], bindAddress+"::") {
+				return fmt.Errorf("hosting runtime publish must bind only to the private runner address")
+			}
+			index++
+		}
+	}
+	return nil
 }
 
 func validateHostingWorkloadLimits(limits hostingWorkloadLimits) error {

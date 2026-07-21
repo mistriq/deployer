@@ -175,6 +175,30 @@ func TestHostingWorkloadLimitsAreFailClosedAtExecutionBoundary(t *testing.T) {
 	}
 }
 
+func TestHostingRuntimeContainerPolicyDeniesHostExposureAndPrivileges(t *testing.T) {
+	secretDir := "/run/user/1000/secrets"
+	valid := []string{"run", "-d", "--cap-drop=ALL", "-p", "127.0.0.1::3000", "image"}
+	if err := validateHostingRuntimeContainerArgs(valid, "127.0.0.1", ""); err != nil {
+		t.Fatalf("valid private runtime rejected: %v", err)
+	}
+	withSecret := append([]string{}, valid[:len(valid)-1]...)
+	withSecret = append(withSecret, "--mount", "type=bind,source="+secretDir+",target=/run/secrets/deployer,readonly,bind-propagation=rprivate", "image")
+	if err := validateHostingRuntimeContainerArgs(withSecret, "127.0.0.1", secretDir); err != nil {
+		t.Fatalf("controlled secret mount rejected: %v", err)
+	}
+	for name, args := range map[string][]string{
+		"public port":   {"run", "-p", "0.0.0.0::3000"},
+		"privileged":    {"run", "--privileged"},
+		"capability":    {"run", "--cap-add=SYS_ADMIN"},
+		"host volume":   {"run", "--volume", "/:/host"},
+		"docker socket": {"run", "--mount", "type=bind,source=/var/run/docker.sock,target=/run/docker.sock"},
+	} {
+		if err := validateHostingRuntimeContainerArgs(args, "127.0.0.1", secretDir); err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+	}
+}
+
 func TestGeneratedHostingRecipeRejectsOutputDirectoryInjection(t *testing.T) {
 	for _, output := range []string{
 		"dist\nRUN touch /owned",
