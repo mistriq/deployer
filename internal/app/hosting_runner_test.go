@@ -3899,6 +3899,41 @@ func TestHostingRunnerClassAndHeartbeatLabelsStayHostingScoped(t *testing.T) {
 	}
 }
 
+func TestHostingRunnerHeartbeatPublishesFreeCapacityAndDrainState(t *testing.T) {
+	withTempDB(t)
+	runner, err := createHostingRunner(t.Context(), hostingRunnerInput{
+		Name: "capacity-drain-runner", Labels: []string{"linux"}, ProtocolVersion: hostingRunnerProtocolVersion,
+		ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"22"},
+		Capacity: capacityDTO{CPUMillis: 2000, RAMBytes: 2 << 30, DiskBytes: 10 << 30, PIDs: 512},
+		Reserve:  capacityDTO{CPUMillis: 250, RAMBytes: 256 << 20, DiskBytes: 1 << 30, PIDs: 32},
+	}, "capacity-drain-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	free := capacityDTO{CPUMillis: 1500, RAMBytes: 1 << 30, DiskBytes: 8 << 30, PIDs: 400}
+	sessionID := strings.TrimPrefix(hashHostingOperation("test.runner.session", fmt.Sprint(runner.ID)), "sha256:")[:48]
+	payload, _ := json.Marshal(hostingHeartbeatRequest{Free: free, Draining: true, Labels: []string{"linux"},
+		ProtocolVersion: hostingRunnerProtocolVersion, ManifestVersions: []string{hostingManifestVersion}, RuntimeVersions: []string{"22"},
+		Operations: []string{"build", hostingRunnerInventoryOperation}, SessionID: sessionID, Sequence: 1,
+		RuntimeInventory: &[]hostingObservedRuntime{}})
+	req := httptest.NewRequest(http.MethodPost, "/api/hosting-agent/v1/heartbeat", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(context.WithValue(req.Context(), hostingRunnerContextKey{}, &HostingRunner{ID: runner.ID}))
+	rec := httptest.NewRecorder()
+	handleHostingAgentHeartbeat(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	runners, err := listHostingRunners(t.Context())
+	if err != nil || len(runners) != 1 {
+		t.Fatalf("list runners=%+v err=%v", runners, err)
+	}
+	got := runners[0]
+	if !got.Draining || got.Status != "online" || got.Free != free {
+		t.Fatalf("runner heartbeat state=%+v", got)
+	}
+}
+
 func TestHostingServiceAndLegacyCredentialsCannotCrossExecutionBoundaries(t *testing.T) {
 	withTempDB(t)
 	hostingRunner, err := createHostingRunner(t.Context(), hostingRunnerInput{

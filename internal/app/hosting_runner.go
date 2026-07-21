@@ -32,6 +32,7 @@ type HostingRunner struct {
 	RuntimeVersions  []string    `json:"runtime_versions"`
 	Operations       []string    `json:"operations"`
 	Capacity         capacityDTO `json:"capacity"`
+	Free             capacityDTO `json:"free"`
 	Reserve          capacityDTO `json:"reserve"`
 	Draining         bool        `json:"draining"`
 	Status           string      `json:"status"`
@@ -194,7 +195,7 @@ func createHostingRunner(ctx context.Context, input hostingRunnerInput, requestI
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &HostingRunner{ID: id, Name: input.Name, Token: token, ExecutionClass: input.ExecutionClass, Labels: normalizeStringList(input.Labels), ProtocolVersion: input.ProtocolVersion, ManifestVersions: normalizeStringList(input.ManifestVersions), RuntimeVersions: normalizeStringList(input.RuntimeVersions), Operations: input.Operations, Capacity: input.Capacity, Reserve: input.Reserve, Status: "offline", CreatedAt: now}, nil
+	return &HostingRunner{ID: id, Name: input.Name, Token: token, ExecutionClass: input.ExecutionClass, Labels: normalizeStringList(input.Labels), ProtocolVersion: input.ProtocolVersion, ManifestVersions: normalizeStringList(input.ManifestVersions), RuntimeVersions: normalizeStringList(input.RuntimeVersions), Operations: input.Operations, Capacity: input.Capacity, Free: input.Capacity, Reserve: input.Reserve, Status: "offline", CreatedAt: now}, nil
 }
 
 func validateCapacity(capacity, reserve capacityDTO) error {
@@ -235,8 +236,9 @@ func hostingStringListContains(values []string, wanted string) bool {
 }
 
 func listHostingRunners(ctx context.Context) ([]HostingRunner, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, name, labels_json, protocol_version, manifest_versions_json,
+	rows, err := db.QueryContext(ctx, `SELECT id, name, execution_class, labels_json, protocol_version, manifest_versions_json,
 		runtime_versions_json, operation_capabilities_json, capacity_cpu_millis, capacity_ram_bytes, capacity_disk_bytes, capacity_pids,
+		free_cpu_millis, free_ram_bytes, free_disk_bytes, free_pids,
 		reserve_cpu_millis, reserve_ram_bytes, reserve_disk_bytes, reserve_pids, draining, status, last_seen, created_at
 		FROM hosting_runners ORDER BY name`)
 	if err != nil {
@@ -249,8 +251,9 @@ func listHostingRunners(ctx context.Context) ([]HostingRunner, error) {
 		var labels, manifests, runtimes, operations, created string
 		var drain int
 		var seen sql.NullString
-		if err := rows.Scan(&runner.ID, &runner.Name, &labels, &runner.ProtocolVersion, &manifests, &runtimes, &operations,
+		if err := rows.Scan(&runner.ID, &runner.Name, &runner.ExecutionClass, &labels, &runner.ProtocolVersion, &manifests, &runtimes, &operations,
 			&runner.Capacity.CPUMillis, &runner.Capacity.RAMBytes, &runner.Capacity.DiskBytes, &runner.Capacity.PIDs,
+			&runner.Free.CPUMillis, &runner.Free.RAMBytes, &runner.Free.DiskBytes, &runner.Free.PIDs,
 			&runner.Reserve.CPUMillis, &runner.Reserve.RAMBytes, &runner.Reserve.DiskBytes, &runner.Reserve.PIDs,
 			&drain, &runner.Status, &seen, &created); err != nil {
 			return nil, err
