@@ -334,3 +334,31 @@ func TestHostingRunbookCoversServiceIdentityBackupAndRunnerRecovery(t *testing.T
 		}
 	}
 }
+
+func TestHostingOperationsDocumentationMatchesStructuredObservabilityContract(t *testing.T) {
+	files := map[string][]string{
+		"README.md": {
+			"phase_duration_seconds", "stable `failure_codes`", "online\nschedulable runners", "pending/delivering callbacks",
+		},
+		"SECURITY.md": {
+			"stable failure codes", "Pending and delivering callback rows", "inactive/failed release artifacts",
+		},
+		"CHANGELOG.md": {
+			"deployment phase-duration timelines", "stable failure-code outcome metrics", "release archives",
+		},
+		"docs/openapi.yaml": {
+			"per-phase elapsed durations", "stable failure-code counts", "online schedulable runner capacity",
+		},
+	}
+	for path, required := range files {
+		content, err := os.ReadFile(filepath.Join("..", "..", path))
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		for _, value := range required {
+			if !strings.Contains(string(content), value) {
+				t.Errorf("%s is missing %q", path, value)
+			}
+		}
+	}
+}

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add deployment phase-duration timelines, stable failure-code outcome metrics,
+  online-schedulable capacity reporting, and explicit retention cleanup error
+  reporting for expired release archives.
 - Add a private `/api/internal/v1` Light Apps Hosting execution API with scoped,
   hashed, overlapping service credentials, strict signed manifests, canonical
   idempotency, stable errors, and audit records.

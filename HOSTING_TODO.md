@@ -69,7 +69,7 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Metrics for queue age, success rate, duration, capacity and callback lag.
 - [x] Service token, DB backup/restore, stale job and runner-loss runbooks.
 - [x] Retention and cleanup for artifacts, releases, logs and callback records.
-- [ ] Update README, SECURITY, CHANGELOG and OpenAPI.
+- [x] Update README, SECURITY, CHANGELOG and OpenAPI.
 
 ## Required verification
 

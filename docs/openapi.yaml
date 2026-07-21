@@ -1475,7 +1475,7 @@ paths:
         - $ref: "#/components/parameters/ExternalDeploymentId"
       responses:
         "200":
-          description: Ordered redacted events with stable phases and failure codes.
+          description: Ordered redacted events with stable phases, failure codes, and per-phase elapsed durations.
           content:
             application/json:
               schema:
@@ -1557,7 +1557,7 @@ paths:
       security: [{serviceBearerAuth: []}]
       responses:
         "200":
-          description: Queue age, 24-hour outcomes and duration, runner capacity, and callback lag.
+          description: Queue age, 24-hour outcomes/duration and stable failure-code counts, online schedulable runner capacity, and callback lag.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingMetrics"}

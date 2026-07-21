@@ -473,6 +473,16 @@ delivery is late, duplicated, rejected, retained out of the outbox, or reaches
 `dead_letter`. See [the hosting operations runbook](docs/HOSTING_RUNBOOK.md)
 and `docs/openapi.yaml` for the complete schemas and recovery contract.
 
+Operational reads are private control-plane calls: deployment
+`/events` is an ordered, redacted timeline whose `phase_duration_seconds`
+measures the elapsed time to the next event, and whose final event has zero
+duration. `/metrics` reports queue age, 24-hour terminal success rate and
+duration, stable `failure_codes`, callback lag, and capacity for online
+schedulable runners only. Use structured `failure_code` and timeline fields for
+automation; text in logs, metadata, and messages is diagnostic only. Retention
+never age-deletes pending/delivering callbacks or active releases; see the
+runbook before changing retention settings.
+
 Dedicated hosting runner:
 
 ```bash

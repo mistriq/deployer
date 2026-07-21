@@ -104,3 +104,8 @@ Hosting source archives, logs, callbacks, events, releases, and audit records
 have separate retention settings. Active source artifacts are protected from
 generic artifact cleanup, and active releases are never aged out. Review
 `docs/HOSTING_RUNBOOK.md` before changing retention or restoring a database.
+The private event timeline and aggregate metrics intentionally expose only
+redacted metadata and stable failure codes; automation must not parse log or
+error-message text. Pending and delivering callback rows are retained for
+reconciliation, while cleanup may age out only finalized delivered/dead-letter
+rows and inactive/failed release artifacts according to the configured policy.
