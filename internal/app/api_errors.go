@@ -77,6 +77,7 @@ func jsonError(w http.ResponseWriter, msg string, status int) {
 }
 
 func jsonErrorCode(w http.ResponseWriter, code, msg string, status int) {
+	msg = redactSecrets(msg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	logOperationalError("encode JSON error", json.NewEncoder(w).Encode(apiErrorResponse{

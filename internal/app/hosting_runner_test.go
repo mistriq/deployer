@@ -39,6 +39,21 @@ type fakeProxyClient struct {
 	currentEndpoint  string
 }
 
+type blockingRequestBody struct {
+	reader  *bytes.Reader
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (body *blockingRequestBody) Read(buffer []byte) (int, error) {
+	body.once.Do(func() { close(body.started) })
+	<-body.release
+	return body.reader.Read(buffer)
+}
+
+func (*blockingRequestBody) Close() error { return nil }
+
 func (fake *fakeProxyClient) Activate(_ context.Context, request proxyActivationRequest) (*proxyActivationResponse, error) {
 	fake.mu.Lock()
 	fake.activations = append(fake.activations, request)
@@ -3667,6 +3682,96 @@ func TestHostingLeaseMutationsRejectExpiryAndRedactLogs(t *testing.T) {
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_logs`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("log count=%d err=%v", count, err)
+	}
+}
+
+func TestRecoveryLogWriteRechecksLeaseAfterBlockedBodyDecode(t *testing.T) {
+	withTempDB(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t,
+		"project_01JRECOVERYLOGRACE", "deployment_01JRECOVERYLOGRACE")
+	releaseDigest := "sha256:" + strings.Repeat("d", 64)
+	artifactDigest := attachTestReleaseArtifact(t, job.JobID, releaseDigest)
+	var deploymentID int64
+	var cpu, ram, disk, pids int64
+	var artifactPath string
+	var artifactSize int64
+	if err := db.QueryRow(`SELECT hosting_deployment_id, required_cpu_millis, required_ram_bytes,
+		required_disk_bytes, required_pids, release_upload_path, release_upload_size
+		FROM hosting_jobs WHERE id=?`, job.JobID).Scan(
+		&deploymentID, &cpu, &ram, &disk, &pids, &artifactPath, &artifactSize); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := db.Exec(`INSERT INTO hosting_release_artifacts
+		(artifact_digest, release_digest, artifact_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?)`,
+		artifactDigest, releaseDigest, artifactPath, artifactSize, formatSQLiteTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	releaseResult, err := db.Exec(`INSERT INTO hosting_releases
+		(hosting_project_id, hosting_deployment_id, release_digest, release_artifact_digest,
+		 commit_sha, artifact_digest, status, runtime_endpoint, runtime_runner_id,
+		 runtime_generation, runtime_instance_id, runtime_manifest_json, created_at, activated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, 1, ?, '{}', ?, ?)`, project.ID, deploymentID,
+		releaseDigest, artifactDigest, strings.Repeat("a", 40), "sha256:"+strings.Repeat("c", 64),
+		"http://127.0.0.1:43210", runnerID, "build-race-instance", formatSQLiteTime(now), formatSQLiteTime(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := releaseResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseToken := "recovery-log-race-token"
+	recoveryResult, err := db.Exec(`INSERT INTO hosting_runtime_recoveries
+		(hosting_release_id, hosting_runner_id, status, lease_generation, lease_token_hash,
+		 lease_expires_at, attempts, required_cpu_millis, required_ram_bytes,
+		 required_disk_bytes, required_pids, runtime_owner_runner_id, created_at, started_at)
+		VALUES (?, ?, 'leased', 1, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)`, releaseID, runnerID,
+		hashToken(leaseToken), formatSQLiteTime(now.Add(time.Minute)), cpu, ram, disk, pids,
+		runnerID, formatSQLiteTime(now), formatSQLiteTime(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryID, err := recoveryResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"stream":"runtime","message":"late log"}`)
+	body := &blockingRequestBody{reader: bytes.NewReader(payload), started: make(chan struct{}), release: make(chan struct{})}
+	request := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/api/hosting-agent/v1/recoveries/%d/logs", recoveryID), body)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Deployer-Lease-Generation", "1")
+	request.Header.Set("X-Deployer-Lease-Token", leaseToken)
+	request = request.WithContext(context.WithValue(request.Context(), hostingRunnerContextKey{},
+		&HostingRunner{ID: runnerID}))
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handleHostingRecoveryLogs(recorder, request, recoveryID)
+		close(done)
+	}()
+	select {
+	case <-body.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery log handler did not reach body decoding")
+	}
+	if _, err := db.Exec(`UPDATE hosting_runtime_recoveries SET lease_expires_at=? WHERE id=?`,
+		formatSQLiteTime(time.Now().UTC().Add(-time.Second)), recoveryID); err != nil {
+		t.Fatal(err)
+	}
+	close(body.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery log handler did not finish")
+	}
+	var logs int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_logs WHERE hosting_deployment_id=?`, deploymentID).Scan(&logs); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusForbidden || logs != 0 {
+		t.Fatalf("status=%d body=%s logs=%d", recorder.Code, recorder.Body.String(), logs)
 	}
 }
 

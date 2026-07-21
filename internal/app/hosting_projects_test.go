@@ -350,6 +350,41 @@ func TestHostingManifestValidationRejectsUnsupportedOrUnsafeFields(t *testing.T)
 	}
 }
 
+func TestHostingExternalIdentifiersRejectSecretShapedValues(t *testing.T) {
+	for _, identifier := range []string{
+		"dpl_1234567890abcdefghij",
+		"htr_1234567890abcdefghij",
+		"wli_1234567890abcdefghij",
+		"ghp_1234567890abcdefghij",
+		"gho_1234567890abcdefghij",
+		"ghu_1234567890abcdefghij",
+		"ghs_1234567890abcdefghij",
+		"github_pat_1234567890abcdefghij",
+		"sk_live_1234567890abcdefghij",
+		"xoxb-1234567890abcdefghij",
+		"xoxa-1234567890abcdefghij",
+		"xoxp-1234567890abcdefghij",
+		"xoxr-1234567890abcdefghij",
+		"xoxs-1234567890abcdefghij",
+		"AKIA1234567890ABCDEF",
+	} {
+		for _, candidate := range []string{identifier, "project-" + identifier} {
+			projectRequest := hostingProjectUpsertRequest{ExternalProjectID: candidate,
+				Manifest: validHostingManifest("static")}
+			if err := validateHostingProjectRequest(&projectRequest); err == nil {
+				t.Fatalf("secret-shaped external project ID %q was accepted", candidate)
+			}
+			deploymentRequest := validHostingDeploymentRequest(candidate)
+			if err := validateHostingDeploymentRequestShape(&deploymentRequest); err == nil {
+				t.Fatalf("secret-shaped external deployment ID %q was accepted", candidate)
+			}
+			if !validHostingExternalIDSyntax(candidate) {
+				t.Fatalf("legacy-compatible syntax unexpectedly rejected %q", candidate)
+			}
+		}
+	}
+}
+
 func TestHostingManifestDigestUsesValidatedCanonicalValues(t *testing.T) {
 	withTempDB(t)
 	withHostingConfig(t)

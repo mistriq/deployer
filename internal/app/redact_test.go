@@ -1,8 +1,11 @@
 package app
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRedactSecrets(t *testing.T) {
@@ -27,6 +30,38 @@ func TestRedactSecrets(t *testing.T) {
 	}
 	if count := strings.Count(got, "[REDACTED]"); count < 9 {
 		t.Fatalf("expected at least 9 redactions, got %d in %q", count, got)
+	}
+}
+
+func TestJSONErrorsRedactDynamicSecretValues(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	jsonErrorCode(recorder, errCodeValidation,
+		"upstream rejected Authorization: Bearer callback-error-secret", http.StatusBadRequest)
+	if recorder.Code != http.StatusBadRequest || strings.Contains(recorder.Body.String(), "callback-error-secret") ||
+		!strings.Contains(recorder.Body.String(), "[REDACTED]") {
+		t.Fatalf("redacted error status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHostingStructuredEventsRedactMetadataBeforePersistence(t *testing.T) {
+	withTempDB(t)
+	project, _ := provisionDeploymentTestProject(t, "project_01JCEVENTREDACT")
+	secret := "structured-event-secret"
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := recordHostingEvent(t.Context(), conn, project.ID, 0, "redaction_test", "queued", "",
+		map[string]any{"diagnostic": "Authorization: Bearer " + secret}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var metadata string
+	if err := db.QueryRow(`SELECT metadata_json FROM hosting_events WHERE event_type='redaction_test'`).Scan(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(metadata, secret) || !strings.Contains(metadata, "[REDACTED]") {
+		t.Fatalf("event metadata was not redacted: %s", metadata)
 	}
 }
 

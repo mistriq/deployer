@@ -196,7 +196,8 @@ func cleanupHostingRecords(ctx context.Context, cfg AppConfig, now time.Time) er
 			WHERE release.release_artifact_digest=hosting_release_artifacts.artifact_digest)`); err != nil {
 		return err
 	}
-	if err := deleteOlder(`DELETE FROM callback_outbox WHERE status IN ('delivered','dead_letter') AND created_at<?`, cfg.HostingCallbackRetentionDays); err != nil {
+	if err := deleteOlder(`DELETE FROM callback_outbox WHERE status IN ('delivered','dead_letter')
+		AND COALESCE(finalized_at, delivered_at, created_at)<?`, cfg.HostingCallbackRetentionDays); err != nil {
 		return err
 	}
 	if err := deleteOlder(`DELETE FROM hosting_audit_events WHERE created_at<?`, cfg.HostingAuditRetentionDays); err != nil {

@@ -68,7 +68,7 @@ func handleInternalProjectUpsert(w http.ResponseWriter, r *http.Request, externa
 
 func handleInternalProject(w http.ResponseWriter, r *http.Request) {
 	externalProjectID, suffix, ok := parseResourcePath(r.URL.Path, "/api/internal/v1/projects/")
-	if !ok || !externalIDPattern.MatchString(externalProjectID) {
+	if !ok || !validHostingExternalIDSyntax(externalProjectID) {
 		jsonErrorCode(w, errCodeProjectNotFound, "project not found", http.StatusNotFound)
 		return
 	}
@@ -122,7 +122,7 @@ func handleInternalDeploymentCreate(w http.ResponseWriter, r *http.Request, exte
 
 func handleInternalDeployment(w http.ResponseWriter, r *http.Request) {
 	externalDeploymentID, suffix, ok := parseResourcePath(r.URL.Path, "/api/internal/v1/deployments/")
-	if !ok || !externalIDPattern.MatchString(externalDeploymentID) {
+	if !ok || !validHostingExternalIDSyntax(externalDeploymentID) {
 		jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
 		return
 	}

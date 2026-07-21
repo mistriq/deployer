@@ -28,8 +28,10 @@ type callbackOutboxRecord struct {
 	EventID             string
 	HostingDeploymentID int64
 	Payload             []byte
+	PayloadHash         string
 	Attempts            int
 	ClaimToken          string
+	CreatedAt           time.Time
 }
 
 func runHostingCallbackDispatcher(ctx context.Context) {
@@ -63,13 +65,14 @@ func deliverHostingCallbackOnce(ctx context.Context, now time.Time) (bool, error
 		return false, err
 	}
 	deliveryErr := sendHostingCallback(ctx, record, now)
+	completedAt := time.Now().UTC()
 	if deliveryErr == nil {
-		if err := markHostingCallbackDelivered(ctx, record, now); err != nil {
+		if err := markHostingCallbackDelivered(ctx, record, completedAt); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
-	if err := rescheduleHostingCallback(ctx, record, deliveryErr, now); err != nil {
+	if err := rescheduleHostingCallback(ctx, record, deliveryErr, completedAt); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -92,16 +95,20 @@ func claimHostingCallback(ctx context.Context, now time.Time) (*callbackOutboxRe
 	}()
 	staleBefore := formatSQLiteTime(now.Add(-callbackLeaseTimeout))
 	if _, err := conn.ExecContext(ctx, `UPDATE callback_outbox SET status='pending', locked_at=NULL, claim_token_hash=''
-		WHERE status='delivering' AND locked_at<?`, staleBefore); err != nil {
+		WHERE status='delivering' AND (locked_at IS NULL OR locked_at<?)`, staleBefore); err != nil {
 		return nil, err
 	}
 	var record callbackOutboxRecord
-	err = conn.QueryRowContext(ctx, `SELECT id, event_id, hosting_deployment_id, payload_json, attempts
+	var createdAt string
+	err = conn.QueryRowContext(ctx, `SELECT id, event_id, hosting_deployment_id, payload_json, payload_hash,
+		attempts, created_at
 		FROM callback_outbox WHERE status='pending' AND next_attempt_at<=? ORDER BY id LIMIT 1`, formatSQLiteTime(now)).Scan(
-		&record.ID, &record.EventID, &record.HostingDeploymentID, &record.Payload, &record.Attempts)
+		&record.ID, &record.EventID, &record.HostingDeploymentID, &record.Payload, &record.PayloadHash,
+		&record.Attempts, &createdAt)
 	if err != nil {
 		return nil, err
 	}
+	record.CreatedAt = parseSQLiteTime(createdAt)
 	record.ClaimToken, err = generateLeaseToken()
 	if err != nil {
 		return nil, err
@@ -124,6 +131,9 @@ func claimHostingCallback(ctx context.Context, now time.Time) (*callbackOutboxRe
 }
 
 func sendHostingCallback(ctx context.Context, record *callbackOutboxRecord, now time.Time) error {
+	if err := validateHostingCallbackEnvelope(ctx, record); err != nil {
+		return err
+	}
 	target, err := validateCallbackTarget(appConfig.CallbackURL)
 	if err != nil {
 		return &hostingAPIError{Code: "callback_not_configured", Message: "hosting callback target is unavailable", StatusCode: http.StatusServiceUnavailable, Err: err}
@@ -141,14 +151,10 @@ func sendHostingCallback(ctx context.Context, record *callbackOutboxRecord, now 
 	request.Header.Set(callbackTimestampHeader, timestamp)
 	request.Header.Set(callbackEventIDHeader, record.EventID)
 	request.Header.Set(callbackSignatureHeader, signature)
-	timeout := appConfig.CallbackTimeout
-	if timeout <= 0 {
-		timeout = 15 * time.Second
-	}
-	if timeout >= callbackLeaseTimeout {
-		timeout = callbackLeaseTimeout / 2
-	}
-	client := &http.Client{Timeout: timeout}
+	timeout := hostingCallbackRequestTimeout(appConfig.CallbackTimeout)
+	client := &http.Client{Timeout: timeout, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
 	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("send callback: %w", err)
@@ -157,6 +163,48 @@ func sendHostingCallback(ctx context.Context, record *callbackOutboxRecord, now 
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return fmt.Errorf("callback returned HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
+func hostingCallbackRequestTimeout(configured time.Duration) time.Duration {
+	if configured <= 0 {
+		configured = 15 * time.Second
+	}
+	if configured > callbackLeaseTimeout/2 {
+		return callbackLeaseTimeout / 2
+	}
+	return configured
+}
+
+func validateHostingCallbackEnvelope(ctx context.Context, record *callbackOutboxRecord) error {
+	actualHash := sha256.Sum256(record.Payload)
+	if record.CreatedAt.IsZero() || record.PayloadHash != "sha256:"+hex.EncodeToString(actualHash[:]) {
+		return &hostingAPIError{Code: "callback_payload_corrupt",
+			Message: "callback payload cannot be verified", StatusCode: http.StatusInternalServerError}
+	}
+	deployment, err := getHostingDeploymentByID(ctx, record.HostingDeploymentID)
+	if err != nil {
+		return &hostingAPIError{Code: "callback_payload_corrupt",
+			Message: "callback payload cannot be verified", StatusCode: http.StatusInternalServerError, Err: err}
+	}
+	if !validHostingExternalIDForAdmission(deployment.ExternalProjectID) ||
+		!validHostingExternalIDForAdmission(deployment.ExternalDeploymentID) {
+		return &hostingAPIError{Code: "callback_identity_invalid",
+			Message: "callback identity cannot be delivered", StatusCode: http.StatusInternalServerError}
+	}
+	expectedEventID, expectedPayload, _, err := buildHostingTerminalCallback(deployment, record.CreatedAt)
+	if err != nil || record.EventID != expectedEventID {
+		return &hostingAPIError{Code: "callback_payload_corrupt",
+			Message: "callback payload cannot be verified", StatusCode: http.StatusInternalServerError, Err: err}
+	}
+	if bytes.Equal(record.Payload, expectedPayload) {
+		return nil
+	}
+	legacyEventID, legacyPayload, _, legacyErr := buildLegacyHostingTerminalCallback(deployment, record.CreatedAt)
+	if legacyErr != nil || record.EventID != legacyEventID || !bytes.Equal(record.Payload, legacyPayload) {
+		return &hostingAPIError{Code: "callback_payload_corrupt",
+			Message: "callback payload cannot be verified", StatusCode: http.StatusInternalServerError, Err: legacyErr}
 	}
 	return nil
 }
@@ -190,9 +238,9 @@ func markHostingCallbackDelivered(ctx context.Context, record *callbackOutboxRec
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE callback_outbox SET status='delivered', delivered_at=?, locked_at=NULL,
+	result, err := tx.ExecContext(ctx, `UPDATE callback_outbox SET status='delivered', delivered_at=?, finalized_at=?, locked_at=NULL,
 		claim_token_hash='', last_error_code='' WHERE id=? AND status='delivering' AND claim_token_hash=?`,
-		formatSQLiteTime(now), record.ID, hashToken(record.ClaimToken))
+		formatSQLiteTime(now), formatSQLiteTime(now), record.ID, hashToken(record.ClaimToken))
 	if err != nil {
 		return err
 	}
@@ -223,14 +271,22 @@ func rescheduleHostingCallback(ctx context.Context, record *callbackOutboxRecord
 	if errorsAsHosting(deliveryErr, &apiErr) {
 		errorCode = apiErr.Code
 	}
+	if errorCode == "callback_payload_corrupt" || errorCode == "callback_identity_invalid" {
+		status = "dead_letter"
+		callbackState = "dead_letter"
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE callback_outbox SET status=?, next_attempt_at=?, locked_at=NULL,
+	var finalizedAt any
+	if status == "dead_letter" {
+		finalizedAt = formatSQLiteTime(now)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE callback_outbox SET status=?, next_attempt_at=?, finalized_at=?, locked_at=NULL,
 		claim_token_hash='', last_error_code=? WHERE id=? AND status='delivering' AND claim_token_hash=?`,
-		status, formatSQLiteTime(next), errorCode, record.ID, hashToken(record.ClaimToken))
+		status, formatSQLiteTime(next), finalizedAt, errorCode, record.ID, hashToken(record.ClaimToken))
 	if err != nil {
 		return err
 	}

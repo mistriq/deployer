@@ -321,7 +321,7 @@ func handleHostingRecoveryLogs(w http.ResponseWriter, r *http.Request, recoveryI
 		jsonErrorCode(w, errCodeJobForbidden, "valid recovery lease is required", http.StatusForbidden)
 		return
 	}
-	state, err := authenticateHostingRecoveryLease(r.Context(), runner.ID, recoveryID, generation, token)
+	_, err := authenticateHostingRecoveryLease(r.Context(), runner.ID, recoveryID, generation, token)
 	if err != nil {
 		jsonErrorCode(w, errCodeJobForbidden, "valid recovery lease is required", http.StatusForbidden)
 		return
@@ -338,10 +338,22 @@ func handleHostingRecoveryLogs(w http.ResponseWriter, r *http.Request, recoveryI
 	if len(input.Message) > maxHostingLogChunkBytes {
 		input.Message = input.Message[len(input.Message)-maxHostingLogChunkBytes:]
 	}
-	if _, err := db.ExecContext(r.Context(), `INSERT INTO hosting_logs
-		(hosting_deployment_id, stream, message, created_at) VALUES (?, ?, ?, ?)`, state.DeploymentID,
-		input.Stream, input.Message, formatSQLiteTime(time.Now().UTC())); err != nil {
+	now := time.Now().UTC()
+	result, err := db.ExecContext(r.Context(), `INSERT INTO hosting_logs
+		(hosting_deployment_id, stream, message, created_at)
+		SELECT release.hosting_deployment_id, ?, ?, ? FROM hosting_runtime_recoveries recovery
+		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
+		WHERE recovery.id=? AND recovery.hosting_runner_id=? AND recovery.lease_generation=?
+		  AND recovery.lease_token_hash=? AND recovery.status IN ('leased','running')
+		  AND recovery.lease_expires_at>?`, input.Stream, input.Message, formatSQLiteTime(now), recoveryID,
+		runner.ID, generation, hashToken(token), formatSQLiteTime(now))
+	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "persist recovery log failed", http.StatusInternalServerError)
+		return
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		jsonErrorCode(w, errCodeJobForbidden, "valid recovery lease is required", http.StatusForbidden)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

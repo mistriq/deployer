@@ -106,7 +106,7 @@ URL through your authorization gateway.
 | `DEPLOYER_PROXY_ADAPTER_TIMEOUT` | `15s` | Activation/suspension adapter request timeout. |
 | `DEPLOYER_HOSTING_CALLBACK_URL` | empty | Hosting control-plane terminal callback URL. HTTPS is required except for loopback tests. |
 | `DEPLOYER_HOSTING_CALLBACK_SECRET` | empty | HMAC callback key; use at least 32 random bytes. |
-| `DEPLOYER_HOSTING_CALLBACK_TIMEOUT` | `15s` | Per-attempt callback timeout. |
+| `DEPLOYER_HOSTING_CALLBACK_TIMEOUT` | `15s` | Per-attempt callback timeout, capped at 60 seconds to leave a safety margin inside the two-minute delivery lease. |
 | `DEPLOYER_HOSTING_CALLBACK_MAX_ATTEMPTS` | `12` | Attempts before a callback enters `dead_letter`. |
 | `DEPLOYER_SERVICE_TOKEN_ROTATION_OVERLAP` | `24h` | Validity overlap retained for the prior service-token credential during rotation; set `0s` for immediate expiry. |
 | `DEPLOYER_HOSTING_LOG_RETENTION_DAYS` | `30` | Hosting log retention; `0` disables deletion. |
@@ -457,9 +457,20 @@ must branch on stable JSON `code`, `status`, `phase`, and `failure_code` values
 rather than human text.
 
 Terminal callbacks are delivered at least once. Their signature covers
-`<timestamp>.<event_id>.<raw body>`; receivers reject timestamps outside five
-minutes and deduplicate event IDs. Polling remains authoritative when delivery
-is missed or reaches `dead_letter`. See [the hosting operations runbook](docs/HOSTING_RUNBOOK.md)
+`<header Unix timestamp>.<event_id>.<raw body>`; receivers reject header
+timestamps outside five minutes, compare the signature in constant time, and
+deduplicate event IDs before applying state. The body has a separate immutable
+RFC3339 terminal-event timestamp. A retry preserves the event ID and exact raw
+body while refreshing the header timestamp and signature. Any `2xx` response
+acknowledges the event; redirects are not followed, and all other outcomes use
+bounded exponential backoff measured from attempt completion. Deployer
+reconstructs the durable envelope from authoritative terminal state before
+signing it, accepts the exact supported legacy body shape without rewriting an
+already-attempted event, and dead-letters a corrupt envelope without sending
+it. Callback metadata is allowlisted and re-redacted; it may be absent only on
+an immutable event enqueued by an older Deployer version. Polling remains authoritative when
+delivery is late, duplicated, rejected, retained out of the outbox, or reaches
+`dead_letter`. See [the hosting operations runbook](docs/HOSTING_RUNBOOK.md)
 and `docs/openapi.yaml` for the complete schemas and recovery contract.
 
 Dedicated hosting runner:

@@ -47,8 +47,10 @@
 - Make rollback select a release by exact external deployment identity plus
   content digest, avoiding ambiguity between content-identical deployments.
 - Add a transactional signed callback outbox with retries, dead-letter state,
-  polling reconciliation, runner-loss recovery/reassignment, and deterministic
-  retry exhaustion.
+  polling reconciliation, exact legacy-envelope redelivery, redirect rejection,
+  payload-integrity validation, completion-based backoff, restart recovery,
+  finalized-time retention, and deterministic retry exhaustion. Quarantine
+  unsafe legacy identities without breaking authenticated polling.
 - Add per-project and global execution kill switches, aggregate hosting metrics,
   hosting retention policies, expanded secret redaction, OpenAPI contracts, and
   hosting operations/security runbooks.

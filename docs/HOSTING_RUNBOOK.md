@@ -64,7 +64,9 @@ private network.
   truncated/invalid successful JSON results are retried with a newly minted
   one-time identity rather than replaying a token ID.
 - Configure the HTTPS terminal callback URL and an independent HMAC key of at
-  least 32 random bytes.
+  least 32 random bytes. Keep the per-attempt timeout below 60 seconds; Deployer
+  caps larger values at 60 seconds to preserve a safety margin inside its
+  two-minute delivery lease.
 - Register at least one dedicated hosting runner with capacity and reserve
   values, then run `deployer hosting-agent` under a dedicated OS account. Keep
   the Docker engine and host kernel patched. Set
@@ -154,11 +156,24 @@ be rejected.
 3. Poll the returned `Location`. Structured `status`, `phase`, and
    `failure_code` are authoritative. Do not parse log or error text.
 4. Treat the terminal callback as at-least-once. Verify the HMAC over
-   `<timestamp>.<event_id>.<raw body>`, reject timestamps outside five minutes,
-   and deduplicate event IDs before applying state.
-5. Poll the deployment whenever a callback is late, duplicated, or reports
-   `dead_letter`. Polling contains the release identity and log/event references
-   needed to repair control-plane state.
+   `<header Unix timestamp>.<event_id>.<raw body>` in constant time, reject the
+   header timestamp outside five minutes, require the header event ID to equal
+   `event_id` in the body, and deduplicate before applying state. The body has a
+   separate immutable RFC3339 terminal-event timestamp. Retries preserve the
+   event ID and exact raw body while refreshing the header timestamp and
+   signature. Return any `2xx` only after the event is durably accepted.
+   Deployer does not follow redirects; failures retry with bounded exponential
+   backoff measured from attempt completion. An event enqueued before callback
+   metadata was introduced is retried with its exact legacy body rather than
+   rewritten under the same event ID.
+5. Poll the deployment whenever a callback is late, duplicated, rejected, or
+   ambiguous. The poll response's `callback_state` exposes `pending`,
+   `delivered`, or `dead_letter`; terminal status, phase, failure code, release
+   identity, and log/event references remain available after callback-record
+   retention and are authoritative for repairing control-plane state. A
+   historical terminal deployment that predates a recoverable outbox row is
+   normalized to polling-only `dead_letter` rather than emitting a synthetic
+   late callback.
 
 An active release has passed the candidate health gate and has an adapter route
 revision. A failed build, health check, or activation leaves the prior active
@@ -352,7 +367,8 @@ Cleanup runs at startup and every six hours:
 - hosting logs: 30 days,
 - events: 90 days,
 - inactive/failed releases: 90 days,
-- delivered/dead-letter callbacks: 30 days,
+- delivered/dead-letter callbacks: 30 days after delivery or dead-letter
+  finalization (pending and delivering rows are never age-deleted),
 - hosting and service-token audits: 365 days,
 - expired idempotency responses: immediately eligible.
 

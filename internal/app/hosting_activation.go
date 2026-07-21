@@ -290,6 +290,11 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 
 	cancelled, err := activateHealthyHostingRelease(ctx, state, input.ReleaseDigest, activation.RouteRevision)
 	if err != nil {
+		if errors.Is(err, errHostingCallbackEnqueue) {
+			// The activation intent and external apply remain durable. An exact
+			// completion retry can atomically finish state and recreate the outbox.
+			return err
+		}
 		current, currentErr := hostingProxyOperationIsCurrent(ctx, operationID)
 		if currentErr != nil {
 			return currentErr

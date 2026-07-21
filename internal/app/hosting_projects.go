@@ -32,12 +32,21 @@ const (
 )
 
 var (
-	externalIDPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$`)
-	repositoryNamePattern  = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
-	packageScriptPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$`)
-	outputDirectoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$`)
-	healthPathPattern      = regexp.MustCompile(`^/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[A-Fa-f0-9]{2})*$`)
+	externalIDPattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$`)
+	externalIDSecretPattern = regexp.MustCompile(`(?:(?:dpl_|htr_|wli_|ghp_|gho_|ghu_|ghs_|github_pat_|sk_live_|xox[baprs]-)[A-Za-z0-9_.-]{8,}|AKIA[A-Z0-9]{16})`)
+	repositoryNamePattern   = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	packageScriptPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$`)
+	outputDirectoryPattern  = regexp.MustCompile(`^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$`)
+	healthPathPattern       = regexp.MustCompile(`^/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[A-Fa-f0-9]{2})*$`)
 )
+
+func validHostingExternalIDSyntax(value string) bool {
+	return externalIDPattern.MatchString(value)
+}
+
+func validHostingExternalIDForAdmission(value string) bool {
+	return validHostingExternalIDSyntax(value) && !externalIDSecretPattern.MatchString(value)
+}
 
 type HostingProjectManifest struct {
 	SchemaVersion   string                    `json:"schema_version"`
@@ -181,8 +190,8 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 
 func validateHostingProjectRequest(payload *hostingProjectUpsertRequest) error {
 	payload.ExternalProjectID = strings.TrimSpace(payload.ExternalProjectID)
-	if !externalIDPattern.MatchString(payload.ExternalProjectID) {
-		return fmt.Errorf("external_project_id must contain 8-128 safe characters")
+	if !validHostingExternalIDForAdmission(payload.ExternalProjectID) {
+		return fmt.Errorf("external_project_id must contain 8-128 safe characters and must not match a credential format")
 	}
 	manifest := &payload.Manifest
 	manifest.Repository.FullName = strings.TrimSpace(manifest.Repository.FullName)

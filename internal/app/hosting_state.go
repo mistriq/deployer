@@ -410,34 +410,74 @@ func recordHostingEvent(ctx context.Context, conn *sql.Conn, projectID, deployme
 	return err
 }
 
-func enqueueTerminalCallback(ctx context.Context, conn *sql.Conn, deploymentID int64, now time.Time) error {
+func enqueueTerminalCallback(ctx context.Context, conn *sql.Conn, deploymentID int64, now time.Time) (resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			resultErr = fmt.Errorf("%w: %v", errHostingCallbackEnqueue, resultErr)
+		}
+	}()
 	deployment, err := getHostingDeploymentByIDOnConn(ctx, conn, deploymentID)
 	if err != nil {
 		return err
 	}
+	eventID, encoded, payloadHash, err := buildHostingTerminalCallback(deployment, now)
+	if err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO callback_outbox
+		(event_id, hosting_deployment_id, payload_json, payload_hash, status, attempts, next_attempt_at, created_at)
+		VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
+		ON CONFLICT(hosting_deployment_id) DO NOTHING`, eventID, deploymentID, string(encoded),
+		payloadHash, formatSQLiteTime(now), formatSQLiteTime(now))
+	return err
+}
+
+func buildHostingTerminalCallback(deployment *HostingDeployment, timestamp time.Time) (string, []byte, string, error) {
 	eventIdentity := sha256.Sum256([]byte(deployment.ExternalDeploymentID + "\x00" + deployment.Status + "\x00" + deployment.Phase))
 	eventID := "evt_" + hex.EncodeToString(eventIdentity[:16])
 	payload := map[string]any{
-		"event_id": eventID, "timestamp": now, "external_project_id": deployment.ExternalProjectID,
+		"event_id": eventID, "timestamp": timestamp, "external_project_id": deployment.ExternalProjectID,
+		"external_deployment_id": deployment.ExternalDeploymentID, "phase": deployment.Phase,
+		"status": deployment.Status, "failure_code": deployment.FailureCode,
+		"artifact_digest": deployment.ArtifactDigest, "release_digest": deployment.ReleaseDigest,
+		"metadata": map[string]string{"failure_message": redactSecrets(deployment.FailureMessage),
+			"previous_release_digest": deployment.PreviousRelease},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", nil, "", err
+	}
+	hash := sha256.Sum256(encoded)
+	return eventID, encoded, "sha256:" + hex.EncodeToString(hash[:]), nil
+}
+
+func buildLegacyHostingTerminalCallback(deployment *HostingDeployment, timestamp time.Time) (string, []byte, string, error) {
+	eventIdentity := sha256.Sum256([]byte(deployment.ExternalDeploymentID + "\x00" + deployment.Status + "\x00" + deployment.Phase))
+	eventID := "evt_" + hex.EncodeToString(eventIdentity[:16])
+	payload := map[string]any{
+		"event_id": eventID, "timestamp": timestamp, "external_project_id": deployment.ExternalProjectID,
 		"external_deployment_id": deployment.ExternalDeploymentID, "phase": deployment.Phase,
 		"status": deployment.Status, "failure_code": deployment.FailureCode,
 		"artifact_digest": deployment.ArtifactDigest, "release_digest": deployment.ReleaseDigest,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return "", nil, "", err
 	}
 	hash := sha256.Sum256(encoded)
-	_, err = conn.ExecContext(ctx, `INSERT INTO callback_outbox
-		(event_id, hosting_deployment_id, payload_json, payload_hash, status, attempts, next_attempt_at, created_at)
-		VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
-		ON CONFLICT(hosting_deployment_id) DO NOTHING`, eventID, deploymentID, string(encoded),
-		"sha256:"+hex.EncodeToString(hash[:]), formatSQLiteTime(now), formatSQLiteTime(now))
-	return err
+	return eventID, encoded, "sha256:" + hex.EncodeToString(hash[:]), nil
 }
 
 func getHostingDeploymentByIDOnConn(ctx context.Context, conn *sql.Conn, id int64) (*HostingDeployment, error) {
 	return scanHostingDeployment(conn.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
+		d.commit_sha, d.manifest_digest, d.artifact_digest, d.status, d.phase, d.failure_code,
+		d.failure_message, d.release_digest, d.previous_release_digest, d.callback_state,
+		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at
+		FROM hosting_deployments d JOIN hosting_projects p ON p.id=d.hosting_project_id WHERE d.id=?`, id))
+}
+
+func getHostingDeploymentByID(ctx context.Context, id int64) (*HostingDeployment, error) {
+	return scanHostingDeployment(db.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
 		d.commit_sha, d.manifest_digest, d.artifact_digest, d.status, d.phase, d.failure_code,
 		d.failure_message, d.release_digest, d.previous_release_digest, d.callback_state,
 		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at
@@ -1091,7 +1131,7 @@ func handleInternalRollback(w http.ResponseWriter, r *http.Request, externalProj
 		return
 	}
 	request.ExternalDeploymentID = strings.TrimSpace(request.ExternalDeploymentID)
-	if !externalIDPattern.MatchString(request.ExternalDeploymentID) {
+	if !validHostingExternalIDSyntax(request.ExternalDeploymentID) {
 		jsonErrorCode(w, errCodeValidation, "external_deployment_id is invalid", http.StatusBadRequest)
 		return
 	}

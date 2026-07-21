@@ -45,12 +45,12 @@ The primary agent owns this checklist and updates it only after implementation a
 
 ## P0 — callbacks and reconciliation
 
-- [ ] Transactional callback outbox with unique event IDs.
-- [ ] HMAC signature, timestamp validation contract and replay protection.
-- [ ] Retry/backoff/dead-letter behavior.
-- [ ] Terminal callback safe to deliver more than once.
-- [ ] Polling endpoint contains enough state to repair a missed callback.
-- [ ] Redact secrets from logs, callbacks, errors and structured events.
+- [x] Transactional callback outbox with unique event IDs.
+- [x] HMAC signature, timestamp validation contract and replay protection.
+- [x] Retry/backoff/dead-letter behavior.
+- [x] Terminal callback safe to deliver more than once.
+- [x] Polling endpoint contains enough state to repair a missed callback.
+- [x] Redact secrets from logs, callbacks, errors and structured events.
 
 ## P1 — runner and capacity
 
@@ -78,10 +78,10 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Idempotency replay and concurrent duplicate tests.
 - [x] Per-project deployment serialization tests.
 - [x] Exact commit/artifact mismatch rejection tests.
-- [ ] Callback signing, retry, replay and polling reconciliation tests.
+- [x] Callback signing, retry, replay and polling reconciliation tests.
 - [x] Health failure preserves active release test.
 - [x] Cancel, rollback, suspend/resume and restart recovery tests.
-- [ ] Forbidden workload and secret-redaction security tests.
+- [x] Forbidden workload and secret-redaction security tests.
 - [x] Full `go test ./...`, `go test -race ./...`, `go vet ./...` and `git diff --check` pass.
 - [ ] `govulncheck ./...` passes when available or blocker is documented.
 - [ ] No open P0/P1 issue and no demo/placeholder production path remains.

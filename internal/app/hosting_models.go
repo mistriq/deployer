@@ -82,6 +82,7 @@ type HostingRelease struct {
 type hostingMigration struct {
 	id         string
 	statements []string
+	migrate    func(context.Context, *sql.Conn) error
 }
 
 func applyHostingMigrations() error {
@@ -572,6 +573,23 @@ func applyHostingMigrations() error {
 				`UPDATE hosting_releases SET runtime_observed_at=NULL, runtime_observed_session_id=''`,
 			},
 		},
+		{
+			id: "041_callback_recovery_and_retention",
+			statements: []string{
+				`ALTER TABLE callback_outbox ADD COLUMN finalized_at DATETIME`,
+				`UPDATE callback_outbox SET finalized_at=delivered_at
+					WHERE status='delivered' AND finalized_at IS NULL`,
+				`UPDATE callback_outbox SET finalized_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+					WHERE status='dead_letter' AND finalized_at IS NULL`,
+				`UPDATE callback_outbox SET status='pending', locked_at=NULL, claim_token_hash=''
+					WHERE status='delivering' AND locked_at IS NULL`,
+				`UPDATE hosting_deployments SET callback_state='dead_letter'
+					WHERE status IN ('active','failed','cancelled') AND callback_state='pending'
+					  AND NOT EXISTS (SELECT 1 FROM callback_outbox callback
+					    WHERE callback.hosting_deployment_id=hosting_deployments.id)`,
+			},
+			migrate: quarantineLegacyUnsafeHostingCallbackIdentities,
+		},
 	}
 
 	for _, migration := range migrations {
@@ -615,6 +633,11 @@ func applyHostingMigration(migration hostingMigration) error {
 			return fmt.Errorf("apply migration %s: %w", migration.id, err)
 		}
 	}
+	if migration.migrate != nil {
+		if err := migration.migrate(ctx, conn); err != nil {
+			return fmt.Errorf("apply migration %s data transform: %w", migration.id, err)
+		}
+	}
 	if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)`, migration.id, formatSQLiteTime(time.Now())); err != nil {
 		return fmt.Errorf("record migration %s: %w", migration.id, err)
 	}
@@ -622,6 +645,52 @@ func applyHostingMigration(migration hostingMigration) error {
 		return fmt.Errorf("commit migration %s: %w", migration.id, err)
 	}
 	committed = true
+	return nil
+}
+
+func quarantineLegacyUnsafeHostingCallbackIdentities(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `SELECT callback.id, callback.hosting_deployment_id,
+		project.external_project_id, deployment.external_deployment_id
+		FROM callback_outbox callback
+		JOIN hosting_deployments deployment ON deployment.id=callback.hosting_deployment_id
+		JOIN hosting_projects project ON project.id=deployment.hosting_project_id
+		WHERE callback.status IN ('pending','delivering') ORDER BY callback.id`)
+	if err != nil {
+		return err
+	}
+	type callbackIdentity struct {
+		id, deploymentID                        int64
+		externalProjectID, externalDeploymentID string
+	}
+	callbacks := make([]callbackIdentity, 0)
+	for rows.Next() {
+		var callback callbackIdentity
+		if err := rows.Scan(&callback.id, &callback.deploymentID, &callback.externalProjectID,
+			&callback.externalDeploymentID); err != nil {
+			rows.Close()
+			return err
+		}
+		callbacks = append(callbacks, callback)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	now := formatSQLiteTime(time.Now().UTC())
+	for _, callback := range callbacks {
+		if validHostingExternalIDForAdmission(callback.externalProjectID) &&
+			validHostingExternalIDForAdmission(callback.externalDeploymentID) {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE callback_outbox SET status='dead_letter',
+			finalized_at=?, locked_at=NULL, claim_token_hash='', last_error_code='callback_identity_invalid'
+			WHERE id=?`, now, callback.id); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE hosting_deployments
+			SET callback_state='dead_letter', updated_at=? WHERE id=?`, now, callback.deploymentID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -657,6 +726,7 @@ func scanHostingDeployment(scanner interface{ Scan(...any) error }) (*HostingDep
 	deployment.FinishedAt = nullableSQLiteTime(finishedAt)
 	deployment.CreatedAt = parseSQLiteTime(createdAt)
 	deployment.UpdatedAt = parseSQLiteTime(updatedAt)
+	deployment.FailureMessage = redactSecrets(deployment.FailureMessage)
 	deployment.LogReference = "/api/internal/v1/deployments/" + deployment.ExternalDeploymentID + "/logs"
 	deployment.EventReference = "/api/internal/v1/deployments/" + deployment.ExternalDeploymentID + "/events"
 	return &deployment, nil
@@ -774,3 +844,4 @@ func isHostingTerminalStatus(status string) bool {
 
 var errHostingStateConflict = errors.New("hosting state conflict")
 var errHostingProxyOperationSuperseded = errors.New("hosting proxy operation superseded")
+var errHostingCallbackEnqueue = errors.New("hosting callback enqueue failed")

@@ -72,7 +72,7 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, `UPDATE callback_outbox SET status='pending', locked_at=NULL, claim_token_hash=''
-		WHERE status='delivering' AND locked_at<?`, formatSQLiteTime(now.Add(-callbackLeaseTimeout))); err != nil {
+		WHERE status='delivering' AND (locked_at IS NULL OR locked_at<?)`, formatSQLiteTime(now.Add(-callbackLeaseTimeout))); err != nil {
 		return err
 	}
 	if err := reconcileExpiredHostingRecoveries(ctx, conn, now); err != nil {

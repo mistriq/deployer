@@ -49,8 +49,21 @@ command execution.
 - Treat short-lived secret references as sensitive metadata even though
   Deployer never stores their plaintext values. Do not place plaintext secrets
   in manifests, idempotency keys, external IDs, audit reasons, or log messages.
+  New hosting external IDs that match the stable forbidden credential pattern
+  are rejected even when their characters otherwise satisfy the identifier
+  grammar. Syntactically valid legacy IDs remain pollable for reconciliation,
+  but their pending callbacks are quarantined as `callback_identity_invalid`
+  and they cannot be used for new admission.
   HTTP request logs omit query strings and redact bounded decoded paths so
   percent-encoded credentials cannot bypass log redaction.
+- Treat the callback outbox as sensitive integrity data. Deployer reconstructs
+  each terminal envelope from authoritative deployment state and verifies its
+  event ID, payload hash, and exact bytes before signing. A mismatch is
+  dead-lettered without a network request. Receivers must verify the HMAC in
+  constant time, enforce the five-minute header timestamp window, require the
+  header and body event IDs to match, and deduplicate before applying state.
+  Redirects are deliberately not followed so signed bodies and headers cannot
+  be forwarded to another origin.
 - Configure `DEPLOYER_HOSTING_WORKLOAD_IDENTITY_SECRET` as an independent key of
   at least 32 random bytes. The secret broker validates issuer, audience,
   lifetime, reference digest, lease identity, and one-time token ID. Rotate with

@@ -125,6 +125,36 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 			t.Errorf("project kill-switch OpenAPI contract is missing %q", value)
 		}
 	}
+	pollSection := hostingContractSection(t, document,
+		"  /api/internal/v1/deployments/{externalDeploymentId}:",
+		"  /api/internal/v1/deployments/{externalDeploymentId}/cancel:")
+	for _, value := range []string{"authoritative when a", "callback_state=dead_letter",
+		"immutable digests", "deployment_not_found", "insufficient_scope"} {
+		if !strings.Contains(pollSection, value) {
+			t.Errorf("deployment polling OpenAPI contract is missing %q", value)
+		}
+	}
+	callbackWebhook := hostingContractSection(t, document, "webhooks:", "components:")
+	for _, value := range []string{"header Unix timestamp", "exact raw body", "refreshing the header",
+		"Any 2xx", "Redirects", "attempt completion", "callback_payload_corrupt",
+		"callback_identity_invalid", "older Deployer version", `"2XX"`} {
+		if !strings.Contains(callbackWebhook, value) {
+			t.Errorf("callback webhook OpenAPI contract is missing %q", value)
+		}
+	}
+	callbackSchema := hostingContractSection(t, document, "    HostingCallback:", "    HostingMetrics:")
+	for _, value := range []string{"additionalProperties: false", "HostingCallbackMetadata",
+		"failure_message", "previous_release_digest", "status: {const: active}",
+		"status: {const: failed}", "status: {const: cancelled}", "Immutable terminal-event time"} {
+		if !strings.Contains(callbackSchema, value) {
+			t.Errorf("HostingCallback schema is missing %q", value)
+		}
+	}
+	for _, value := range []string{"x-new-admission-forbidden-pattern", "legacy stored values remain readable"} {
+		if !strings.Contains(document, value) {
+			t.Errorf("external identifier compatibility contract is missing %q", value)
+		}
+	}
 	globalKillSection := hostingContractSection(t, document,
 		"  /api/internal/v1/settings/kill-switch:",
 		"  /api/hosting-agent/v1/heartbeat:")
@@ -235,9 +265,31 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"loss terminates with `runner_lost`",
 		"pending activation is freshly revalidated",
 		"ambiguous adapter `503` remains durable",
+		"header Unix timestamp", "retry preserves the event ID and exact raw",
+		"redirects are not followed", "immutable event enqueued by an older",
 	} {
 		if !strings.Contains(string(readmeContent), value) {
 			t.Errorf("README is missing hosting contract %q", value)
+		}
+	}
+	securityContent, err := os.ReadFile(filepath.Join("..", "..", "SECURITY.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"Redirects are deliberately not followed", "callback_identity_invalid",
+		"Syntactically valid legacy IDs remain pollable"} {
+		if !strings.Contains(string(securityContent), value) {
+			t.Errorf("SECURITY is missing callback contract %q", value)
+		}
+	}
+	runbookContent, err := os.ReadFile(filepath.Join("..", "..", "docs", "HOSTING_RUNBOOK.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"polling-only `dead_letter`", "exact legacy body",
+		"after delivery or dead-letter"} {
+		if !strings.Contains(string(runbookContent), value) {
+			t.Errorf("hosting runbook is missing callback contract %q", value)
 		}
 	}
 	brokerContract, err := os.ReadFile(filepath.Join("..", "..", "docs", "source-broker-openapi.yaml"))

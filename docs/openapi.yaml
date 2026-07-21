@@ -1394,7 +1394,12 @@ paths:
     get:
       tags: [internal]
       summary: Poll authoritative deployment state
-      description: Requires deployments:read.
+      description: >
+        Requires deployments:read. This response is authoritative when a
+        terminal callback is late, duplicated, rejected, retained out of the
+        outbox, or has callback_state=dead_letter. Human failure_message is
+        redacted and non-authoritative; branch on status, phase, failure_code,
+        immutable digests, and callback_state.
       operationId: getInternalDeployment
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1405,11 +1410,21 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDeployment"}
-        "404": {$ref: "#/components/responses/Error"}
-        "401": {$ref: "#/components/responses/Error"}
-        "403": {$ref: "#/components/responses/Error"}
-        "405": {$ref: "#/components/responses/Error"}
-        "500": {$ref: "#/components/responses/Error"}
+        "401":
+          description: Missing or invalid service token; code is service_token_required or invalid_service_token.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+        "403":
+          description: Authenticated token lacks deployments:read; code is insufficient_scope.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+        "404":
+          description: Deployment identity does not exist; code is deployment_not_found.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+        "405":
+          description: Method is not GET; code is method_not_allowed.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+        "500":
+          description: Authoritative state could not be read; code is internal_error.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
 
   /api/internal/v1/deployments/{externalDeploymentId}/cancel:
     post:
@@ -2216,12 +2231,22 @@ webhooks:
       tags: [internal]
       summary: Signed at-least-once terminal hosting callback
       description: >
-        Deployer signs "<timestamp>.<event_id>.<raw body>" with HMAC-SHA256.
-        Receivers MUST reject timestamps outside a five-minute window, compare
-        signatures in constant time, and deduplicate X-Deployer-Event-ID. A 2xx
-        response acknowledges delivery. Non-2xx and network failures retry with
-        bounded exponential backoff and may reach dead_letter. Poll the deployment
-        endpoint to reconcile any missed callback.
+        Deployer signs "<header Unix timestamp>.<event_id>.<raw body>" with
+        HMAC-SHA256. The header event ID equals body event_id. Receivers MUST
+        reject header timestamps outside a five-minute window, compare signatures
+        in constant time, and deduplicate X-Deployer-Event-ID before applying
+        state. Retries keep the event ID and exact raw body (including its immutable
+        RFC3339 terminal-event timestamp) unchanged while refreshing the header
+        timestamp and signature. Any 2xx response acknowledges delivery. Redirects
+        are never followed; 3xx, other non-2xx, timeout, and network failures retry
+        with bounded exponential backoff measured from attempt completion and may
+        reach dead_letter. A corrupt durable envelope is never signed or sent and
+        immediately enters dead_letter with stable internal code
+        callback_payload_corrupt. A legacy secret-shaped identifier is likewise
+        quarantined with callback_identity_invalid. Poll the deployment endpoint
+        to reconcile any missed callback. Metadata is present on newly enqueued
+        events but may be absent when retrying an immutable envelope created by
+        an older Deployer version.
       parameters:
         - name: X-Deployer-Timestamp
           in: header
@@ -2241,7 +2266,7 @@ webhooks:
           application/json:
             schema: {$ref: "#/components/schemas/HostingCallback"}
       responses:
-        "204": {description: Callback accepted or already processed.}
+        "2XX": {description: Callback accepted or already processed.}
 
 components:
   securitySchemes:
@@ -2320,20 +2345,32 @@ components:
       name: externalProjectId
       in: path
       required: true
+      description: >
+        New identifiers must not match the stable forbidden credential pattern.
+        Syntactically valid identifiers stored by an older version remain
+        readable for reconciliation but cannot be used for new admission or
+        callback delivery.
       schema:
         type: string
         minLength: 8
         maxLength: 128
         pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+        x-new-admission-forbidden-pattern: '(?:(?:dpl_|htr_|wli_|ghp_|gho_|ghu_|ghs_|github_pat_|sk_live_|xox[baprs]-)[A-Za-z0-9_.-]{8,}|AKIA[A-Z0-9]{16})'
     ExternalDeploymentId:
       name: externalDeploymentId
       in: path
       required: true
+      description: >
+        New identifiers must not match the stable forbidden credential pattern.
+        Syntactically valid identifiers stored by an older version remain
+        readable for reconciliation but cannot be used for new admission or
+        callback delivery.
       schema:
         type: string
         minLength: 8
         maxLength: 128
         pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+        x-new-admission-forbidden-pattern: '(?:(?:dpl_|htr_|wli_|ghp_|gho_|ghu_|ghs_|github_pat_|sk_live_|xox[baprs]-)[A-Za-z0-9_.-]{8,}|AKIA[A-Z0-9]{16})'
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -2687,12 +2724,16 @@ components:
       minLength: 8
       maxLength: 128
       pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+      description: New values must not match the stable forbidden credential pattern; legacy stored values remain readable only for reconciliation.
+      x-new-admission-forbidden-pattern: '(?:(?:dpl_|htr_|wli_|ghp_|gho_|ghu_|ghs_|github_pat_|sk_live_|xox[baprs]-)[A-Za-z0-9_.-]{8,}|AKIA[A-Z0-9]{16})'
 
     ExternalDeploymentId:
       type: string
       minLength: 8
       maxLength: 128
       pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+      description: New values must not match the stable forbidden credential pattern; legacy stored values remain readable only for reconciliation.
+      x-new-admission-forbidden-pattern: '(?:(?:dpl_|htr_|wli_|ghp_|gho_|ghu_|ghs_|github_pat_|sk_live_|xox[baprs]-)[A-Za-z0-9_.-]{8,}|AKIA[A-Z0-9]{16})'
 
     HostingWorkloadLimits:
       type: object
@@ -3275,13 +3316,22 @@ components:
 
     HostingCallback:
       type: object
+      additionalProperties: false
       required: [event_id, timestamp, external_project_id, external_deployment_id, phase, status, failure_code, artifact_digest, release_digest]
+      allOf:
+        - oneOf:
+            - properties: {status: {const: active}, phase: {const: active}}
+            - properties: {status: {const: failed}, phase: {const: failed}}
+            - properties: {status: {const: cancelled}, phase: {const: cancelled}}
       properties:
         event_id: {type: string, pattern: '^evt_[a-f0-9]{32}$'}
-        timestamp: {type: string, format: date-time}
+        timestamp:
+          type: string
+          format: date-time
+          description: Immutable terminal-event time in the signed raw body; this is not the fresh Unix replay-window header timestamp.
         external_project_id: {$ref: "#/components/schemas/ExternalProjectId"}
         external_deployment_id: {$ref: "#/components/schemas/ExternalDeploymentId"}
-        phase: {type: string}
+        phase: {type: string, enum: [active, failed, cancelled]}
         status: {type: string, enum: [active, failed, cancelled]}
         failure_code:
           oneOf:
@@ -3289,6 +3339,19 @@ components:
             - {type: string, const: ''}
         artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
         release_digest:
+          oneOf:
+            - {$ref: "#/components/schemas/SHA256Digest"}
+            - {type: string, const: ''}
+        metadata: {$ref: "#/components/schemas/HostingCallbackMetadata"}
+
+    HostingCallbackMetadata:
+      type: object
+      additionalProperties: false
+      required: [failure_message, previous_release_digest]
+      description: Allowlisted and redacted non-authoritative metadata; clients branch only on stable structured fields.
+      properties:
+        failure_message: {type: string, description: Redacted human diagnostic; never parse for state.}
+        previous_release_digest:
           oneOf:
             - {$ref: "#/components/schemas/SHA256Digest"}
             - {type: string, const: ''}

@@ -106,8 +106,8 @@ func validateHostingDeploymentRequestShape(request *hostingDeploymentCreateReque
 	request.ArtifactDigest = strings.ToLower(strings.TrimSpace(request.ArtifactDigest))
 	request.SourceReference.Provider = strings.TrimSpace(request.SourceReference.Provider)
 	request.SourceReference.Reference = strings.TrimSpace(request.SourceReference.Reference)
-	if !externalIDPattern.MatchString(request.ExternalDeploymentID) {
-		return fmt.Errorf("external_deployment_id must contain 8-128 safe characters")
+	if !validHostingExternalIDForAdmission(request.ExternalDeploymentID) {
+		return fmt.Errorf("external_deployment_id must contain 8-128 safe characters and must not match a credential format")
 	}
 	if len(request.CommitSHA) != 40 || !isLowerHex(request.CommitSHA) {
 		return fmt.Errorf("commit_sha must be a full 40-character lowercase hexadecimal SHA")
@@ -241,7 +241,7 @@ func createHostingDeployment(ctx context.Context, token *ServiceToken, externalP
 	if !validIdempotencyKey(idempotencyKey) {
 		return nil, &hostingAPIError{Code: errCodeInvalidIdempotencyKey, Message: "Idempotency-Key must contain 8-128 safe characters", StatusCode: 400}
 	}
-	if !externalIDPattern.MatchString(externalProjectID) {
+	if !validHostingExternalIDForAdmission(externalProjectID) {
 		return nil, &hostingAPIError{Code: errCodeProjectNotFound, Message: "project not found", StatusCode: 404}
 	}
 	request.SecretReferences = append([]HostingSecretReference(nil), request.SecretReferences...)

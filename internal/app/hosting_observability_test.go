@@ -58,10 +58,45 @@ func TestCleanupHostingRecordsAppliesConfiguredRetention(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO hosting_audit_events (issuer_token_id, hosting_project_id, event_type, reason, created_at) VALUES (?, ?, 'test', 'old', ?)`, token.ID, project.ID, old); err != nil {
 		t.Fatal(err)
 	}
+	now := time.Now().UTC()
+	insertCallback := func(externalID, status string, finalizedAt any) int64 {
+		t.Helper()
+		result, err := db.Exec(`INSERT INTO hosting_deployments
+			(hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest,
+			 status, phase, callback_state, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'cancelled', 'cancelled', ?, ?, ?)`, project.ID, externalID,
+			strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64),
+			status, old, old)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deploymentID, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		lockedAt := any(nil)
+		if status == "delivering" {
+			lockedAt = old
+		}
+		eventRune := string(externalID[len(externalID)-1])
+		if _, err := db.Exec(`INSERT INTO callback_outbox
+			(event_id, hosting_deployment_id, payload_json, payload_hash, status, attempts,
+			 next_attempt_at, created_at, finalized_at, locked_at)
+			VALUES (?, ?, '{}', ?, ?, 1, ?, ?, ?, ?)`, "evt_"+strings.Repeat(eventRune, 32),
+			deploymentID, "sha256:"+strings.Repeat("c", 64), status, old, old, finalizedAt, lockedAt); err != nil {
+			t.Fatal(err)
+		}
+		return deploymentID
+	}
+	insertCallback("deployment_01JRETAINP", "pending", nil)
+	insertCallback("deployment_01JRETAIND", "delivering", nil)
+	insertCallback("deployment_01JRETAINR", "delivered", formatSQLiteTime(now))
+	oldDeliveredID := insertCallback("deployment_01JRETAINO", "delivered", old)
+	insertCallback("deployment_01JRETAINX", "dead_letter", old)
 	if err := cleanupHostingRecords(t.Context(), AppConfig{
 		HostingLogRetentionDays: 1, HostingEventRetentionDays: 1, HostingReleaseRetentionDays: 1,
 		HostingCallbackRetentionDays: 1, HostingAuditRetentionDays: 1,
-	}, time.Now().UTC()); err != nil {
+	}, now); err != nil {
 		t.Fatal(err)
 	}
 	for _, table := range []string{"hosting_logs", "hosting_events"} {
@@ -77,6 +112,22 @@ func TestCleanupHostingRecordsAppliesConfiguredRetention(t *testing.T) {
 	var jobs int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_jobs`).Scan(&jobs); err != nil || jobs != 1 {
 		t.Fatalf("active hosting job was removed: count=%d err=%v", jobs, err)
+	}
+	var retainedCallbacks, removedCallbacks int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM callback_outbox
+		WHERE status IN ('pending','delivering','delivered')`).Scan(&retainedCallbacks); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM callback_outbox
+		WHERE hosting_deployment_id=? OR status='dead_letter'`, oldDeliveredID).Scan(&removedCallbacks); err != nil {
+		t.Fatal(err)
+	}
+	if retainedCallbacks != 3 || removedCallbacks != 0 {
+		t.Fatalf("retained callbacks=%d removed callbacks still present=%d", retainedCallbacks, removedCallbacks)
+	}
+	pollState, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JRETAINO")
+	if err != nil || pollState.Status != hostingStatusCancelled || pollState.CallbackState != "delivered" {
+		t.Fatalf("poll state after callback retention=%+v err=%v", pollState, err)
 	}
 }
 

@@ -1107,8 +1107,8 @@ func parseHostingPublishedRuntimeEndpoint(ports string) (string, error) {
 
 func validLegacyHostingRuntime(runtime hostingObservedRuntime) bool {
 	if runtime.RuntimeInstanceID != "" || !validSHA256Digest(runtime.ReleaseDigest) ||
-		!externalIDPattern.MatchString(runtime.ExternalProjectID) ||
-		!externalIDPattern.MatchString(runtime.ExternalDeploymentID) {
+		!validHostingExternalIDSyntax(runtime.ExternalProjectID) ||
+		!validHostingExternalIDSyntax(runtime.ExternalDeploymentID) {
 		return false
 	}
 	switch runtime.State {
@@ -1190,7 +1190,7 @@ func reconcileHostingAgentReleases(ctx context.Context, config hostingAgentConfi
 	retainedSet := make(map[string]struct{}, len(retained))
 	legacyRetainedSet := make(map[string]struct{})
 	for _, release := range retained {
-		if !validSHA256Digest(release.ReleaseDigest) || !externalIDPattern.MatchString(release.ExternalProjectID) || !externalIDPattern.MatchString(release.ExternalDeploymentID) {
+		if !validSHA256Digest(release.ReleaseDigest) || !validHostingExternalIDSyntax(release.ExternalProjectID) || !validHostingExternalIDSyntax(release.ExternalDeploymentID) {
 			return fmt.Errorf("control plane returned invalid retained release identity")
 		}
 		base := release.ExternalProjectID + "\x00" + release.ExternalDeploymentID + "\x00" + release.ReleaseDigest

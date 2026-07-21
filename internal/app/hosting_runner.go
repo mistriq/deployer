@@ -716,8 +716,8 @@ func validateHostingRuntimeInventory(inventory []hostingObservedRuntime) error {
 	}
 	seen := make(map[string]struct{}, len(inventory))
 	for _, runtime := range inventory {
-		if !validSHA256Digest(runtime.ReleaseDigest) || !externalIDPattern.MatchString(runtime.ExternalProjectID) ||
-			!externalIDPattern.MatchString(runtime.ExternalDeploymentID) ||
+		if !validSHA256Digest(runtime.ReleaseDigest) || !validHostingExternalIDSyntax(runtime.ExternalProjectID) ||
+			!validHostingExternalIDSyntax(runtime.ExternalDeploymentID) ||
 			(runtime.RuntimeInstanceID != "" && !hostingSecretInstancePattern.MatchString(runtime.RuntimeInstanceID)) {
 			return fmt.Errorf("runtime_inventory contains an invalid runtime identity")
 		}
