@@ -644,8 +644,11 @@ func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingP
 		free_cpu_millis=free_cpu_millis-?, free_ram_bytes=free_ram_bytes-?,
 		free_disk_bytes=free_disk_bytes-?, free_pids=free_pids-?
 		WHERE id=? AND status='online' AND draining=0 AND active_session_id<>''
+		  AND EXISTS (SELECT 1 FROM json_each(manifest_versions_json) WHERE value=?)
+		  AND EXISTS (SELECT 1 FROM json_each(runtime_versions_json) WHERE value=?)
 		  AND EXISTS (SELECT 1 FROM json_each(operation_capabilities_json)
 		    WHERE value=?)
+		  AND (? = 0 OR EXISTS (SELECT 1 FROM json_each(operation_capabilities_json) WHERE value=?))
 		  AND free_cpu_millis-reserve_cpu_millis>=?
 		  AND free_ram_bytes-reserve_ram_bytes>=?
 		  AND free_disk_bytes-reserve_disk_bytes>=?
@@ -656,7 +659,8 @@ func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingP
 		          WHERE job.hosting_runner_id=hosting_runners.id AND job.status IN ('queued','leased','running'))
 		     + (SELECT COUNT(*) FROM hosting_runtime_recoveries recovery
 		          WHERE recovery.hosting_runner_id=hosting_runners.id AND recovery.status IN ('queued','leased','running'))) < ?`,
-		limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs, selected, hostingRunnerInventoryOperation, limits.CPUMillis,
+		limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs, selected, project.Manifest.SchemaVersion,
+		project.Manifest.Runtime.NodeVersion, operation, boolToInt(requireSecrets), hostingRunnerSecretOperation, limits.CPUMillis,
 		limits.RAMBytes, limits.DiskBytes, limits.PIDs, hostingRuntimeInventorySchedulingLimit)
 	if err != nil {
 		return 0, err
@@ -682,6 +686,13 @@ func jsonStringListContains(encoded, wanted string) bool {
 		}
 	}
 	return false
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func isSQLiteUniqueConstraint(err error) bool {

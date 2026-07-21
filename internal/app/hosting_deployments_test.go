@@ -696,6 +696,44 @@ func TestHostingDeploymentRefusesCapacityWithoutPartialState(t *testing.T) {
 	}
 }
 
+func TestHostingDeploymentRefusesPlacementBelowRunnerReserve(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JRESERVE")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	result, err := db.Exec(`INSERT INTO hosting_runners
+		(name, token_hash, labels_json, protocol_version, manifest_versions_json, runtime_versions_json, operation_capabilities_json,
+		 capacity_cpu_millis, capacity_ram_bytes, capacity_disk_bytes, capacity_pids,
+		 free_cpu_millis, free_ram_bytes, free_disk_bytes, free_pids,
+		 reported_free_cpu_millis, reported_free_ram_bytes, reported_free_disk_bytes, reported_free_pids,
+		 reserve_cpu_millis, reserve_ram_bytes, reserve_disk_bytes, reserve_pids,
+		 active_session_id, last_heartbeat_sequence, status, last_seen, created_at)
+		VALUES (?, ?, '["linux"]', 'v1', '["v1"]', '["22"]', '["build","runtime-inventory-v1"]',
+		 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'online', ?, ?)`,
+		"reserve-floor", hashToken("reserve-floor-token"), limits.CPUMillis*2, limits.RAMBytes*2, limits.DiskBytes*2, limits.PIDs*2,
+		limits.CPUMillis+limits.CPUMillis/2-1, limits.RAMBytes+limits.RAMBytes/2-1, limits.DiskBytes+limits.DiskBytes/2-1, limits.PIDs+limits.PIDs/2-1,
+		limits.CPUMillis+limits.CPUMillis/2-1, limits.RAMBytes+limits.RAMBytes/2-1, limits.DiskBytes+limits.DiskBytes/2-1, limits.PIDs+limits.PIDs/2-1,
+		limits.CPUMillis/2, limits.RAMBytes/2, limits.DiskBytes/2, limits.PIDs/2,
+		strings.Repeat("a", 48), formatSQLiteTime(time.Now().UTC()), formatSQLiteTime(time.Now().UTC()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validHostingDeploymentRequest("deployment_01JRESERVE")
+	request.ManifestDigest = project.ManifestDigest
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "idem_01JRESERVE", request); err == nil {
+		t.Fatal("placement below reserve was accepted")
+	}
+	var jobs int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_jobs WHERE hosting_runner_id=?`, runnerID).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	} else if jobs != 0 {
+		t.Fatalf("job was created after reserve refusal: %d", jobs)
+	}
+}
+
 func TestHostingDeploymentValidatesSecretNamesAndDuplicates(t *testing.T) {
 	base := validHostingDeploymentRequest("deployment_01JSECNAMES")
 	base.SecretReferences = []HostingSecretReference{{
