@@ -67,7 +67,7 @@ The primary agent owns this checklist and updates it only after implementation a
 
 - [x] Deployment event timeline with phase durations and stable failure codes.
 - [x] Metrics for queue age, success rate, duration, capacity and callback lag.
-- [ ] Service token, DB backup/restore, stale job and runner-loss runbooks.
+- [x] Service token, DB backup/restore, stale job and runner-loss runbooks.
 - [ ] Retention and cleanup for artifacts, releases, logs and callback records.
 - [ ] Update README, SECURITY, CHANGELOG and OpenAPI.
 

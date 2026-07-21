@@ -335,7 +335,16 @@ identity after the incident is resolved.
 ## Database backup and restore
 
 SQLite uses WAL mode. Never copy only a live `.db` file while ignoring its WAL.
-Use SQLite online backup tooling, or stop Deployer and copy the database:
+Use SQLite online backup tooling, or stop Deployer and copy the database. For
+an online backup, run this under the account that owns the database and write
+the result to a protected destination on separate storage:
+
+```bash
+sqlite3 /var/lib/deployer/deployer.db ".backup '/var/backups/deployer-YYYYMMDD.db'"
+sqlite3 /var/backups/deployer-YYYYMMDD.db 'PRAGMA integrity_check;'
+```
+
+If SQLite tooling is unavailable, stop Deployer before copying the database:
 
 ```bash
 systemctl stop deployer
@@ -359,6 +368,35 @@ For restore:
 Do not manually mark a release active. Adapter activation and the database
 state transition are intentionally coupled through idempotent operation IDs and
 health evidence.
+
+## Service identity, stale-job, and runner-loss verification
+
+Use the control plane's protected credential store for all authenticated checks;
+never paste a `dpl_` token into shell history, URLs, logs, or tickets.
+
+1. After a service-token rotation, perform the runbook's uncached generation
+   read and an authenticated `GET /api/internal/v1/capabilities` from the
+   control plane. Confirm the new token's `authenticated` audit record before
+   releasing the rotation lock. Revoke the overlapping predecessor only after
+   this check succeeds.
+2. During a queue incident, inspect `GET /api/internal/v1/metrics` and
+   `GET /api/internal/v1/runners`. Compare `queued_jobs`,
+   `oldest_age_seconds`, online free/reserve capacity, `failure_codes`, and
+   `oldest_lag_seconds`; use a deployment's structured events and stable
+   `failure_code`, never log text, to decide the next action.
+3. Do not edit `hosting_jobs`, `hosting_deployments`, lease tokens, or runner
+   capacity directly. Expired leases are fenced and reconciliation either
+   requeues the job onto a compatible runner or terminals it with the stable
+   `runner_lost` code after the bounded retry policy. Restart Deployer to resume
+   reconciliation only after restoring its database/artifact volume; no
+   customer action is required to repair a stale lease.
+4. For runner loss, preserve the runner work root and managed artifacts, bring
+   up a replacement with the same dedicated credential only after the failed
+   process is stopped, then observe its fenced heartbeat and inventory session.
+   For an intentional replacement retain the same work root; for a permanently
+   lost host use a new runner and let durable recovery place each immutable
+   release. Verify recovery through polling, private health evidence, and the
+   proxy route revision before declaring the incident resolved.
 
 ## Retention
 

@@ -311,3 +311,26 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestHostingRunbookCoversServiceIdentityBackupAndRunnerRecovery(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "docs", "HOSTING_RUNBOOK.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := string(content)
+	for _, required := range []string{
+		"## Service identities and rotation",
+		"credential_generation",
+		"sqlite3 /var/lib/deployer/deployer.db \".backup",
+		"PRAGMA integrity_check",
+		"## Service identity, stale-job, and runner-loss verification",
+		"never paste a `dpl_` token",
+		"Do not edit `hosting_jobs`",
+		"`runner_lost` code",
+		"fenced heartbeat and inventory session",
+	} {
+		if !strings.Contains(document, required) {
+			t.Errorf("hosting runbook is missing %q", required)
+		}
+	}
+}
