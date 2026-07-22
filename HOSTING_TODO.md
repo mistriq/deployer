@@ -83,6 +83,6 @@ The primary agent owns this checklist and updates it only after implementation a
 - [x] Cancel, rollback, suspend/resume and restart recovery tests.
 - [x] Forbidden workload and secret-redaction security tests.
 - [x] Full `go test ./...`, `go test -race ./...`, `go vet ./...` and `git diff --check` pass.
-- [ ] `govulncheck ./...` passes when available or blocker is documented.
+- [x] `govulncheck ./...` passes when available or blocker is documented.
 - [ ] No open P0/P1 issue and no demo/placeholder production path remains.
 - [ ] Real staging static + Node deployment, proxy activation and rollback pass; test fake alone is insufficient.
