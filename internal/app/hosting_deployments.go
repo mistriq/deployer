@@ -590,6 +590,7 @@ type hostingRunnerQuerier interface {
 
 func selectCompatibleHostingRunner(ctx context.Context, querier hostingRunnerQuerier, manifest HostingProjectManifest, limits hostingWorkloadLimits, operation string, requireSecrets bool, excludedRunnerID int64) (int64, error) {
 	cutoff := formatSQLiteTime(time.Now().UTC().Add(-hostingRunnerStaleAfter))
+	requireNode := hostingRuntimeRequiresNode(manifest.Runtime)
 	rows, err := querier.QueryContext(ctx, `SELECT id, manifest_versions_json, runtime_versions_json, operation_capabilities_json
 		FROM hosting_runners
 		WHERE execution_class='hosting' AND status='online' AND draining=0 AND last_seen>=? AND id<>?
@@ -618,7 +619,7 @@ func selectCompatibleHostingRunner(ctx context.Context, querier hostingRunnerQue
 			return 0, err
 		}
 		if jsonStringListContains(manifestsJSON, manifest.SchemaVersion) &&
-			jsonStringListContains(runtimesJSON, manifest.Runtime.NodeVersion) &&
+			(!requireNode || jsonStringListContains(runtimesJSON, manifest.Runtime.NodeVersion)) &&
 			jsonStringListContains(operationsJSON, operation) &&
 			jsonStringListContains(operationsJSON, hostingRunnerInventoryOperation) &&
 			(!requireSecrets || jsonStringListContains(operationsJSON, hostingRunnerSecretOperation)) {
@@ -645,7 +646,7 @@ func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingP
 		free_disk_bytes=free_disk_bytes-?, free_pids=free_pids-?
 		WHERE id=? AND status='online' AND draining=0 AND active_session_id<>''
 		  AND EXISTS (SELECT 1 FROM json_each(manifest_versions_json) WHERE value=?)
-		  AND EXISTS (SELECT 1 FROM json_each(runtime_versions_json) WHERE value=?)
+		  AND (? = 0 OR EXISTS (SELECT 1 FROM json_each(runtime_versions_json) WHERE value=?))
 		  AND EXISTS (SELECT 1 FROM json_each(operation_capabilities_json)
 		    WHERE value=?)
 		  AND (? = 0 OR EXISTS (SELECT 1 FROM json_each(operation_capabilities_json) WHERE value=?))
@@ -660,7 +661,8 @@ func reserveHostingRunner(ctx context.Context, conn *sql.Conn, project *hostingP
 		     + (SELECT COUNT(*) FROM hosting_runtime_recoveries recovery
 		          WHERE recovery.hosting_runner_id=hosting_runners.id AND recovery.status IN ('queued','leased','running'))) < ?`,
 		limits.CPUMillis, limits.RAMBytes, limits.DiskBytes, limits.PIDs, selected, project.Manifest.SchemaVersion,
-		project.Manifest.Runtime.NodeVersion, operation, boolToInt(requireSecrets), hostingRunnerSecretOperation, limits.CPUMillis,
+		boolToInt(hostingRuntimeRequiresNode(project.Manifest.Runtime)), project.Manifest.Runtime.NodeVersion,
+		operation, boolToInt(requireSecrets), hostingRunnerSecretOperation, limits.CPUMillis,
 		limits.RAMBytes, limits.DiskBytes, limits.PIDs, hostingRuntimeInventorySchedulingLimit)
 	if err != nil {
 		return 0, err

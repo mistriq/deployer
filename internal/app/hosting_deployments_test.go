@@ -161,6 +161,50 @@ func TestInternalDeploymentCreationIsHostingOnlyAndPayloadIdempotent(t *testing.
 	}
 }
 
+func TestNoBuildStaticDeploymentSelectsReservesAndClaimsRunner(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	oldPreparer := prepareHostingSource
+	prepareHostingSource = func(context.Context, *HostingProject, HostingSourceReference, string, string) (string, string, error) {
+		return "/managed/no-build-source.tar", "sha256:" + strings.Repeat("c", 64), nil
+	}
+	t.Cleanup(func() { prepareHostingSource = oldPreparer })
+	manifest := validHostingManifest("static")
+	manifest.Runtime = HostingRuntimeManifest{Kind: "static", OutputDirectory: "."}
+	project, _, _, err := upsertHostingProject(t.Context(), "project_01JNOBUILD", manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := createServiceToken("no-build-deployment-writer", []string{serviceScopeDeploymentsRead, serviceScopeDeploymentsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits, err := hostingLimitsForProfile(project.ResourceProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerID := insertHostingRunnerForTest(t, "no-build-runner", limits)
+	request := validHostingDeploymentRequest("deployment_01JNOBUILD")
+	request.ManifestDigest = project.ManifestDigest
+	if _, err := createHostingDeployment(t.Context(), token, project.ExternalProjectID, "create_01JNOBUILD", request); err != nil {
+		t.Fatalf("create no-build static deployment: %v", err)
+	}
+	job, err := claimHostingJob(t.Context(), runnerID)
+	if err != nil {
+		t.Fatalf("claim no-build static deployment: %v", err)
+	}
+	if job.Recipe.Runtime != manifest.Runtime || hostingRuntimeRequiresNode(job.Recipe.Runtime) {
+		t.Fatalf("claimed recipe changed no-build runtime: %+v", job.Recipe.Runtime)
+	}
+	var freeCPU int64
+	if err := db.QueryRow(`SELECT free_cpu_millis FROM hosting_runners WHERE id=?`, runnerID).Scan(&freeCPU); err != nil {
+		t.Fatal(err)
+	}
+	if freeCPU != 0 {
+		t.Fatalf("no-build deployment did not reserve runner capacity: %d", freeCPU)
+	}
+}
+
 func TestInternalDeploymentRejectsExecutionEscapeFieldsAndBadRequestEnvelopes(t *testing.T) {
 	withTempDB(t)
 	project, token := provisionDeploymentTestProject(t, "project_01JINPUTBOUND")

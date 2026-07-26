@@ -323,8 +323,10 @@ func TestHostingManifestValidationRejectsUnsupportedOrUnsafeFields(t *testing.T)
 		"output noncanonical": func(payload *hostingProjectUpsertRequest) {
 			payload.Manifest.Runtime.OutputDirectory = "dist/../public"
 		},
-		"repository as output": func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.OutputDirectory = "." },
-		"unsafe script":        func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.BuildScript = "build && env" },
+		"reserved output": func(payload *hostingProjectUpsertRequest) {
+			payload.Manifest.Runtime.OutputDirectory = ".deployer/site"
+		},
+		"unsafe script": func(payload *hostingProjectUpsertRequest) { payload.Manifest.Runtime.BuildScript = "build && env" },
 		"unsafe health": func(payload *hostingProjectUpsertRequest) {
 			payload.Manifest = validHostingManifest("node")
 			payload.Manifest.Runtime.HealthPath = "//metadata.internal"
@@ -347,6 +349,69 @@ func TestHostingManifestValidationRejectsUnsupportedOrUnsafeFields(t *testing.T)
 				t.Fatal("expected manifest to be rejected")
 			}
 		})
+	}
+}
+
+func TestHostingManifestValidationAcceptsNoBuildStatic(t *testing.T) {
+	for _, runtime := range []HostingRuntimeManifest{
+		{Kind: "static", OutputDirectory: "."},
+		{Kind: "static", OutputDirectory: "public/assets"},
+		{Kind: "static", NodeVersion: "20", OutputDirectory: "site"},
+	} {
+		t.Run(runtime.OutputDirectory+runtime.NodeVersion, func(t *testing.T) {
+			manifest := validHostingManifest("static")
+			manifest.Runtime = runtime
+			payload := hostingProjectUpsertRequest{ExternalProjectID: "project_01JNOBUILD", Manifest: manifest}
+			if err := validateHostingProjectRequest(&payload); err != nil {
+				t.Fatalf("valid no-build static manifest rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestHostingManifestValidationRejectsMalformedNoBuildStatic(t *testing.T) {
+	tests := map[string]HostingRuntimeManifest{
+		"package without build": {Kind: "static", NodeVersion: "22", PackageManager: "npm", OutputDirectory: "."},
+		"build without package": {Kind: "static", NodeVersion: "22", BuildScript: "build", OutputDirectory: "."},
+		"build without node":    {Kind: "static", PackageManager: "npm", BuildScript: "build", OutputDirectory: "."},
+		"invalid package":       {Kind: "static", NodeVersion: "22", PackageManager: "bun", BuildScript: "build", OutputDirectory: "."},
+		"invalid optional node": {Kind: "static", NodeVersion: "latest", OutputDirectory: "."},
+		"start script":          {Kind: "static", OutputDirectory: ".", StartScript: "start"},
+		"port":                  {Kind: "static", OutputDirectory: ".", Port: 8080},
+		"health path":           {Kind: "static", OutputDirectory: ".", HealthPath: "/health"},
+	}
+	for name, runtime := range tests {
+		t.Run(name, func(t *testing.T) {
+			manifest := validHostingManifest("static")
+			manifest.Runtime = runtime
+			payload := hostingProjectUpsertRequest{ExternalProjectID: "project_01JNOBUILD", Manifest: manifest}
+			if err := validateHostingProjectRequest(&payload); err == nil {
+				t.Fatal("malformed no-build static manifest was accepted")
+			}
+		})
+	}
+}
+
+func TestInternalProjectProvisionAcceptsExactNoBuildStaticWireShape(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	token, err := createServiceToken("no-build-project-writer", []string{serviceScopeProjectsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"manifest":{"schema_version":"v1","repository":{"installation_id":1001,"repository_id":2002,"full_name":"socials-century/plain-site"},"runtime":{"kind":"static","output_directory":"."},"resource_profile":"starter"}}`)
+	request := signedRawManifestRequest(t, token.Token, "project_01JNOBUILD", body, time.Now())
+	recorder := httptest.NewRecorder()
+	serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI)).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("provision no-build static = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response internalProjectResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Manifest.Runtime != (HostingRuntimeManifest{Kind: "static", OutputDirectory: "."}) {
+		t.Fatalf("unexpected canonical runtime: %+v", response.Manifest.Runtime)
 	}
 }
 
@@ -406,6 +471,33 @@ func TestHostingManifestDigestUsesValidatedCanonicalValues(t *testing.T) {
 	}
 	if project.ManifestDigest != expectedDigest || project.Manifest != canonical {
 		t.Fatalf("canonical manifest mismatch: digest=%q want=%q manifest=%+v", project.ManifestDigest, expectedDigest, project.Manifest)
+	}
+}
+
+func TestNoBuildStaticManifestDigestOmitsBuildFields(t *testing.T) {
+	manifest := validHostingManifest("static")
+	manifest.Runtime = HostingRuntimeManifest{Kind: "static", OutputDirectory: "."}
+	encoded, firstDigest, err := manifestJSONAndDigest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, absent := range []string{"node_version", "package_manager", "build_script"} {
+		if strings.Contains(encoded, `"`+absent+`"`) {
+			t.Fatalf("canonical no-build manifest contains absent field %q: %s", absent, encoded)
+		}
+	}
+	_, secondDigest, err := manifestJSONAndDigest(manifest)
+	if err != nil || secondDigest != firstDigest {
+		t.Fatalf("no-build manifest digest is not deterministic: first=%q second=%q err=%v", firstDigest, secondDigest, err)
+	}
+	built := manifest
+	built.Runtime = HostingRuntimeManifest{Kind: "static", NodeVersion: "22", PackageManager: "npm", BuildScript: "build", OutputDirectory: "."}
+	_, builtDigest, err := manifestJSONAndDigest(built)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if builtDigest == firstDigest {
+		t.Fatal("built and no-build static manifests have the same digest")
 	}
 }
 

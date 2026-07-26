@@ -64,7 +64,7 @@ type HostingRepositoryManifest struct {
 type HostingRuntimeManifest struct {
 	Kind            string `json:"kind"`
 	NodeVersion     string `json:"node_version,omitempty"`
-	PackageManager  string `json:"package_manager"`
+	PackageManager  string `json:"package_manager,omitempty"`
 	BuildScript     string `json:"build_script,omitempty"`
 	StartScript     string `json:"start_script,omitempty"`
 	OutputDirectory string `json:"output_directory,omitempty"`
@@ -232,28 +232,40 @@ func validateHostingRuntimeManifest(runtime *HostingRuntimeManifest) error {
 	if runtime.Kind != "static" && runtime.Kind != "node" {
 		return fmt.Errorf("runtime kind must be static or node")
 	}
-	if runtime.NodeVersion != "20" && runtime.NodeVersion != "22" {
-		return fmt.Errorf("node_version must be 20 or 22")
-	}
-	if runtime.PackageManager != "npm" && runtime.PackageManager != "pnpm" && runtime.PackageManager != "yarn" {
-		return fmt.Errorf("package_manager must be npm, pnpm, or yarn")
-	}
 	if runtime.BuildScript != "" && !packageScriptPattern.MatchString(runtime.BuildScript) {
 		return fmt.Errorf("build_script must be a package.json script name, not a shell command")
 	}
 
 	switch runtime.Kind {
 	case "static":
-		if runtime.BuildScript == "" {
-			return fmt.Errorf("static runtime requires build_script")
-		}
 		if err := validateHostingOutputDirectory(runtime.OutputDirectory); err != nil {
 			return err
 		}
 		if runtime.StartScript != "" || runtime.Port != 0 || runtime.HealthPath != "" {
 			return fmt.Errorf("static runtime must not define start_script, port, or health_path")
 		}
+		if (runtime.PackageManager == "") != (runtime.BuildScript == "") {
+			return fmt.Errorf("static runtime must define package_manager and build_script together")
+		}
+		if runtime.PackageManager == "" {
+			if runtime.NodeVersion != "" && !validHostingNodeVersion(runtime.NodeVersion) {
+				return fmt.Errorf("node_version must be 20 or 22 when present")
+			}
+			return nil
+		}
+		if !validHostingNodeVersion(runtime.NodeVersion) {
+			return fmt.Errorf("node_version must be 20 or 22")
+		}
+		if !validHostingPackageManager(runtime.PackageManager) {
+			return fmt.Errorf("package_manager must be npm, pnpm, or yarn")
+		}
 	case "node":
+		if !validHostingNodeVersion(runtime.NodeVersion) {
+			return fmt.Errorf("node_version must be 20 or 22")
+		}
+		if !validHostingPackageManager(runtime.PackageManager) {
+			return fmt.Errorf("package_manager must be npm, pnpm, or yarn")
+		}
 		if !packageScriptPattern.MatchString(runtime.StartScript) {
 			return fmt.Errorf("node runtime requires a package.json start_script name")
 		}
@@ -270,7 +282,22 @@ func validateHostingRuntimeManifest(runtime *HostingRuntimeManifest) error {
 	return nil
 }
 
+func validHostingNodeVersion(value string) bool {
+	return value == "20" || value == "22"
+}
+
+func validHostingPackageManager(value string) bool {
+	return value == "npm" || value == "pnpm" || value == "yarn"
+}
+
+func hostingRuntimeRequiresNode(runtime HostingRuntimeManifest) bool {
+	return runtime.Kind == "node" || runtime.PackageManager != "" || runtime.BuildScript != ""
+}
+
 func validateHostingOutputDirectory(value string) error {
+	if value == "." {
+		return nil
+	}
 	if len(value) > 256 || !outputDirectoryPattern.MatchString(value) {
 		return fmt.Errorf("output_directory must contain only safe relative path segments")
 	}
@@ -280,6 +307,9 @@ func validateHostingOutputDirectory(value string) error {
 	}
 	if clean != value {
 		return fmt.Errorf("output_directory must be a canonical relative path")
+	}
+	if value == ".deployer" || strings.HasPrefix(value, ".deployer/") {
+		return fmt.Errorf("output_directory must not use the platform-reserved .deployer directory")
 	}
 	return nil
 }

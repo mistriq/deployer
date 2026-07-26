@@ -2658,20 +2658,34 @@ components:
     HostingStaticRuntime:
       type: object
       additionalProperties: false
-      required: [kind, node_version, package_manager, build_script, output_directory]
+      required: [kind, output_directory]
       properties:
         kind: {type: string, const: static}
-        node_version: {type: string, enum: ['20', '22']}
-        package_manager: {type: string, enum: [npm, pnpm, yarn]}
+        node_version:
+          type: string
+          enum: ['20', '22']
+          description: Required for a package build; optional and ignored when package_manager and build_script are absent.
+        package_manager:
+          type: string
+          enum: [npm, pnpm, yarn]
+          description: Omit together with build_script to publish output_directory directly without Node or a build stage.
         build_script:
           type: string
           pattern: '^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$'
-          description: package.json script name, never a shell command.
+          description: package.json script name, never a shell command. Omit together with package_manager for a no-build static site.
         output_directory:
           type: string
           maxLength: 256
-          pattern: '^(?!\.{1,2}(?:/|$))[A-Za-z0-9_.-]+(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9_.-]+)*$'
-          description: Canonical relative path segments inside the repository; no whitespace, control characters, backslashes, or traversal.
+          pattern: '^(?:\.|(?!\.deployer(?:/|$))(?!\.{1,2}(?:/|$))[A-Za-z0-9_.-]+(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9_.-]+)*)$'
+          description: Canonical relative path inside the repository, or "." for its root; no platform .deployer directory, whitespace, control characters, backslashes, or traversal.
+      oneOf:
+        - description: No-build static site served directly from the repository checkout; node_version may be omitted or ignored.
+          not:
+            anyOf:
+              - required: [package_manager]
+              - required: [build_script]
+        - description: Static site produced by an allowlisted package build.
+          required: [node_version, package_manager, build_script]
 
     HostingNodeRuntime:
       type: object

@@ -1452,18 +1452,35 @@ func writeGeneratedHostingRecipe(sourceDir string, recipe hostingJobRecipe) erro
 	if err := os.Mkdir(directory, 0750); err != nil {
 		return err
 	}
-	install, runBuild, command, err := hostingPackageCommands(recipe.Runtime)
-	if err != nil {
-		return err
-	}
 	var dockerfile string
-	if recipe.Runtime.Kind == "static" {
+	if recipe.Runtime.Kind == "static" && !hostingRuntimeRequiresNode(recipe.Runtime) {
+		source := recipe.Runtime.OutputDirectory
+		if source != "." {
+			source = "./" + source
+		}
+		copyInstruction, err := json.Marshal([]string{source, "/usr/share/nginx/html/"})
+		if err != nil {
+			return err
+		}
+		dockerfile = fmt.Sprintf("FROM nginxinc/nginx-unprivileged:1.27-alpine\nCOPY %s\nEXPOSE 8080\n", copyInstruction)
+		if err := os.WriteFile(filepath.Join(directory, "Dockerfile.dockerignore"), []byte(".deployer\n"), 0640); err != nil {
+			return err
+		}
+	} else if recipe.Runtime.Kind == "static" {
+		install, runBuild, _, err := hostingPackageCommands(recipe.Runtime)
+		if err != nil {
+			return err
+		}
 		dockerfile = fmt.Sprintf("FROM node:%s-bookworm-slim AS build\nWORKDIR /app\nCOPY . .\nRUN %s\nRUN %s\nFROM nginxinc/nginx-unprivileged:1.27-alpine\nCOPY .deployer/nginx.conf /etc/nginx/conf.d/default.conf\nCOPY --from=build /app/%s /usr/share/nginx/html\nEXPOSE 8080\n", recipe.Runtime.NodeVersion, install, runBuild, recipe.Runtime.OutputDirectory)
 		nginx := "server { listen 8080; server_name _; root /usr/share/nginx/html; location / { try_files $uri $uri/ /index.html; } }\n"
 		if err := os.WriteFile(filepath.Join(directory, "nginx.conf"), []byte(nginx), 0640); err != nil {
 			return err
 		}
 	} else {
+		install, runBuild, command, err := hostingPackageCommands(recipe.Runtime)
+		if err != nil {
+			return err
+		}
 		buildStep := ""
 		if recipe.Runtime.BuildScript != "" {
 			buildStep = "RUN " + runBuild + "\n"

@@ -312,6 +312,28 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 	}
 }
 
+func TestOpenAPIDocumentsNoBuildStaticRuntime(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "docs", "openapi.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	section := hostingContractSection(t, string(content), "    HostingStaticRuntime:", "    HostingNodeRuntime:")
+	if strings.Contains(section, "required: [kind, node_version, package_manager, build_script, output_directory]") {
+		t.Fatal("OpenAPI still requires build fields for every static runtime")
+	}
+	for _, required := range []string{
+		"required: [kind, output_directory]",
+		"Omit together with build_script to publish output_directory directly without Node or a build stage.",
+		"No-build static site served directly from the repository checkout",
+		"required: [node_version, package_manager, build_script]",
+		"(?:\\.|(?!\\.deployer",
+	} {
+		if !strings.Contains(section, required) {
+			t.Errorf("no-build static OpenAPI schema is missing %q", required)
+		}
+	}
+}
+
 func TestHostingRunbookCoversServiceIdentityBackupAndRunnerRecovery(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join("..", "..", "docs", "HOSTING_RUNBOOK.md"))
 	if err != nil {

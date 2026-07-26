@@ -386,10 +386,15 @@ runtime endpoint, never a bare unsuspend; a project with no active release
 remains suspended until a later healthy activation supersedes the intent.
 
 Provision accepts only the versioned hosting manifest documented in OpenAPI:
-GitHub App installation/repository IDs, `static` or `node`, an allowlisted Node
-version and package manager, package.json script names, paths, port, health
-path, and a resource profile. It does not accept repository/deploy filesystem
-paths, SSH targets, Compose, build args, environment secrets, or shell hooks.
+GitHub App installation/repository IDs, `static` or `node`, allowlisted build
+fields, paths, port, health path, and a resource profile. A plain static checkout
+has no Node or package build fields; its runtime is exactly
+`{"kind":"static","output_directory":"."}` (or another safe canonical relative
+output path). Deployer copies that directory directly into an nginx-only image.
+Static projects with a package build still require `node_version`,
+`package_manager`, and `build_script` together. Provision does not accept
+repository/deploy filesystem paths, SSH targets, Compose, build args,
+environment secrets, or shell hooks.
 Deployer derives runtime namespaces from `external_project_id` and stores hosting
 state separately from trusted admin projects/builds. Hosting jobs cannot enter
 the legacy builder, Compose, Dockerfile, SSH, or `post_deploy` paths.

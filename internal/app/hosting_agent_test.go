@@ -148,6 +148,68 @@ func TestGeneratedHostingRecipesIgnoreCustomerDockerfile(t *testing.T) {
 	}
 }
 
+func TestGeneratedNoBuildStaticRecipeUsesOnlyNginx(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		output     string
+		copySource string
+	}{
+		{name: "repository root", output: ".", copySource: "."},
+		{name: "nested output", output: "public/assets", copySource: "./public/assets"},
+		{name: "option-like output", output: "--from/customer-site", copySource: "./--from/customer-site"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			runtime := HostingRuntimeManifest{Kind: "static", OutputDirectory: test.output}
+			if err := writeGeneratedHostingRecipe(directory, hostingJobRecipe{Runtime: runtime}); err != nil {
+				t.Fatal(err)
+			}
+			generated, err := os.ReadFile(filepath.Join(directory, ".deployer", "Dockerfile"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(generated)
+			if strings.Count(text, "FROM ") != 1 || !strings.Contains(text, "FROM nginxinc/nginx-unprivileged:1.27-alpine") {
+				t.Fatalf("no-build recipe is not a single nginx stage: %s", text)
+			}
+			for _, forbidden := range []string{"node:", " AS build", "RUN ", "npm", "pnpm", "yarn"} {
+				if strings.Contains(text, forbidden) {
+					t.Fatalf("no-build recipe contains %q: %s", forbidden, text)
+				}
+			}
+			copyJSON, _ := json.Marshal([]string{test.copySource, "/usr/share/nginx/html/"})
+			if !strings.Contains(text, "COPY "+string(copyJSON)+"\n") {
+				t.Fatalf("no-build recipe does not publish %q: %s", test.output, text)
+			}
+			ignore, err := os.ReadFile(filepath.Join(directory, ".deployer", "Dockerfile.dockerignore"))
+			if err != nil || string(ignore) != ".deployer\n" {
+				t.Fatalf("platform recipe files are not excluded from static output: %q err=%v", ignore, err)
+			}
+			if _, err := os.Stat(filepath.Join(directory, ".deployer", "nginx.conf")); !os.IsNotExist(err) {
+				t.Fatalf("no-build recipe unexpectedly generated nginx config: %v", err)
+			}
+		})
+	}
+}
+
+func TestGeneratedBuiltStaticRecipeKeepsNodeBuildStage(t *testing.T) {
+	directory := t.TempDir()
+	runtime := HostingRuntimeManifest{Kind: "static", NodeVersion: "22", PackageManager: "npm", BuildScript: "build", OutputDirectory: "dist"}
+	if err := writeGeneratedHostingRecipe(directory, hostingJobRecipe{Runtime: runtime}); err != nil {
+		t.Fatal(err)
+	}
+	generated, err := os.ReadFile(filepath.Join(directory, ".deployer", "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(generated)
+	for _, required := range []string{"FROM node:22-bookworm-slim AS build", "RUN npm ci --ignore-scripts", "RUN npm run build", "COPY --from=build /app/dist /usr/share/nginx/html"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("built static recipe is missing %q: %s", required, text)
+		}
+	}
+}
+
 func TestHostingWorkloadLimitsAreFailClosedAtExecutionBoundary(t *testing.T) {
 	valid, err := hostingLimitsForProfile("starter")
 	if err != nil {
@@ -208,17 +270,23 @@ func TestGeneratedHostingRecipeRejectsOutputDirectoryInjection(t *testing.T) {
 		"dist/../public",
 		"dist//public",
 	} {
-		t.Run(strings.ReplaceAll(output, "/", "_"), func(t *testing.T) {
-			directory := t.TempDir()
-			runtime := HostingRuntimeManifest{Kind: "static", NodeVersion: "22", PackageManager: "npm",
-				BuildScript: "build", OutputDirectory: output}
-			if err := writeGeneratedHostingRecipe(directory, hostingJobRecipe{Runtime: runtime}); err == nil {
-				t.Fatalf("unsafe output directory %q was accepted", output)
-			}
-			if _, err := os.Stat(filepath.Join(directory, ".deployer")); !os.IsNotExist(err) {
-				t.Fatalf("generated recipe directory exists after rejected output %q: %v", output, err)
-			}
-		})
+		for _, mode := range []string{"no-build", "built"} {
+			t.Run(mode+"_"+strings.ReplaceAll(output, "/", "_"), func(t *testing.T) {
+				directory := t.TempDir()
+				runtime := HostingRuntimeManifest{Kind: "static", OutputDirectory: output}
+				if mode == "built" {
+					runtime.NodeVersion = "22"
+					runtime.PackageManager = "npm"
+					runtime.BuildScript = "build"
+				}
+				if err := writeGeneratedHostingRecipe(directory, hostingJobRecipe{Runtime: runtime}); err == nil {
+					t.Fatalf("unsafe output directory %q was accepted", output)
+				}
+				if _, err := os.Stat(filepath.Join(directory, ".deployer")); !os.IsNotExist(err) {
+					t.Fatalf("generated recipe directory exists after rejected output %q: %v", output, err)
+				}
+			})
+		}
 	}
 }
 
