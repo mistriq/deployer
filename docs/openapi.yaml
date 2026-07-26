@@ -1187,7 +1187,10 @@ paths:
         - $ref: "#/components/parameters/ExternalProjectId"
       responses:
         "200":
-          description: Releases ordered newest first. Private runtime endpoints are omitted.
+          description: >
+            Releases ordered newest first. Each persisted runtime endpoint is the private,
+            runner-authoritative endpoint that passed Deployer validation and health gating;
+            callers must not treat it as a public URL.
           content:
             application/json:
               schema:
@@ -1399,7 +1402,9 @@ paths:
         terminal callback is late, duplicated, rejected, retained out of the
         outbox, or has callback_state=dead_letter. Human failure_message is
         redacted and non-authoritative; branch on status, phase, failure_code,
-        immutable digests, and callback_state.
+        immutable digests, and callback_state. After the runner reports a
+        validated candidate, runtime_endpoint and redacted health_evidence
+        provide the private authoritative workload evidence.
       operationId: getInternalDeployment
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -2877,6 +2882,13 @@ components:
         failure_message: {type: string, description: Redacted operator context; clients must use failure_code for logic.}
         release_digest: {$ref: "#/components/schemas/SHA256Digest"}
         previous_release_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        runtime_endpoint:
+          type: string
+          format: uri
+          description: Private runner-authoritative HTTP(S) endpoint for the immutable release; present after the runner reports and Deployer validates it.
+        health_evidence:
+          type: object
+          description: Redacted evidence recorded by Deployer for the candidate health gate.
         runtime_status:
           type: string
           enum: [available, checking, recovering, unavailable]
@@ -2914,6 +2926,7 @@ components:
             - properties:
                 status: {const: active}
                 phase: {const: active}
+              required: [release_digest, runtime_endpoint, health_evidence]
             - properties:
                 status: {const: failed}
                 phase: {const: failed}
@@ -2931,11 +2944,22 @@ components:
         artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
         status: {type: string, enum: [healthy, active, inactive, failed]}
         health_evidence: {type: object}
+        runtime_endpoint:
+          type: string
+          format: uri
+          description: Private runner-authoritative HTTP(S) endpoint for this immutable release; callers must not treat it as a public URL.
         route_revision: {type: string}
         previous_release_digest: {$ref: "#/components/schemas/SHA256Digest"}
         created_at: {type: string, format: date-time}
         activated_at: {type: string, format: date-time}
         deactivated_at: {type: string, format: date-time}
+      allOf:
+        - oneOf:
+            - properties:
+                status: {enum: [healthy, active, inactive]}
+              required: [runtime_endpoint, health_evidence]
+            - properties:
+                status: {const: failed}
 
     HostingRollbackRelease:
       allOf:

@@ -129,9 +129,18 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"  /api/internal/v1/deployments/{externalDeploymentId}:",
 		"  /api/internal/v1/deployments/{externalDeploymentId}/cancel:")
 	for _, value := range []string{"authoritative when a", "callback_state=dead_letter",
-		"immutable digests", "deployment_not_found", "insufficient_scope"} {
+		"immutable digests", "runtime_endpoint", "health_evidence",
+		"deployment_not_found", "insufficient_scope"} {
 		if !strings.Contains(pollSection, value) {
 			t.Errorf("deployment polling OpenAPI contract is missing %q", value)
+		}
+	}
+	releasesSection := hostingContractSection(t, document,
+		"  /api/internal/v1/projects/{externalProjectId}/releases:",
+		"  /api/internal/v1/projects/{externalProjectId}/rollback:")
+	for _, value := range []string{"runner-authoritative endpoint", "health gating", "HostingRelease"} {
+		if !strings.Contains(releasesSection, value) {
+			t.Errorf("release-list OpenAPI contract is missing %q", value)
 		}
 	}
 	callbackWebhook := hostingContractSection(t, document, "webhooks:", "components:")
@@ -209,6 +218,7 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"Stable status/phase pairs", "status: {const: queued}",
 		"status: {const: running}", "status: {const: active}",
 		"status: {const: failed}", "status: {const: cancelled}",
+		"required: [release_digest, runtime_endpoint, health_evidence]",
 		"enum: [queued, fetching_source, building, starting_candidate, health_checking, activating, cancelling]",
 	} {
 		if !strings.Contains(deploymentSchema, value) {
@@ -217,6 +227,11 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 	}
 	if strings.Contains(deploymentSchema, "rolling_back") {
 		t.Error("HostingDeployment phase must not advertise event-only rolling_back")
+	}
+	releaseSchema := hostingContractSection(t, document,
+		"    HostingRelease:", "    HostingRollbackRelease:")
+	if !strings.Contains(releaseSchema, "required: [runtime_endpoint, health_evidence]") {
+		t.Error("HostingRelease schema must require runtime evidence after health gating")
 	}
 	eventSchema := hostingContractSection(t, document, "    HostingEvent:", "    HostingLog:")
 	if !strings.Contains(eventSchema, "rolling_back") {

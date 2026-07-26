@@ -322,6 +322,12 @@ Private control-plane API:
 - `GET /api/internal/v1/runners`
 - `GET /api/internal/v1/metrics`
 
+Authenticated deployment polling and release history return the private
+runner-authoritative `runtime_endpoint` and redacted `health_evidence` after a
+runner reports an endpoint that passes Deployer validation and health gating.
+The endpoint is intended for private control-plane verification and recovery;
+it is not a public customer URL.
+
 Rollback selects an immutable release instance with both its
 `external_deployment_id` and `release_digest`; a digest alone is intentionally
 insufficient because content-identical deployments can have distinct runtime

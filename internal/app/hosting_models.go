@@ -50,6 +50,8 @@ type HostingDeployment struct {
 	FailureMessage        string     `json:"failure_message,omitempty"`
 	ReleaseDigest         string     `json:"release_digest,omitempty"`
 	PreviousRelease       string     `json:"previous_release_digest,omitempty"`
+	RuntimeEndpoint       string     `json:"runtime_endpoint,omitempty"`
+	HealthEvidence        any        `json:"health_evidence,omitempty"`
 	RuntimeStatus         string     `json:"runtime_status,omitempty"`
 	RuntimeFailureCode    string     `json:"runtime_failure_code,omitempty"`
 	RuntimeRecoveryID     int64      `json:"runtime_recovery_id,omitempty"`
@@ -72,7 +74,7 @@ type HostingRelease struct {
 	Status               string     `json:"status"`
 	HealthEvidence       any        `json:"health_evidence,omitempty"`
 	RouteRevision        string     `json:"route_revision,omitempty"`
-	RuntimeEndpoint      string     `json:"-"`
+	RuntimeEndpoint      string     `json:"runtime_endpoint,omitempty"`
 	PreviousRelease      string     `json:"previous_release_digest,omitempty"`
 	CreatedAt            time.Time  `json:"created_at"`
 	ActivatedAt          *time.Time `json:"activated_at,omitempty"`
@@ -757,6 +759,24 @@ func getHostingDeploymentByExternalID(ctx context.Context, externalID string) (*
 	if err != nil {
 		return nil, err
 	}
+	var runtimeEndpoint, healthEvidenceJSON string
+	err = db.QueryRowContext(ctx, `SELECT runtime_endpoint, health_evidence_json
+		FROM hosting_releases WHERE hosting_deployment_id=? ORDER BY id DESC LIMIT 1`, deployment.ID).Scan(
+		&runtimeEndpoint, &healthEvidenceJSON)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if err == nil {
+		if runtimeEndpoint != "" {
+			if err := validateRuntimeEndpoint(runtimeEndpoint); err != nil {
+				return nil, fmt.Errorf("invalid persisted hosting runtime endpoint: %w", err)
+			}
+			deployment.RuntimeEndpoint = runtimeEndpoint
+		}
+		if err := json.Unmarshal([]byte(healthEvidenceJSON), &deployment.HealthEvidence); err != nil {
+			return nil, fmt.Errorf("decode deployment health evidence: %w", err)
+		}
+	}
 	if deployment.Status == hostingStatusActive {
 		var releaseStatus, desiredState, killReason, runnerStatus, runtimeFailureCode string
 		var globalKill int
@@ -834,6 +854,11 @@ func listHostingReleases(ctx context.Context, projectID int64) ([]HostingRelease
 		}
 		if err := json.Unmarshal([]byte(evidence), &release.HealthEvidence); err != nil {
 			return nil, fmt.Errorf("decode health evidence: %w", err)
+		}
+		if release.RuntimeEndpoint != "" {
+			if err := validateRuntimeEndpoint(release.RuntimeEndpoint); err != nil {
+				return nil, fmt.Errorf("invalid persisted hosting runtime endpoint: %w", err)
+			}
 		}
 		release.CreatedAt = parseSQLiteTime(createdAt)
 		release.ActivatedAt = nullableSQLiteTime(activatedAt)

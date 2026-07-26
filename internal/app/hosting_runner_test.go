@@ -342,6 +342,82 @@ func TestHostingRunnerHealthyCandidateRetainsRuntimeCapacity(t *testing.T) {
 	}
 }
 
+func TestInternalRuntimeEvidenceContractIsScopedAndAuthoritative(t *testing.T) {
+	withTempDB(t)
+	withFakeProxy(t)
+	_, _, runnerID, job := createAndClaimHostingJob(t, "project_01JEVIDENCE", "deployment_01JEVIDENCE")
+	releaseDigest := "sha256:" + strings.Repeat("e", 64)
+	completion := hostingCompletionRequest{
+		Status:                "success",
+		ReleaseDigest:         releaseDigest,
+		ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, releaseDigest),
+		RuntimeEndpoint:       healthyHostingEndpointForTest(t),
+		HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(2), "status_code": float64(200)},
+	}
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err != nil {
+		t.Fatalf("complete healthy job: %v", err)
+	}
+	reader, err := createServiceToken("runtime-evidence-reader", []string{serviceScopeDeploymentsRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied, err := createServiceToken("runtime-evidence-denied", []string{serviceScopeProjectsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI))
+
+	request := httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JEVIDENCE", nil)
+	request.Header.Set("Authorization", "Bearer "+reader.Token)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("poll status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var deployment HostingDeployment
+	if err := json.NewDecoder(recorder.Body).Decode(&deployment); err != nil {
+		t.Fatal(err)
+	}
+	evidence, ok := deployment.HealthEvidence.(map[string]any)
+	if deployment.RuntimeEndpoint != completion.RuntimeEndpoint || !ok || evidence["healthy"] != true || evidence["status_code"] != float64(200) {
+		t.Fatalf("poll runtime evidence=%+v", deployment)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/internal/v1/projects/project_01JEVIDENCE/releases", nil)
+	request.Header.Set("Authorization", "Bearer "+reader.Token)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("release list status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var releases []HostingRelease
+	if err := json.NewDecoder(recorder.Body).Decode(&releases); err != nil {
+		t.Fatal(err)
+	}
+	if len(releases) != 1 || releases[0].RuntimeEndpoint != completion.RuntimeEndpoint {
+		t.Fatalf("release runtime evidence=%+v", releases)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JEVIDENCE", nil)
+	request.Header.Set("Authorization", "Bearer "+denied.Token)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("insufficient scope status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	if _, err := db.Exec(`UPDATE hosting_releases SET runtime_endpoint='http://public.example.test:8080' WHERE release_digest=?`, releaseDigest); err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JEVIDENCE", nil)
+	request.Header.Set("Authorization", "Bearer "+reader.Token)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("invalid persisted endpoint status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestConflictingHostingJobCompletionsCannotRaceProxyActivation(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
