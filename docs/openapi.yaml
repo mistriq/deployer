@@ -1210,11 +1210,16 @@ paths:
         Requires deployments:write. The JSON request body is limited to 8 KiB.
         Admission atomically persists a pending idempotency receipt scoped to
         the stable issuer, rollback operation, key, and canonical request hash,
-        and binds it to one immutable routing intent and route generation before
-        health or adapter calls. An exact retry while that receipt is pending
+        and binds it to one exact immutable release selection. For proxy_v1 it
+        also creates one immutable routing intent and route generation before
+        health or adapter calls. For runtime_only_v1 it binds the exact inactive
+        runner session, runtime instance and endpoint, health-checks that
+        selection, and atomically swaps the active release without creating a
+        proxy operation, route generation, route revision, or adapter call. An
+        exact retry while that receipt is pending
         returns 409 idempotency_in_progress; reusing the key with a different
         request returns 409 idempotency_conflict. Neither case creates new work
-        or advances the route generation. A 503 after admission leaves
+        or advances lifecycle work. For proxy_v1, a 503 after admission leaves
         the intent pending, so the caller must retain and retry only the same
         Idempotency-Key. Pending rollback receipts do not expire. Reconciliation,
         including after restart, atomically records the terminal response and,
@@ -1268,7 +1273,7 @@ paths:
         "413": {$ref: "#/components/responses/Error"}
         "415": {$ref: "#/components/responses/Error"}
         "502":
-          description: The adapter rejected the immutable rollback intent. A retained terminal-error replay includes Idempotency-Replayed true.
+          description: proxy_v1 only. The adapter rejected the immutable rollback intent. A retained terminal-error replay includes Idempotency-Replayed true.
           headers:
             Idempotency-Replayed: {$ref: "#/components/headers/IdempotencyReplayed"}
           content:
@@ -1276,7 +1281,7 @@ paths:
               schema: {$ref: "#/components/schemas/Error"}
         "503":
           description: >
-            The adapter is unavailable or returned an activation result whose
+            proxy_v1 only. The adapter is unavailable or returned an activation result whose
             identity could not be confirmed. Once admission has persisted the
             receipt, the rollback remains pending and the caller must retry the
             exact request with the same Idempotency-Key; changing the key can
@@ -1294,7 +1299,15 @@ paths:
     post:
       tags: [internal]
       summary: Accept suspended desired state without deleting releases
-      description: Requires projects:write. The response acknowledges durable desired state. Proxy convergence is generation-fenced and may complete asynchronously after an adapter outage.
+      description: >
+        Requires projects:write. The response acknowledges durable desired
+        state. For proxy_v1, convergence is generation-fenced and may complete
+        asynchronously after an adapter outage. For runtime_only_v1, suspend
+        durably removes the exact managed runtime from the runner retention set.
+        Ownership and capacity are released only after a later higher-sequence
+        heartbeat in the same fenced runner session confirms that exact runtime
+        is absent; confirmation queues one retained-image recovery. No proxy
+        operation, route generation, or route revision is created.
       operationId: suspendInternalProject
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1322,13 +1335,18 @@ paths:
       summary: Accept active desired state for the retained release
       description: >
         Requires projects:write. The response acknowledges durable desired
-        state. When no kill switch is enabled, resume generation-fences and
-        reactivates the exact authoritative active release and runtime endpoint;
-        it is never a bare unsuspend. A missing or unavailable active runtime
+        state. For proxy_v1, when no kill switch is enabled, resume
+        generation-fences and reactivates the exact authoritative active release
+        and runtime endpoint; it is never a bare unsuspend. A missing or unavailable active runtime
         remains suspended with durable convergence pending. If a kill switch is
         enabled, desired state becomes active without admitting a resume route
         intent. Proxy convergence may complete asynchronously after an adapter
-        outage.
+        outage. For runtime_only_v1, resume admits the durable recovery only
+        when both kill switches permit execution; the runner restores and
+        health-checks the retained image without rebuilding source and without
+        any proxy operation or route revision. If a later suspension cancels a
+        queued or in-flight restore, the next permitted resume durably ensures
+        one new recovery after the cancelled lease becomes terminal.
       operationId: resumeInternalProject
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1356,15 +1374,19 @@ paths:
       summary: Change a project's execution kill switch
       description: >
         Requires projects:write. Enabling atomically cancels queued work,
-        durably requests cancellation of leased work, and persists a newer
-        generation-fenced proxy suspension for a desired-active project before
-        returning. Disabling persists a generation-fenced resume only when the
+        durably requests cancellation of leased work, and persists either a
+        newer generation-fenced proxy suspension or, for runtime_only_v1, an
+        exact runner-confirmed stop intent before returning. Runtime-only
+        ownership and capacity remain reserved until a later higher-sequence
+        same-session heartbeat confirms absence. Disabling persists convergence only when the
         project remains desired active and neither the project nor global kill
         switch is enabled. Resume reactivates the exact authoritative active
         release and endpoint rather than blindly exposing the adapter's retained
         target; a missing or unavailable active runtime remains suspended with
-        convergence pending. Routing convergence may complete asynchronously
-        after an adapter outage. The JSON request body is limited to 8 KiB.
+        convergence pending. Runtime-only convergence restores the retained
+        image without rebuilding source and creates no proxy operation, route
+        generation, or route revision. Proxy routing convergence may complete
+        asynchronously after an adapter outage. The JSON request body is limited to 8 KiB.
       operationId: setInternalProjectKillSwitch
       security: [{serviceBearerAuth: []}]
       parameters:
@@ -1577,14 +1599,19 @@ paths:
       summary: Change the global hosting execution kill switch
       description: >
         Requires hosting:admin. Enabling atomically cancels queued work,
-        durably requests cancellation of leased work, and persists one newer
-        generation-fenced proxy suspension for every desired-active project.
+        durably requests cancellation of leased work, and persists either one
+        newer generation-fenced proxy suspension or one exact runtime-only stop
+        intent for every desired-active project.
         Disabling persists generation-fenced resumes only for projects that
         remain desired active and have no project kill switch. Each resume
         reactivates the exact authoritative active release and endpoint rather
         than blindly exposing the adapter's retained target; a missing or
         unavailable active runtime remains suspended with convergence pending.
-        Routing convergence may complete asynchronously after an adapter outage.
+        Runtime-only stop confirmation requires a later higher-sequence
+        same-session heartbeat proving exact runtime absence; recovery restores
+        the retained image without rebuilding source and creates no proxy
+        operation, route generation, or route revision. Proxy routing
+        convergence may complete asynchronously after an adapter outage.
         The JSON request body is limited to 8 KiB.
       operationId: setInternalGlobalKillSwitch
       security: [{serviceBearerAuth: []}]
@@ -1630,7 +1657,11 @@ paths:
             this runner session. An inventory-capable agent removes only
             containers in its exact namespace, or exact unnamespaced legacy
             containers recorded in its durable adoption registry, when they
-            are absent from this set.
+            are absent from this set. A runtime_only_v1 suspend or kill-switch
+            stop removes the exact runtime from this set. Deployer confirms the
+            stop only after a later higher-sequence heartbeat in the same fenced
+            runner session omits that exact runtime; a runner-session change
+            establishes a new baseline and is not itself confirmation.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/HostingHeartbeatResponse"}
@@ -2025,8 +2056,12 @@ paths:
         A successful recovery requires a recent exact restore-instance
         observation from the current fenced runner inventory session, including
         an exact match between the observed endpoint and completion runtime_endpoint, and a
-        fresh Deployer HTTP health check that does not follow redirects before
-        the generation-fenced recovery activation is dispatched.
+        fresh Deployer HTTP health check that does not follow redirects. For
+        proxy_v1, a generation-fenced recovery activation is then dispatched.
+        For runtime_only_v1, Deployer atomically commits the new exact
+        runner/session/instance/endpoint and health evidence without creating a
+        proxy operation, route generation, or route revision. An exact replay
+        must match the already committed identity and publication-mode fence.
       operationId: completeHostingRecovery
       security: [{hostingAgentBearerAuth: []}]
       parameters:
@@ -2236,6 +2271,10 @@ webhooks:
       tags: [internal]
       summary: Signed at-least-once terminal hosting callback
       description: >
+        This callback represents only the original immutable deployment terminal
+        transition. Rollback, suspend/resume, kill-switch, and runtime-recovery
+        lifecycle transitions are exposed through authenticated polling and
+        structured events and do not enqueue another deployment callback.
         Deployer signs "<header Unix timestamp>.<event_id>.<raw body>" with
         HMAC-SHA256. The header event ID equals body event_id. Receivers MUST
         reject header timestamps outside a five-minute window, compare signatures
@@ -2754,12 +2793,14 @@ components:
         Signed, immutable per-project publication policy. Omission during initial
         provisioning selects proxy_v1 for legacy compatibility. runtime_only_v1
         makes a health-gated private runner workload authoritative without claiming
-        proxy, DNS, TLS, or public reachability.
+        proxy, DNS, TLS, or public reachability. Its rollback, suspend/resume,
+        kill-switch and runtime-loss recovery paths likewise create no proxy
+        operations, route generations or route revisions.
 
     HostingFailureCode:
       type: string
       description: Stable machine-readable hosting execution or recovery failure code.
-      enum: [artifact_digest_mismatch, artifact_unavailable, build_failed, build_timeout, cancelled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, runtime_instance_lost, secret_reference_unavailable, source_fetch_failed, workload_policy_violation]
+      enum: [artifact_digest_mismatch, artifact_unavailable, build_failed, build_timeout, cancelled, execution_disabled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_start_failed, runtime_instance_lost, secret_reference_unavailable, source_fetch_failed, workload_policy_violation]
 
     ExternalProjectId:
       type: string
@@ -2911,7 +2952,7 @@ components:
           description: checking is the durable grace period after a complete snapshot first omits or reports a non-running exact instance.
         runtime_failure_code:
           type: string
-          enum: [artifact_digest_mismatch, artifact_unavailable, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_instance_lost, runtime_start_failed, secret_reference_unavailable, workload_policy_violation]
+          enum: [artifact_digest_mismatch, artifact_unavailable, execution_disabled, health_check_failed, proxy_activation_failed, release_persistence_failed, runner_lost, runtime_instance_lost, runtime_start_failed, secret_reference_unavailable, workload_policy_violation]
           description: Stable runtime/recovery cause; independent of the immutable original deployment failure_code.
         runtime_recovery_id:
           type: integer
@@ -2965,7 +3006,9 @@ components:
           type: string
           format: uri
           description: Private runner-authoritative HTTP(S) endpoint for this immutable release; callers must not treat it as a public URL.
-        route_revision: {type: string}
+        route_revision:
+          type: string
+          description: proxy_v1 adapter revision; absent for runtime_only_v1.
         previous_release_digest: {$ref: "#/components/schemas/SHA256Digest"}
         created_at: {type: string, format: date-time}
         activated_at: {type: string, format: date-time}
@@ -3007,7 +3050,9 @@ components:
             Stable structured event name. Runtime inventory transitions include
             runtime_instance_missing_observed, runtime_instance_loss_confirmed,
             runtime_recovery_queued, runtime_reappeared_before_recovery,
-            runtime_recovered, inactive_runtime_runner_lost, and terminal
+            runtime_recovered, runtime_stop_requested,
+            runtime_execution_suspended, runtime_recovery_requeued_after_resume,
+            inactive_runtime_runner_lost, and terminal
             runtime_recovery_failed/runtime_recovery_cancelled variants.
         phase: {type: string, enum: [queued, fetching_source, building, starting_candidate, health_checking, activating, active, failed, cancelling, cancelled, rolling_back]}
         failure_code: {$ref: "#/components/schemas/HostingFailureCode"}

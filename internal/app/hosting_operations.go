@@ -138,7 +138,7 @@ func setHostingExecutionKillSwitch(ctx context.Context, token *ServiceToken, ext
 			return nil, false, err
 		}
 	}
-	routeIntentCount, err := stageHostingKillSwitchRouteIntents(ctx, conn, token.ID, operation,
+	routeIntentCount, runtimeOnlyCount, err := stageHostingKillSwitchRouteIntents(ctx, conn, token.ID, operation,
 		key, projectID, input.Enabled, now)
 	if err != nil {
 		return nil, false, err
@@ -147,6 +147,11 @@ func setHostingExecutionKillSwitch(ctx context.Context, token *ServiceToken, ext
 		if err := cancelHostingJobsForKillSwitch(ctx, conn, projectID, input.Reason, now); err != nil {
 			return nil, false, err
 		}
+		if _, err := suspendRuntimeOnlyWorkloads(ctx, conn, projectID, input.Reason, now); err != nil {
+			return nil, false, err
+		}
+	} else if _, err := ensureResumableRuntimeOnlyRecoveries(ctx, conn, projectID, now); err != nil {
+		return nil, false, err
 	}
 	metadata, _ := json.Marshal(map[string]any{"enabled": input.Enabled, "scope": scope, "external_project_id": externalProjectID})
 	var auditProject any
@@ -171,7 +176,7 @@ func setHostingExecutionKillSwitch(ctx context.Context, token *ServiceToken, ext
 		return nil, false, err
 	}
 	committed = true
-	if routeIntentCount != 0 {
+	if routeIntentCount != 0 || runtimeOnlyCount != 0 {
 		if err := reconcileHostingDesiredStateOperations(ctx); err != nil {
 			logOperationalError("dispatch durable kill-switch route intent", err)
 		}
@@ -181,8 +186,8 @@ func setHostingExecutionKillSwitch(ctx context.Context, token *ServiceToken, ext
 
 func stageHostingKillSwitchRouteIntents(ctx context.Context, conn *sql.Conn, tokenID int64,
 	operation, key string, projectID sql.NullInt64, enabled bool,
-	now time.Time) (int, error) {
-	query := `SELECT project.id, project.external_project_id
+	now time.Time) (int, int, error) {
+	query := `SELECT project.id, project.external_project_id, project.publication_mode
 		FROM hosting_projects project JOIN hosting_settings settings ON settings.id=1
 		WHERE project.desired_state='active'`
 	var args []any
@@ -195,23 +200,24 @@ func stageHostingKillSwitchRouteIntents(ctx context.Context, conn *sql.Conn, tok
 	}
 	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	type projectRoute struct {
-		id         int64
-		externalID string
+		id              int64
+		externalID      string
+		publicationMode string
 	}
 	var projects []projectRoute
 	for rows.Next() {
 		var project projectRoute
-		if err := rows.Scan(&project.id, &project.externalID); err != nil {
+		if err := rows.Scan(&project.id, &project.externalID, &project.publicationMode); err != nil {
 			rows.Close()
-			return 0, err
+			return 0, 0, err
 		}
 		projects = append(projects, project)
 	}
 	if err := rows.Close(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	operationType := "resume"
 	operationDesiredState := "active"
@@ -219,22 +225,29 @@ func stageHostingKillSwitchRouteIntents(ctx context.Context, conn *sql.Conn, tok
 		operationType = "suspend"
 		operationDesiredState = ""
 	}
+	routeCount := 0
+	runtimeOnlyCount := 0
 	for _, project := range projects {
+		if project.publicationMode == hostingPublicationRuntimeOnlyV1 {
+			runtimeOnlyCount++
+			continue
+		}
 		operationID := hashHostingOperation("kill-switch-route", fmt.Sprint(tokenID), operation,
 			key, project.externalID, operationType, formatSQLiteTime(now))
 		generation, err := nextHostingRouteGeneration(ctx, conn, project.id)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_proxy_operations
 			(operation_id, hosting_project_id, operation_type, route_generation, desired_state,
 			 status, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`, operationID, project.id, operationType,
 			generation, operationDesiredState, formatSQLiteTime(now), formatSQLiteTime(now)); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
+		routeCount++
 	}
-	return len(projects), nil
+	return routeCount, runtimeOnlyCount, nil
 }
 
 func cancelHostingJobsForKillSwitch(ctx context.Context, conn *sql.Conn, projectID sql.NullInt64, reason string, now time.Time) error {

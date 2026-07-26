@@ -119,9 +119,11 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"  /api/internal/v1/projects/{externalProjectId}/kill-switch:",
 		"  /api/internal/v1/deployments/{externalDeploymentId}:")
 	for _, value := range []string{"atomically cancels queued work", "newer",
-		"generation-fenced proxy suspension", "neither the project nor global kill",
-		"exact authoritative active", "rather than blindly exposing",
-		"convergence may complete asynchronously"} {
+		"generation-fenced proxy suspension", "exact runner-confirmed stop intent",
+		"higher-sequence", "same-session heartbeat confirms absence",
+		"neither the project nor global kill", "exact authoritative active",
+		"rather than blindly exposing", "without rebuilding source",
+		"creates no proxy", "route revision"} {
 		if !strings.Contains(projectKillSection, value) {
 			t.Errorf("project kill-switch OpenAPI contract is missing %q", value)
 		}
@@ -168,10 +170,11 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 	globalKillSection := hostingContractSection(t, document,
 		"  /api/internal/v1/settings/kill-switch:",
 		"  /api/hosting-agent/v1/heartbeat:")
-	for _, value := range []string{"atomically cancels queued work", "one newer",
-		"generation-fenced proxy suspension for every desired-active project",
+	for _, value := range []string{"atomically cancels queued work", "generation-fenced proxy suspension",
+		"exact runtime-only stop", "every desired-active project",
 		"have no project kill switch", "exact authoritative active",
-		"blindly exposing", "convergence may complete asynchronously"} {
+		"blindly exposing", "higher-sequence", "same-session heartbeat",
+		"without rebuilding source", "creates no proxy", "route revision"} {
 		if !strings.Contains(globalKillSection, value) {
 			t.Errorf("global kill-switch OpenAPI contract is missing %q", value)
 		}
@@ -234,16 +237,24 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 	if !strings.Contains(releaseSchema, "required: [runtime_endpoint, health_evidence]") {
 		t.Error("HostingRelease schema must require runtime evidence after health gating")
 	}
+	for _, value := range []string{"proxy_v1 adapter revision", "absent for runtime_only_v1"} {
+		if !strings.Contains(releaseSchema, value) {
+			t.Errorf("HostingRelease publication-mode contract is missing %q", value)
+		}
+	}
 	eventSchema := hostingContractSection(t, document, "    HostingEvent:", "    HostingLog:")
-	if !strings.Contains(eventSchema, "rolling_back") {
-		t.Error("HostingEvent phase must retain rolling_back")
+	for _, value := range []string{"rolling_back", "runtime_stop_requested", "runtime_execution_suspended"} {
+		if !strings.Contains(eventSchema, value) {
+			t.Errorf("HostingEvent lifecycle contract is missing %q", value)
+		}
 	}
 	recoveryCompletionSection := hostingContractSection(t, document,
 		"  /api/hosting-agent/v1/recoveries/{hostingRecoveryId}/complete:",
 		"  /api/agent/poll:")
 	for _, value := range []string{"exact restore-instance", "current fenced runner inventory session",
 		"exact match between the observed endpoint", "fresh Deployer HTTP health check", "does not follow redirects",
-		"generation-fenced recovery activation"} {
+		"generation-fenced recovery activation", "For runtime_only_v1", "without creating a",
+		"proxy operation, route generation, or route revision", "exact replay"} {
 		if !strings.Contains(recoveryCompletionSection, value) {
 			t.Errorf("hosting recovery completion contract is missing %q", value)
 		}
@@ -253,10 +264,10 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, value := range []string{
-		"An exact retry while pending returns `409 idempotency_in_progress`",
+		"retry while pending returns `409 idempotency_in_progress`",
 		"Pending rollback receipts do not",
 		"expire. Once reconciliation records a completed success or terminal error",
-		"replays the completed response instead of creating another routing intent",
+		"replays the completed response", "instead of creating duplicate lifecycle work",
 		"`starting_candidate`, and `health_checking` in order",
 		"repeating the current",
 		"initial successful", "accepted only from `health_checking`",
@@ -272,8 +283,10 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"Cancellation wins over stale",
 		"atomically persists a newer route-generation compensation",
 		"cannot become terminal until both",
-		"one newer suspension intent per desired-active",
-		"never a bare unsuspend", "no active release",
+		"runtime-only stop intent", "higher-sequence heartbeat",
+		"without rebuilding", "never create proxy operations or route revisions",
+		"do not enqueue a second deployment callback",
+		"never a bare unsuspend",
 		"previous active",
 		"release unchanged",
 		"expired uncancelled leases are fenced and requeued",

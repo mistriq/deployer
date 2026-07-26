@@ -658,12 +658,12 @@ func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, ext
 		return stored, true, nil
 	}
 	var projectID int64
-	var projectKillReason string
+	var projectKillReason, publicationMode string
 	var globalKill int
-	if err := conn.QueryRowContext(ctx, `SELECT project.id, project.kill_switch_reason,
+	if err := conn.QueryRowContext(ctx, `SELECT project.id, project.kill_switch_reason, project.publication_mode,
 		settings.global_kill_switch FROM hosting_projects project
 		JOIN hosting_settings settings ON settings.id=1 WHERE project.external_project_id=?`,
-		externalID).Scan(&projectID, &projectKillReason, &globalKill); err != nil {
+		externalID).Scan(&projectID, &projectKillReason, &publicationMode, &globalKill); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, false, &hostingAPIError{Code: errCodeProjectNotFound, Message: "project not found", StatusCode: 404}
 		}
@@ -679,8 +679,21 @@ func setHostingProjectDesiredState(ctx context.Context, token *ServiceToken, ext
 		if err := cancelHostingJobsForKillSwitch(ctx, conn, sql.NullInt64{Int64: projectID, Valid: true}, "project suspended", now); err != nil {
 			return nil, false, err
 		}
+		if publicationMode == hostingPublicationRuntimeOnlyV1 {
+			if _, err := suspendRuntimeOnlyWorkloads(ctx, conn,
+				sql.NullInt64{Int64: projectID, Valid: true}, "project suspended", now); err != nil {
+				return nil, false, err
+			}
+		}
 	}
-	routeChange := desired == "suspended" || (projectKillReason == "" && globalKill == 0)
+	if desired == "active" && publicationMode == hostingPublicationRuntimeOnlyV1 {
+		if _, err := ensureResumableRuntimeOnlyRecoveries(ctx, conn,
+			sql.NullInt64{Int64: projectID, Valid: true}, now); err != nil {
+			return nil, false, err
+		}
+	}
+	routeChange := publicationMode == hostingPublicationProxyV1 &&
+		(desired == "suspended" || (projectKillReason == "" && globalKill == 0))
 	var routeGeneration int64
 	if routeChange {
 		routeGeneration, err = nextHostingRouteGeneration(ctx, conn, projectID)

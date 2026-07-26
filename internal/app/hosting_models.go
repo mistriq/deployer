@@ -607,6 +607,42 @@ func applyHostingMigrations() error {
 					CHECK (publication_mode IN ('proxy_v1','runtime_only_v1'))`,
 			},
 		},
+		{
+			id: "043_hosting_runtime_only_rollbacks",
+			statements: []string{
+				`CREATE TABLE hosting_runtime_rollbacks (
+					operation_id TEXT PRIMARY KEY,
+					hosting_project_id INTEGER NOT NULL REFERENCES hosting_projects(id) ON DELETE RESTRICT,
+					hosting_deployment_id INTEGER NOT NULL REFERENCES hosting_deployments(id) ON DELETE RESTRICT,
+					hosting_release_id INTEGER NOT NULL REFERENCES hosting_releases(id) ON DELETE RESTRICT,
+					expected_previous_release_digest TEXT NOT NULL DEFAULT '',
+					target_runtime_runner_id INTEGER NOT NULL REFERENCES hosting_runners(id) ON DELETE RESTRICT,
+					target_runtime_instance_id TEXT NOT NULL,
+					target_runtime_session_id TEXT NOT NULL,
+					target_runtime_endpoint TEXT NOT NULL,
+					status TEXT NOT NULL CHECK (status IN ('pending','committed','failed')),
+					last_error_code TEXT NOT NULL DEFAULT '',
+					created_at DATETIME NOT NULL,
+					updated_at DATETIME NOT NULL
+				)`,
+				`CREATE INDEX idx_hosting_runtime_rollbacks_pending
+					ON hosting_runtime_rollbacks(status, updated_at)`,
+				`CREATE TABLE hosting_runtime_stops (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					hosting_release_id INTEGER NOT NULL REFERENCES hosting_releases(id) ON DELETE RESTRICT,
+					hosting_runner_id INTEGER NOT NULL REFERENCES hosting_runners(id) ON DELETE RESTRICT,
+					runtime_instance_id TEXT NOT NULL,
+					runner_session_id TEXT NOT NULL,
+					requested_sequence INTEGER NOT NULL,
+					status TEXT NOT NULL CHECK (status IN ('pending','committed')),
+					reason TEXT NOT NULL DEFAULT '',
+					created_at DATETIME NOT NULL,
+					completed_at DATETIME
+				)`,
+				`CREATE UNIQUE INDEX idx_hosting_runtime_stops_one_pending
+					ON hosting_runtime_stops(hosting_release_id) WHERE status='pending'`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {

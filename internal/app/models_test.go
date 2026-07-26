@@ -879,7 +879,7 @@ func TestInitDBMigratesOlderSchema(t *testing.T) {
 		}
 	}
 
-	for _, migrationID := range []string{"015_hosting_projects", "016_hosting_deployments", "042_hosting_publication_mode"} {
+	for _, migrationID := range []string{"015_hosting_projects", "016_hosting_deployments", "042_hosting_publication_mode", "043_hosting_runtime_only_rollbacks"} {
 		var count int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE id=?`, migrationID).Scan(&count); err != nil {
 			t.Fatalf("check migration %s: %v", migrationID, err)

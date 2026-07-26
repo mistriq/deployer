@@ -1660,6 +1660,37 @@ func TestHostingRuntimeRecoveryProxyIntentSurvivesDatabaseRestart(t *testing.T) 
 	if err := db.QueryRow(`SELECT status FROM hosting_proxy_operations WHERE hosting_runtime_recovery_id=?`, recovery.JobID).Scan(&operationStatus); err != nil || operationStatus != "committed" {
 		t.Fatalf("reconciled operation status=%q err=%v", operationStatus, err)
 	}
+	var replayState hostingRuntimeRecoveryState
+	var routeRevision string
+	if err := db.QueryRow(`SELECT recovery.id, recovery.hosting_release_id,
+		release.hosting_deployment_id, release.hosting_project_id, recovery.hosting_runner_id,
+		recovery.lease_generation, recovery.lease_token_hash, release.release_digest,
+		operation.route_generation, operation.route_revision
+		FROM hosting_runtime_recoveries recovery
+		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
+		JOIN hosting_proxy_operations operation ON operation.hosting_runtime_recovery_id=recovery.id
+		WHERE recovery.id=?`, recovery.JobID).Scan(&replayState.ID, &replayState.ReleaseID,
+		&replayState.DeploymentID, &replayState.ProjectID, &replayState.RunnerID,
+		&replayState.LeaseGeneration, &replayState.LeaseTokenHash, &replayState.ReleaseDigest,
+		&replayState.RouteGeneration, &routeRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_proxy_operations SET status='applied'
+		WHERE hosting_runtime_recovery_id=?`, recovery.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitHostingRuntimeRecovery(t.Context(), &replayState, healthServer.URL,
+		routeRevision); err == nil {
+		t.Fatal("proxy recovery replay accepted an uncommitted proxy operation")
+	}
+	if _, err := db.Exec(`UPDATE hosting_proxy_operations SET status='committed', route_revision='mismatched-revision'
+		WHERE hosting_runtime_recovery_id=?`, recovery.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitHostingRuntimeRecovery(t.Context(), &replayState, healthServer.URL,
+		routeRevision); err == nil {
+		t.Fatal("proxy recovery replay accepted a mismatched route revision")
+	}
 }
 
 func TestHostingRuntimeRecoveryProxyIntentFencesConcurrentFailure(t *testing.T) {

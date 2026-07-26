@@ -43,11 +43,17 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 	if err := reconcileHostingDesiredStateOperations(ctx); err != nil {
 		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting desired state: %w", err))
 	}
+	if err := reconcileHostingRuntimeRollbacks(ctx); err != nil {
+		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting runtime-only rollback: %w", err))
+	}
 	if err := reconcileHostingRollbackOperations(ctx); err != nil {
 		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting rollback: %w", err))
 	}
 	if err := reconcileHostingRecoveryProxyOperations(ctx); err != nil {
 		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting recovery routing: %w", err))
+	}
+	if err := reconcileHostingRuntimeOnlyRecoveries(ctx); err != nil {
+		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting runtime-only recovery: %w", err))
 	}
 	if err := reconcileHostingRuntimeOnlyActivations(ctx); err != nil {
 		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting runtime-only activation: %w", err))
@@ -82,6 +88,9 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 		return err
 	}
 	if err := queueLostHostingRuntimes(ctx, conn, now); err != nil {
+		return err
+	}
+	if _, err := ensureResumableRuntimeOnlyRecoveries(ctx, conn, sql.NullInt64{}, now); err != nil {
 		return err
 	}
 	if err := placeHostingRuntimeRecoveries(ctx, conn, now); err != nil {

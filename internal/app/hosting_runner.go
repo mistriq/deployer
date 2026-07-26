@@ -511,6 +511,11 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			jsonErrorCode(w, errCodeInternal, "record hosting runtime observations failed", http.StatusInternalServerError)
 			return
 		}
+		if err := reconcileHostingRuntimeStopsOnHeartbeat(r.Context(), conn, runner.ID,
+			input.SessionID, input.Sequence, now); err != nil {
+			jsonErrorCode(w, errCodeInternal, "reconcile hosting runtime stops failed", http.StatusInternalServerError)
+			return
+		}
 		if err := placeHostingRuntimeRecoveries(r.Context(), conn, now); err != nil {
 			jsonErrorCode(w, errCodeInternal, "place hosting runtime recovery failed", http.StatusInternalServerError)
 			return
@@ -519,12 +524,12 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	rows, err := conn.QueryContext(r.Context(), `SELECT DISTINCT rel.release_digest, p.external_project_id,
 			d.external_deployment_id,
 			CASE
-				WHEN recovery_op.id IS NOT NULL THEN 'active'
+				WHEN recovery.id IS NOT NULL AND (recovery_op.id IS NOT NULL OR p.publication_mode=?) THEN 'active'
 				WHEN activation.id IS NOT NULL AND job.hosting_runner_id=? THEN 'healthy'
 				ELSE rel.status
 			END,
 			CASE
-				WHEN recovery_op.id IS NOT NULL THEN 'restore-' || recovery.id || '-' || recovery.lease_generation
+				WHEN recovery.id IS NOT NULL AND (recovery_op.id IS NOT NULL OR p.publication_mode=?) THEN 'restore-' || recovery.id || '-' || recovery.lease_generation
 				WHEN activation.id IS NOT NULL AND job.hosting_runner_id=? THEN 'build-' || job.id || '-' || job.lease_generation
 				ELSE rel.runtime_instance_id
 		END
@@ -538,11 +543,18 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			AND recovery.hosting_runner_id=? AND recovery.status='running'
 		LEFT JOIN hosting_proxy_operations recovery_op ON recovery_op.hosting_runtime_recovery_id=recovery.id
 			AND recovery_op.operation_type='recover' AND recovery_op.status IN ('pending','applied')
+		JOIN hosting_settings settings ON settings.id=1
 		WHERE (rel.runtime_failure_code='' AND (
-		      (rel.runtime_runner_id=? AND rel.status IN ('healthy','active','inactive'))
+		      (rel.runtime_runner_id=? AND rel.status IN ('healthy','active','inactive')
+		       AND NOT (p.publication_mode=? AND (p.desired_state<>'active' OR p.kill_switch_reason<>''
+		         OR settings.global_kill_switch<>0 OR EXISTS (SELECT 1 FROM hosting_runtime_stops stop
+		           WHERE stop.hosting_release_id=rel.id AND stop.status='pending'))))
 		   OR (job.hosting_runner_id=? AND rel.status='healthy' AND activation.id IS NOT NULL)))
-		   OR (recovery.runtime_endpoint<>'' AND recovery_op.id IS NOT NULL)
-		ORDER BY rel.id`, runner.ID, runner.ID, runner.ID, runner.ID, runner.ID)
+		   OR (recovery.runtime_endpoint<>'' AND (recovery_op.id IS NOT NULL OR p.publication_mode=?)
+		     AND p.desired_state='active' AND p.kill_switch_reason='' AND settings.global_kill_switch=0)
+		ORDER BY rel.id`, hostingPublicationRuntimeOnlyV1, runner.ID,
+		hostingPublicationRuntimeOnlyV1, runner.ID, runner.ID, runner.ID,
+		hostingPublicationRuntimeOnlyV1, runner.ID, hostingPublicationRuntimeOnlyV1)
 	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "list retained hosting releases failed", http.StatusInternalServerError)
 		return
@@ -588,8 +600,14 @@ func handleHostingAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			JOIN hosting_releases release ON release.id=recovery.hosting_release_id
 			JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
 			JOIN hosting_projects project ON project.id=release.hosting_project_id
+			JOIN hosting_settings settings ON settings.id=1
 			WHERE recovery.hosting_runner_id=? AND recovery.status IN ('leased','running')
-			  AND recovery.lease_expires_at>?`, runner.ID, formatSQLiteTime(now), runner.ID, formatSQLiteTime(now))
+			  AND recovery.lease_expires_at>?
+			  AND (project.publication_mode<>? OR (project.desired_state='active'
+			    AND project.kill_switch_reason='' AND settings.global_kill_switch=0
+			    AND NOT EXISTS (SELECT 1 FROM hosting_runtime_stops stop
+			      WHERE stop.hosting_release_id=release.id AND stop.status='pending')))`,
+			runner.ID, formatSQLiteTime(now), runner.ID, formatSQLiteTime(now), hostingPublicationRuntimeOnlyV1)
 		if err != nil {
 			jsonErrorCode(w, errCodeInternal, "list in-flight hosting runtimes failed", http.StatusInternalServerError)
 			return
@@ -691,9 +709,14 @@ func supersededHostingSessionRetention(ctx context.Context, querier *sql.Conn,
 		FROM hosting_releases release
 		JOIN hosting_projects project ON project.id=release.hosting_project_id
 		JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+		JOIN hosting_settings settings ON settings.id=1
 		WHERE release.runtime_runner_id=?
 		  AND (release.status='active' OR
 		    (release.runtime_failure_code='' AND release.status IN ('healthy','inactive')))
+		  AND NOT (project.publication_mode=? AND (project.desired_state<>'active'
+		    OR project.kill_switch_reason<>'' OR settings.global_kill_switch<>0
+		    OR EXISTS (SELECT 1 FROM hosting_runtime_stops stop
+		      WHERE stop.hosting_release_id=release.id AND stop.status='pending')))
 		UNION
 		SELECT release.release_digest, project.external_project_id, deployment.external_deployment_id,
 		  'restore-' || recovery.id || '-' || recovery.lease_generation, 'active'
@@ -701,9 +724,15 @@ func supersededHostingSessionRetention(ctx context.Context, querier *sql.Conn,
 		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
 		JOIN hosting_projects project ON project.id=release.hosting_project_id
 		JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+		JOIN hosting_settings settings ON settings.id=1
 		WHERE recovery.hosting_runner_id=? AND recovery.status IN ('leased','running')
 		  AND recovery.lease_expires_at>?
-		ORDER BY 2, 3, 1, 4`, runnerID, runnerID, formatSQLiteTime(now))
+		  AND (project.publication_mode<>? OR (project.desired_state='active'
+		    AND project.kill_switch_reason='' AND settings.global_kill_switch=0
+		    AND NOT EXISTS (SELECT 1 FROM hosting_runtime_stops stop
+		      WHERE stop.hosting_release_id=release.id AND stop.status='pending')))
+		ORDER BY 2, 3, 1, 4`, runnerID, hostingPublicationRuntimeOnlyV1,
+		runnerID, formatSQLiteTime(now), hostingPublicationRuntimeOnlyV1)
 	if err != nil {
 		return nil, err
 	}
@@ -788,6 +817,12 @@ func recordHostingRuntimeObservations(ctx context.Context, conn *sql.Conn, runne
 		runtime_observed_session_id='', runtime_observed_release_digest='', runtime_observed_instance_id='',
 		runtime_observed_endpoint=''
 		WHERE hosting_runner_id=? AND status IN ('leased','running')`, runnerID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET runtime_observed_at=NULL,
+		runtime_observed_session_id='' WHERE runtime_runner_id=? AND EXISTS (
+		  SELECT 1 FROM hosting_runtime_stops stop WHERE stop.hosting_release_id=hosting_releases.id
+		    AND stop.status='pending')`, runnerID); err != nil {
 		return err
 	}
 	for _, runtime := range inventory {

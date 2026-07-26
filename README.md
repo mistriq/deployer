@@ -332,10 +332,14 @@ Rollback selects an immutable release instance with both its
 `external_deployment_id` and `release_digest`; a digest alone is intentionally
 insufficient because content-identical deployments can have distinct runtime
 instances. Admission atomically binds one pending idempotency receipt to that
-exact release, request hash and routing generation before health or adapter
-calls. An exact retry while pending returns `409 idempotency_in_progress`; a
+exact release and request hash. In `proxy_v1` it also binds the routing
+generation before health or adapter calls. In `runtime_only_v1` it instead
+binds the exact inactive runner session, runtime instance and endpoint, then
+health-gates and atomically swaps the authoritative active release without a
+proxy operation, route generation, route revision or adapter call. An exact
+retry while pending returns `409 idempotency_in_progress`; a
 different request with the same key returns `409 idempotency_conflict`, and
-neither retry creates new work. A `503` leaves the admitted rollback
+neither retry creates new work. For `proxy_v1`, a `503` leaves the admitted rollback
 pending, so retain and retry only the same key. Pending rollback receipts do not
 expire. Once reconciliation records a completed success or terminal error, its
 status and body are retained for 24 hours and a replay returns
@@ -380,16 +384,22 @@ activation atomically persists a newer route-generation compensation before
 returning; adapter dispatch is attempted immediately and restart reconciliation
 retries the exact intent. The deployment cannot become terminal until both the
 candidate activation and the current routing compensation are settled.
-Suspend/resume responses acknowledge durable desired state; adapter
-convergence is asynchronous and generation-fenced during an adapter outage.
-Enabling a project or global execution kill switch likewise atomically cancels
-affected work and persists one newer suspension intent per desired-active
-project. Disabling it resumes routing only when the project remains desired
-active and no other kill switch is enabled; unavailable runtimes keep the
-durable resume pending instead of exposing an unhealthy route. Resume is an
-exact generation-fenced activation of the authoritative active release and
-runtime endpoint, never a bare unsuspend; a project with no active release
-remains suspended until a later healthy activation supersedes the intent.
+Suspend/resume responses acknowledge durable desired state. In `proxy_v1`,
+adapter convergence is asynchronous and generation-fenced during an outage.
+In `runtime_only_v1`, suspend durably requests removal of the exact managed
+runtime from the runner retention set. Ownership and capacity are released only
+after a later, higher-sequence heartbeat in the same fenced runner session
+confirms that exact runtime is absent; that confirmation queues one retained-image
+recovery. Resume admits that recovery only when both kill switches permit it,
+and the runner restores and health-checks the retained image without rebuilding
+customer source or calling the proxy adapter. If another suspension cancels an
+unstarted or in-flight restore, a later permitted resume durably queues one new
+recovery after the cancelled lease is terminal; repeated cycles cannot strand
+an ownerless active release. Resume is never a bare unsuspend.
+Enabling a project or global execution kill switch atomically cancels affected
+work and persists either a generation-fenced proxy suspension or the exact
+runtime-only stop intent. Disabling it converges only projects that remain
+desired active and are permitted by the other kill switch.
 
 Provision accepts the control-plane-owned canonical default hostname, a signed
 immutable `publication_mode`, plus only
@@ -414,9 +424,9 @@ For `runtime_only_v1`, a candidate becomes ACTIVE transactionally after the same
 artifact, runner-session, runtime-inventory, health, desired-state, kill-switch,
 and cancellation fences, with no proxy operation or synthetic route revision.
 ACTIVE in this mode means a healthy private workload only and makes no DNS, TLS,
-hostname, or public-reachability claim. Rollback, suspend/resume, and runtime
-recovery remain on their existing proxy-aware paths until their explicit
-publication-mode branches are implemented.
+hostname, or public-reachability claim. Rollback, suspend/resume, project and
+global kill switches, and runtime-loss recovery preserve those runtime-only
+semantics and never create proxy operations or route revisions.
 
 Hosting jobs advance through `fetching_source`, `building`,
 `starting_candidate`, and `health_checking` in order; repeating the current
@@ -481,7 +491,11 @@ contract and HMAC key-overlap procedure are in
 must branch on stable JSON `code`, `status`, `phase`, and `failure_code` values
 rather than human text.
 
-Terminal callbacks are delivered at least once. Their signature covers
+Terminal callbacks are delivered at least once for the original immutable
+deployment terminal transition. Rollback, suspend/resume, kill-switch and
+runtime-recovery lifecycle transitions are observed through authenticated
+polling and structured events; they do not enqueue a second deployment callback.
+Callback signatures cover
 `<header Unix timestamp>.<event_id>.<raw body>`; receivers reject header
 timestamps outside five minutes, compare the signature in constant time, and
 deduplicate event IDs before applying state. The body has a separate immutable
@@ -531,22 +545,26 @@ enables `no-new-privileges`, uses a read-only root filesystem, and enforces CPU,
 RAM, disk, PID, build-time, and temporary-filesystem limits. Before activation
 it uploads a digest-verified Docker image archive to Deployer-managed artifact
 storage. Heartbeats reconcile exact project/deployment release instances. If
-an active runner is lost, a generation-fenced recovery lease downloads that
-retained image, verifies both archive and image identity, starts and health
-checks it without rebuilding customer source, and switches the private adapter
-through a durable idempotent operation. Restore and rollback use the immutable
+an active runner is lost, a recovery lease downloads that retained image,
+verifies both archive and image identity, and starts and health checks it without
+rebuilding customer source. `proxy_v1` then switches the private adapter through
+a durable generation-fenced operation; `runtime_only_v1` atomically commits the
+new exact runner/session/instance/endpoint evidence without any proxy operation
+or route revision. Restore and rollback use the immutable
 runtime/health snapshot stored with the release, not a later project manifest.
 
-Every activation, rollback, suspension, resume, recovery and compensation sent
-to the proxy adapter carries a positive, per-project monotonic
+Every `proxy_v1` activation, rollback, suspension, resume, recovery and
+compensation sent to the proxy adapter carries a positive, per-project monotonic
 `route_generation`; activation also carries the persisted default hostname.
 The adapter must atomically ignore requests below the
 highest generation it has applied for that project. Deployer persists each
 generation before the network call and reconciles pending operations after
 restart; compensations receive a newer generation. Rollback reconciliation
 atomically finalizes the idempotency receipt with the terminal response and, on
-success, the structured rollback event. An exact retry after restart therefore
-replays the completed response instead of creating another routing intent.
+success, the structured rollback event. Runtime-only rollback applies the same
+receipt/event atomicity around its exact runtime selection without a routing
+intent. An exact retry after restart therefore replays the completed response
+instead of creating duplicate lifecycle work.
 
 Restore is explicitly negotiated through the runner `operations` capability.
 Legacy v1 agents that omit it are treated as build-only and never receive a

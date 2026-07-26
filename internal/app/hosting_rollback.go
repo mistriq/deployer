@@ -76,6 +76,18 @@ func rollbackHostingReleaseResult(ctx context.Context, token *ServiceToken, exte
 		}
 		return decodeHostingRollbackReplay(replay, true)
 	}
+	var publicationMode string
+	if err := db.QueryRowContext(ctx, `SELECT publication_mode FROM hosting_projects WHERE external_project_id=?`,
+		externalProjectID).Scan(&publicationMode); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, &hostingAPIError{Code: errCodeProjectNotFound, Message: "project not found", StatusCode: http.StatusNotFound}
+		}
+		return nil, err
+	}
+	if publicationMode == hostingPublicationRuntimeOnlyV1 {
+		return rollbackHostingRuntimeOnlyRelease(ctx, token, externalProjectID,
+			externalDeploymentID, digest, key, requestHash)
+	}
 	operation, replay, err := stageHostingRollbackOperation(ctx, token, externalProjectID,
 		externalDeploymentID, digest, key, requestHash)
 	if err != nil || replay != nil {
