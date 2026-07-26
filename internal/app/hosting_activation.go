@@ -52,6 +52,7 @@ type hostingCompletionState struct {
 	CompletionFingerprint   string
 	RouteGeneration         int64
 	Runtime                 HostingRuntimeManifest
+	PublicationMode         string
 }
 
 type hostingRouteGenerationQuerier interface {
@@ -204,6 +205,10 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 			return cancelStagedHostingActivation(ctx, latest, input.ReleaseDigest,
 				"durable cancellation intent won during candidate health verification")
 		}
+		if state.PublicationMode == hostingPublicationRuntimeOnlyV1 {
+			return finishHostingJobTerminal(ctx, state, hostingStatusFailed, hostingPhaseFailed,
+				"health_check_failed", err.Error())
+		}
 		operationID := hashHostingOperation("activate", state.ExternalDeploymentID, input.ReleaseDigest)
 		proxy, proxyErr := hostingProxyClientFactory(appConfig)
 		if proxyErr != nil {
@@ -234,6 +239,10 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 		return err
 	}
 	if !allowed {
+		if state.PublicationMode == hostingPublicationRuntimeOnlyV1 {
+			return cancelStagedHostingActivation(ctx, state, input.ReleaseDigest,
+				"project execution is disabled or suspended")
+		}
 		proxy, proxyErr := hostingProxyClientFactory(appConfig)
 		if proxyErr != nil {
 			return proxyErr
@@ -246,6 +255,30 @@ func completeHostingJob(ctx context.Context, runnerID, jobID, generation int64, 
 			return err
 		}
 		return finishHostingJobTerminal(ctx, state, hostingStatusCancelled, hostingPhaseCancelled, "cancelled", "project execution is disabled or suspended")
+	}
+	if state.PublicationMode == hostingPublicationRuntimeOnlyV1 {
+		cancelled, err := activateHealthyHostingReleaseRuntimeOnly(ctx, state, input.ReleaseDigest)
+		if err != nil {
+			if errors.Is(err, errHostingCallbackEnqueue) {
+				return err
+			}
+			var apiErr *hostingAPIError
+			if !errors.As(err, &apiErr) || (apiErr.Code != errCodeReleaseNotHealthy && apiErr.Code != errCodeConflict) {
+				// Storage and other internal failures leave the healthy staged
+				// candidate intact so an exact completion replay or restart
+				// reconciliation can converge it.
+				return err
+			}
+			if finishErr := finishHostingJobTerminal(ctx, state, hostingStatusFailed, hostingPhaseFailed,
+				"health_check_failed", "candidate identity changed before runtime-only activation committed"); finishErr != nil {
+				return finishErr
+			}
+			return nil
+		}
+		if cancelled {
+			return cancelStagedHostingActivation(ctx, state, input.ReleaseDigest, "cancelled during runtime-only activation")
+		}
+		return nil
 	}
 	proxy, err := hostingProxyClientFactory(appConfig)
 	if err != nil {
@@ -349,6 +382,10 @@ func cancelStagedHostingActivation(ctx context.Context, state *hostingCompletion
 		return &hostingAPIError{Code: errCodeConflict,
 			Message: "staged cancellation is missing the candidate release identity", StatusCode: http.StatusConflict}
 	}
+	if state.PublicationMode == hostingPublicationRuntimeOnlyV1 {
+		return finishHostingJobTerminal(ctx, state, hostingStatusCancelled, hostingPhaseCancelled,
+			"cancelled", message)
+	}
 	proxy, err := hostingProxyClientFactory(appConfig)
 	if err != nil {
 		return err
@@ -389,7 +426,7 @@ func getHostingCompletionState(ctx context.Context, runnerID, jobID, generation 
 	var state hostingCompletionState
 	err := db.QueryRowContext(ctx, `SELECT j.id, j.hosting_deployment_id, d.hosting_project_id,
 		j.hosting_runner_id, j.lease_generation, j.lease_token_hash, j.status, d.phase,
-		p.external_project_id, d.external_deployment_id, d.commit_sha, d.artifact_digest,
+		p.external_project_id, d.external_deployment_id, d.commit_sha, d.artifact_digest, p.publication_mode,
 		j.cancel_requested_at, j.lease_expires_at,
 		j.required_cpu_millis, j.required_ram_bytes, j.required_disk_bytes, j.required_pids,
 		j.release_upload_digest, j.release_upload_release_digest, j.release_upload_path, j.release_upload_size,
@@ -401,7 +438,7 @@ func getHostingCompletionState(ctx context.Context, runnerID, jobID, generation 
 		jobID, runnerID, generation, hashToken(leaseToken)).Scan(
 		&state.JobID, &state.DeploymentID, &state.ProjectID, &state.RunnerID,
 		&state.LeaseGeneration, &state.LeaseTokenHash, &state.JobStatus, &state.DeploymentPhase,
-		&state.ExternalProjectID, &state.ExternalDeploymentID, &state.CommitSHA, &state.ArtifactDigest,
+		&state.ExternalProjectID, &state.ExternalDeploymentID, &state.CommitSHA, &state.ArtifactDigest, &state.PublicationMode,
 		&state.CancelRequestedAt, &state.LeaseExpiresAt,
 		&state.Limits.CPUMillis, &state.Limits.RAMBytes, &state.Limits.DiskBytes, &state.Limits.PIDs,
 		&state.ReleaseUploadDigest, &state.ReleaseUploadRelease, &state.ReleaseUploadPath, &state.ReleaseUploadSize,
@@ -420,6 +457,9 @@ func getHostingCompletionState(ctx context.Context, runnerID, jobID, generation 
 			&state.PreviousReleaseDigest, &state.PreviousRuntimeEndpoint)
 	} else if operationErr != nil {
 		return nil, operationErr
+	}
+	if state.PublicationMode != hostingPublicationProxyV1 && state.PublicationMode != hostingPublicationRuntimeOnlyV1 {
+		return nil, fmt.Errorf("invalid persisted publication mode %q", state.PublicationMode)
 	}
 	return &state, nil
 }
@@ -527,6 +567,30 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 	}
 	operationID := hashHostingOperation("activate", state.ExternalDeploymentID, input.ReleaseDigest)
 	if deploymentPhase == hostingPhaseActivating {
+		if state.PublicationMode == hostingPublicationRuntimeOnlyV1 {
+			var releaseArtifactDigest, releaseEndpoint, releaseStatus, releaseInstance, releaseSession string
+			var releaseRunnerID int64
+			if err := conn.QueryRowContext(ctx, `SELECT release_artifact_digest, runtime_endpoint, status,
+				runtime_runner_id, runtime_instance_id, runtime_observed_session_id,
+				previous_release_digest FROM hosting_releases
+				WHERE hosting_deployment_id=? AND release_digest=?`, state.DeploymentID, input.ReleaseDigest).Scan(
+				&releaseArtifactDigest, &releaseEndpoint, &releaseStatus, &releaseRunnerID,
+				&releaseInstance, &releaseSession, &state.PreviousReleaseDigest); err != nil {
+				return &hostingAPIError{Code: errCodeIdempotencyConflict,
+					Message: "staged completion is missing its durable runtime-only release", StatusCode: http.StatusConflict, Err: err}
+			}
+			if releaseArtifactDigest != input.ReleaseArtifactDigest || releaseEndpoint != input.RuntimeEndpoint ||
+				releaseStatus != "healthy" || releaseRunnerID != state.RunnerID ||
+				releaseInstance != expectedInstance || releaseSession != activeSession {
+				return &hostingAPIError{Code: errCodeIdempotencyConflict,
+					Message: "staged completion conflicts with the durable runtime-only release", StatusCode: http.StatusConflict}
+			}
+			if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+				return err
+			}
+			committed = true
+			return nil
+		}
 		var releaseArtifactDigest, releaseEndpoint, releaseStatus, releaseInstance, releaseSession string
 		var releaseRunnerID, routeGeneration int64
 		var operationDigest, operationEndpoint, previousDigest, previousEndpoint, operationStatus string
@@ -605,6 +669,13 @@ func stageHealthyHostingRelease(ctx context.Context, state *hostingCompletionSta
 	}
 	if err := recordHostingEvent(ctx, conn, state.ProjectID, state.DeploymentID, "candidate_healthy", hostingPhaseActivating, "", map[string]any{"release_digest": input.ReleaseDigest}, now); err != nil {
 		return err
+	}
+	if state.PublicationMode == hostingPublicationRuntimeOnlyV1 {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return err
+		}
+		committed = true
+		return nil
 	}
 	var routeGeneration int64
 	var storedDigest, storedEndpoint, storedPreviousDigest, storedPreviousEndpoint string
@@ -784,6 +855,108 @@ func activateHealthyHostingRelease(ctx context.Context, state *hostingCompletion
 	operationID := hashHostingOperation("activate", state.ExternalDeploymentID, releaseDigest)
 	if _, err := conn.ExecContext(ctx, `UPDATE hosting_proxy_operations SET status='committed',
 		updated_at=? WHERE operation_id=? AND status IN ('pending','applied','committed')`, formatSQLiteTime(now), operationID); err != nil {
+		return false, err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return false, err
+	}
+	committed = true
+	return false, nil
+}
+
+func activateHealthyHostingReleaseRuntimeOnly(ctx context.Context, state *hostingCompletionState, releaseDigest string) (bool, error) {
+	now := time.Now().UTC()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	var jobStatus, publicationMode string
+	var cancelRequested sql.NullString
+	if err := conn.QueryRowContext(ctx, `SELECT job.status, job.cancel_requested_at, project.publication_mode
+		FROM hosting_jobs job JOIN hosting_deployments deployment ON deployment.id=job.hosting_deployment_id
+		JOIN hosting_projects project ON project.id=deployment.hosting_project_id
+		WHERE job.id=? AND job.hosting_runner_id=? AND job.lease_generation=? AND job.lease_token_hash=?`,
+		state.JobID, state.RunnerID, state.LeaseGeneration, state.LeaseTokenHash).Scan(
+		&jobStatus, &cancelRequested, &publicationMode); err != nil {
+		return false, err
+	}
+	if jobStatus == "succeeded" {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return false, err
+		}
+		committed = true
+		return false, nil
+	}
+	if cancelRequested.Valid {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return false, err
+		}
+		committed = true
+		return true, nil
+	}
+	if jobStatus != "running" || publicationMode != hostingPublicationRuntimeOnlyV1 {
+		return false, &hostingAPIError{Code: errCodeConflict, Message: "runtime-only activation state changed", StatusCode: http.StatusConflict}
+	}
+	var desiredState, projectKillReason string
+	var globalKill int
+	if err := conn.QueryRowContext(ctx, `SELECT project.desired_state, project.kill_switch_reason, settings.global_kill_switch
+		FROM hosting_projects project JOIN hosting_settings settings ON settings.id=1 WHERE project.id=?`, state.ProjectID).Scan(
+		&desiredState, &projectKillReason, &globalKill); err != nil {
+		return false, err
+	}
+	if desiredState != "active" || projectKillReason != "" || globalKill != 0 {
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return false, err
+		}
+		committed = true
+		return true, nil
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='inactive', deactivated_at=?
+		WHERE hosting_project_id=? AND status='active' AND hosting_deployment_id<>?`,
+		formatSQLiteTime(now), state.ProjectID, state.DeploymentID); err != nil {
+		return false, err
+	}
+	expectedInstance := fmt.Sprintf("build-%d-%d", state.JobID, state.LeaseGeneration)
+	result, err := conn.ExecContext(ctx, `UPDATE hosting_releases SET status='active', route_revision='', activated_at=?,
+		deactivated_at=NULL, runtime_generation=runtime_generation+1
+		WHERE hosting_project_id=? AND hosting_deployment_id=? AND release_digest=? AND status='healthy'
+		  AND runtime_runner_id=? AND runtime_instance_id=? AND runtime_failure_code=''
+		  AND COALESCE((SELECT active_session_id FROM hosting_runners WHERE id=?), '')<>''
+		  AND runtime_observed_at>=?
+		  AND runtime_observed_session_id=(SELECT active_session_id FROM hosting_runners WHERE id=?)`,
+		formatSQLiteTime(now), state.ProjectID, state.DeploymentID, releaseDigest, state.RunnerID,
+		expectedInstance, state.RunnerID, formatSQLiteTime(now.Add(-hostingRunnerStaleAfter)), state.RunnerID)
+	if err != nil {
+		return false, err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return false, &hostingAPIError{Code: errCodeReleaseNotHealthy, Message: "healthy runtime-only candidate was not available for activation", StatusCode: http.StatusConflict}
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_jobs SET status='succeeded', completed_at=?, lease_expires_at=NULL
+		WHERE id=? AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?`, formatSQLiteTime(now),
+		state.JobID, state.RunnerID, state.LeaseGeneration, state.LeaseTokenHash); err != nil {
+		return false, err
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE hosting_deployments SET status='active', phase='active', callback_state='pending',
+		release_digest=?, finished_at=?, updated_at=? WHERE id=? AND status='running'`, releaseDigest,
+		formatSQLiteTime(now), formatSQLiteTime(now), state.DeploymentID); err != nil {
+		return false, err
+	}
+	if err := recordHostingEvent(ctx, conn, state.ProjectID, state.DeploymentID, "release_activated", hostingPhaseActive, "",
+		map[string]any{"release_digest": releaseDigest, "publication_mode": hostingPublicationRuntimeOnlyV1}, now); err != nil {
+		return false, err
+	}
+	if err := enqueueTerminalCallback(ctx, conn, state.DeploymentID, now); err != nil {
 		return false, err
 	}
 	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {

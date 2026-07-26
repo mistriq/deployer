@@ -73,6 +73,75 @@ func signedManifestRequest(t *testing.T, token, externalProjectID string, manife
 	return signedRawManifestRequest(t, token, externalProjectID, body, signedAt)
 }
 
+func signedManifestRequestWithPublicationMode(t *testing.T, token, externalProjectID, publicationMode string, manifest HostingProjectManifest, signedAt time.Time) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(hostingProjectUpsertRequest{
+		DefaultHostname: "customer-app.apps.example.test",
+		PublicationMode: publicationMode,
+		Manifest:        manifest,
+	})
+	if err != nil {
+		t.Fatalf("encode manifest: %v", err)
+	}
+	return signedRawManifestRequest(t, token, externalProjectID, body, signedAt)
+}
+
+func TestInternalProjectPublicationModeDefaultsPersistsAndIsImmutable(t *testing.T) {
+	withTempDB(t)
+	withHostingConfig(t)
+	token, err := createServiceToken("publication-mode-writer", []string{serviceScopeProjectsWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI))
+	manifest := validHostingManifest("static")
+
+	legacyRequest := signedManifestRequest(t, token.Token, "project_01JMODELEG", manifest, time.Now())
+	legacyRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(legacyRecorder, legacyRequest)
+	if legacyRecorder.Code != http.StatusCreated {
+		t.Fatalf("legacy create=%d body=%s", legacyRecorder.Code, legacyRecorder.Body.String())
+	}
+	var legacy internalProjectResponse
+	if err := json.NewDecoder(legacyRecorder.Body).Decode(&legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.PublicationMode != hostingPublicationProxyV1 {
+		t.Fatalf("legacy mode=%q", legacy.PublicationMode)
+	}
+
+	runtimeRequest := signedManifestRequestWithPublicationMode(t, token.Token, "project_01JMODERUN", hostingPublicationRuntimeOnlyV1, manifest, time.Now())
+	runtimeRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(runtimeRecorder, runtimeRequest)
+	if runtimeRecorder.Code != http.StatusCreated {
+		t.Fatalf("runtime create=%d body=%s", runtimeRecorder.Code, runtimeRecorder.Body.String())
+	}
+	runtimeRequest = signedManifestRequestWithPublicationMode(t, token.Token, "project_01JMODERUN", hostingPublicationRuntimeOnlyV1, manifest, time.Now())
+	runtimeRecorder = httptest.NewRecorder()
+	handler.ServeHTTP(runtimeRecorder, runtimeRequest)
+	if runtimeRecorder.Code != http.StatusOK {
+		t.Fatalf("runtime replay=%d body=%s", runtimeRecorder.Code, runtimeRecorder.Body.String())
+	}
+	var replay internalProjectResponse
+	if err := json.NewDecoder(runtimeRecorder.Body).Decode(&replay); err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Replayed || replay.PublicationMode != hostingPublicationRuntimeOnlyV1 {
+		t.Fatalf("runtime replay=%+v", replay)
+	}
+
+	conflict := signedManifestRequest(t, token.Token, "project_01JMODERUN", manifest, time.Now())
+	conflictRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(conflictRecorder, conflict)
+	if conflictRecorder.Code != http.StatusConflict || !strings.Contains(conflictRecorder.Body.String(), "conflict") {
+		t.Fatalf("mode conflict=%d body=%s", conflictRecorder.Code, conflictRecorder.Body.String())
+	}
+	stored, err := getHostingProjectByExternalID("project_01JMODERUN")
+	if err != nil || stored.PublicationMode != hostingPublicationRuntimeOnlyV1 {
+		t.Fatalf("stored runtime mode=%+v err=%v", stored, err)
+	}
+}
+
 func signedRawManifestRequest(t *testing.T, token, externalProjectID string, body []byte, signedAt time.Time) *http.Request {
 	t.Helper()
 	timestampText := itoa(signedAt.Unix())

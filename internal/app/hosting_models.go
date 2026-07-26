@@ -50,6 +50,7 @@ type HostingDeployment struct {
 	FailureMessage        string     `json:"failure_message,omitempty"`
 	ReleaseDigest         string     `json:"release_digest,omitempty"`
 	PreviousRelease       string     `json:"previous_release_digest,omitempty"`
+	PublicationMode       string     `json:"publication_mode"`
 	RuntimeEndpoint       string     `json:"runtime_endpoint,omitempty"`
 	HealthEvidence        any        `json:"health_evidence,omitempty"`
 	RuntimeStatus         string     `json:"runtime_status,omitempty"`
@@ -72,6 +73,7 @@ type HostingRelease struct {
 	CommitSHA            string     `json:"commit_sha"`
 	ArtifactDigest       string     `json:"artifact_digest"`
 	Status               string     `json:"status"`
+	PublicationMode      string     `json:"publication_mode"`
 	HealthEvidence       any        `json:"health_evidence,omitempty"`
 	RouteRevision        string     `json:"route_revision,omitempty"`
 	RuntimeEndpoint      string     `json:"runtime_endpoint,omitempty"`
@@ -598,6 +600,13 @@ func applyHostingMigrations() error {
 			},
 			migrate: quarantineLegacyUnsafeHostingCallbackIdentities,
 		},
+		{
+			id: "042_hosting_publication_mode",
+			statements: []string{
+				`ALTER TABLE hosting_projects ADD COLUMN publication_mode TEXT NOT NULL DEFAULT 'proxy_v1'
+					CHECK (publication_mode IN ('proxy_v1','runtime_only_v1'))`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {
@@ -725,6 +734,7 @@ func scanHostingDeployment(scanner interface{ Scan(...any) error }) (*HostingDep
 		&finishedAt,
 		&createdAt,
 		&updatedAt,
+		&deployment.PublicationMode,
 	)
 	if err != nil {
 		return nil, err
@@ -752,7 +762,7 @@ func getHostingDeploymentByExternalID(ctx context.Context, externalID string) (*
 	deployment, err := scanHostingDeployment(db.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
 		d.commit_sha, d.manifest_digest, d.artifact_digest, d.status, d.phase, d.failure_code,
 		d.failure_message, d.release_digest, d.previous_release_digest, d.callback_state,
-		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at
+		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at, p.publication_mode
 		FROM hosting_deployments d
 		JOIN hosting_projects p ON p.id=d.hosting_project_id
 		WHERE d.external_deployment_id=?`, externalID))
@@ -773,8 +783,14 @@ func getHostingDeploymentByExternalID(ctx context.Context, externalID string) (*
 			}
 			deployment.RuntimeEndpoint = runtimeEndpoint
 		}
-		if err := json.Unmarshal([]byte(healthEvidenceJSON), &deployment.HealthEvidence); err != nil {
+		if err := decodeNonEmptyHealthEvidence(healthEvidenceJSON, &deployment.HealthEvidence); err != nil {
 			return nil, fmt.Errorf("decode deployment health evidence: %w", err)
+		}
+	}
+	if deployment.Status == hostingStatusActive {
+		evidence, ok := deployment.HealthEvidence.(map[string]any)
+		if deployment.RuntimeEndpoint == "" || !ok || !validHealthEvidence(evidence) {
+			return nil, fmt.Errorf("active hosting deployment is missing validated runtime health evidence")
 		}
 	}
 	if deployment.Status == hostingStatusActive {
@@ -834,9 +850,10 @@ func getHostingDeploymentByExternalID(ctx context.Context, externalID string) (*
 func listHostingReleases(ctx context.Context, projectID int64) ([]HostingRelease, error) {
 	rows, err := db.QueryContext(ctx, `SELECT r.release_digest, d.external_deployment_id, r.commit_sha,
 		r.artifact_digest, r.status, r.health_evidence_json, r.route_revision, r.runtime_endpoint,
-		r.previous_release_digest, r.created_at, r.activated_at, r.deactivated_at
+		r.previous_release_digest, r.created_at, r.activated_at, r.deactivated_at, p.publication_mode
 		FROM hosting_releases r
 		JOIN hosting_deployments d ON d.id=r.hosting_deployment_id
+		JOIN hosting_projects p ON p.id=r.hosting_project_id
 		WHERE r.hosting_project_id=? ORDER BY r.id DESC`, projectID)
 	if err != nil {
 		return nil, err
@@ -849,10 +866,10 @@ func listHostingReleases(ctx context.Context, projectID int64) ([]HostingRelease
 		var activatedAt, deactivatedAt sql.NullString
 		if err := rows.Scan(&release.Digest, &release.ExternalDeploymentID, &release.CommitSHA,
 			&release.ArtifactDigest, &release.Status, &evidence, &release.RouteRevision, &release.RuntimeEndpoint,
-			&release.PreviousRelease, &createdAt, &activatedAt, &deactivatedAt); err != nil {
+			&release.PreviousRelease, &createdAt, &activatedAt, &deactivatedAt, &release.PublicationMode); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(evidence), &release.HealthEvidence); err != nil {
+		if err := decodeNonEmptyHealthEvidence(evidence, &release.HealthEvidence); err != nil {
 			return nil, fmt.Errorf("decode health evidence: %w", err)
 		}
 		if release.RuntimeEndpoint != "" {
@@ -863,9 +880,43 @@ func listHostingReleases(ctx context.Context, projectID int64) ([]HostingRelease
 		release.CreatedAt = parseSQLiteTime(createdAt)
 		release.ActivatedAt = nullableSQLiteTime(activatedAt)
 		release.DeactivatedAt = nullableSQLiteTime(deactivatedAt)
+		if release.Status == "healthy" || release.Status == "active" || release.Status == "inactive" {
+			evidence, ok := release.HealthEvidence.(map[string]any)
+			if release.RuntimeEndpoint == "" || !ok || !validHealthEvidence(evidence) {
+				return nil, fmt.Errorf("%s hosting release is missing validated runtime health evidence", release.Status)
+			}
+		}
+		if release.Status == "active" {
+			if release.ActivatedAt == nil {
+				return nil, fmt.Errorf("active hosting release is missing activation time")
+			}
+			switch release.PublicationMode {
+			case hostingPublicationProxyV1:
+				if release.RouteRevision == "" {
+					return nil, fmt.Errorf("active proxy release is missing route revision")
+				}
+			case hostingPublicationRuntimeOnlyV1:
+				if release.RouteRevision != "" {
+					return nil, fmt.Errorf("active runtime-only release has a route revision")
+				}
+			default:
+				return nil, fmt.Errorf("active hosting release has invalid publication mode %q", release.PublicationMode)
+			}
+		}
 		result = append(result, release)
 	}
 	return result, rows.Err()
+}
+
+func decodeNonEmptyHealthEvidence(encoded string, destination *any) error {
+	var evidence map[string]any
+	if err := json.Unmarshal([]byte(encoded), &evidence); err != nil {
+		return err
+	}
+	if len(evidence) != 0 {
+		*destination = evidence
+	}
+	return nil
 }
 
 func isHostingTerminalStatus(status string) bool {

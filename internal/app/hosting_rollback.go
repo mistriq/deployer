@@ -879,16 +879,17 @@ func getHostingRollbackReleaseOn(ctx context.Context, conn *sql.Conn, releaseID 
 		deployment.external_deployment_id, release.commit_sha, release.artifact_digest,
 		release.status, release.health_evidence_json, release.route_revision,
 		release.runtime_endpoint, release.previous_release_digest, release.created_at,
-		release.activated_at, release.deactivated_at
+		release.activated_at, release.deactivated_at, project.publication_mode
 		FROM hosting_releases release JOIN hosting_deployments deployment
-		  ON deployment.id=release.hosting_deployment_id WHERE release.id=?`, releaseID).Scan(
+		  ON deployment.id=release.hosting_deployment_id
+		JOIN hosting_projects project ON project.id=release.hosting_project_id WHERE release.id=?`, releaseID).Scan(
 		&release.Digest, &release.ExternalDeploymentID, &release.CommitSHA,
 		&release.ArtifactDigest, &release.Status, &evidenceJSON, &release.RouteRevision,
 		&release.RuntimeEndpoint, &release.PreviousRelease, &createdAt, &activatedAt,
-		&deactivatedAt); err != nil {
+		&deactivatedAt, &release.PublicationMode); err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal([]byte(evidenceJSON), &release.HealthEvidence); err != nil {
+	if err := decodeNonEmptyHealthEvidence(evidenceJSON, &release.HealthEvidence); err != nil {
 		return nil, fmt.Errorf("decode rollback health evidence: %w", err)
 	}
 	release.CreatedAt = parseSQLiteTime(createdAt)

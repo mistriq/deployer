@@ -391,7 +391,8 @@ exact generation-fenced activation of the authoritative active release and
 runtime endpoint, never a bare unsuspend; a project with no active release
 remains suspended until a later healthy activation supersedes the intent.
 
-Provision accepts the control-plane-owned canonical default hostname plus only
+Provision accepts the control-plane-owned canonical default hostname, a signed
+immutable `publication_mode`, plus only
 the versioned hosting manifest documented in OpenAPI:
 GitHub App installation/repository IDs, `static` or `node`, allowlisted build
 fields, paths, port, health path, and a resource profile. A plain static checkout
@@ -406,6 +407,17 @@ Deployer derives runtime namespaces from `external_project_id` and stores hostin
 state separately from trusted admin projects/builds. Hosting jobs cannot enter
 the legacy builder, Compose, Dockerfile, SSH, or `post_deploy` paths.
 
+`publication_mode` is `proxy_v1` or `runtime_only_v1`. Omission on initial
+provisioning defaults to `proxy_v1`; existing projects cannot change mode through
+ordinary manifest upsert. `proxy_v1` retains generation-fenced adapter activation.
+For `runtime_only_v1`, a candidate becomes ACTIVE transactionally after the same
+artifact, runner-session, runtime-inventory, health, desired-state, kill-switch,
+and cancellation fences, with no proxy operation or synthetic route revision.
+ACTIVE in this mode means a healthy private workload only and makes no DNS, TLS,
+hostname, or public-reachability claim. Rollback, suspend/resume, and runtime
+recovery remain on their existing proxy-aware paths until their explicit
+publication-mode branches are implemented.
+
 Hosting jobs advance through `fetching_source`, `building`,
 `starting_candidate`, and `health_checking` in order; repeating the current
 phase is safe, while skips and regressions conflict. An initial successful
@@ -416,8 +428,9 @@ exact runtime observation from the runner's current fenced inventory session,
 including the endpoint derived from the managed container's sole private port
 binding; the completion endpoint must match that observation exactly.
 Inventory-less runners are ineligible for new work. Deployer then
-applies a fresh HTTP health gate that rejects redirects before
-generation-fenced proxy activation. A terminal candidate health or activation
+applies a fresh HTTP health gate that rejects redirects before either
+runtime-only transactional activation or generation-fenced proxy activation.
+A terminal candidate health or activation
 failure leaves the previous active release unchanged. Activation intents retain
 the exact prior runtime endpoint so restart compensation cannot select a
 content-identical historical instance. After a Deployer restart,

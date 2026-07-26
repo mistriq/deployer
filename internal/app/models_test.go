@@ -865,7 +865,7 @@ func TestInitDBMigratesOlderSchema(t *testing.T) {
 		"projects":            {"runner_id", "deploy_mode", "post_deploy", "permissions", "preserve"},
 		"builds":              {"error_code"},
 		"jobs":                {"mode", "post_deploy", "permissions", "preserve", "error_code"},
-		"hosting_projects":    {"external_project_id", "manifest_version", "manifest_digest", "runtime_kind"},
+		"hosting_projects":    {"external_project_id", "manifest_version", "manifest_digest", "runtime_kind", "publication_mode"},
 		"hosting_deployments": {"external_deployment_id", "commit_sha", "artifact_digest", "status"},
 	} {
 		for _, column := range columns {
@@ -879,7 +879,7 @@ func TestInitDBMigratesOlderSchema(t *testing.T) {
 		}
 	}
 
-	for _, migrationID := range []string{"015_hosting_projects", "016_hosting_deployments"} {
+	for _, migrationID := range []string{"015_hosting_projects", "016_hosting_deployments", "042_hosting_publication_mode"} {
 		var count int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE id=?`, migrationID).Scan(&count); err != nil {
 			t.Fatalf("check migration %s: %v", migrationID, err)

@@ -45,8 +45,13 @@ func handleInternalProjectUpsert(w http.ResponseWriter, r *http.Request, externa
 		return
 	}
 	token, _ := r.Context().Value(serviceTokenContextKey{}).(*ServiceToken)
-	project, created, replayed, err := upsertHostingProjectAudited(r.Context(), payload.ExternalProjectID, payload.DefaultHostname, payload.Manifest, token, requestIDFromContext(r.Context()))
+	project, created, replayed, err := upsertHostingProjectAudited(r.Context(), payload.ExternalProjectID, payload.DefaultHostname, payload.PublicationMode, payload.Manifest, token, requestIDFromContext(r.Context()))
 	if err != nil {
+		var apiErr *hostingAPIError
+		if errors.As(err, &apiErr) {
+			writeHostingAPIError(w, err)
+			return
+		}
 		jsonErrorCode(w, errCodeProvisionFailed, "project provisioning failed", http.StatusInternalServerError)
 		return
 	}
@@ -55,6 +60,7 @@ func handleInternalProjectUpsert(w http.ResponseWriter, r *http.Request, externa
 		ExternalProjectID: project.ExternalProjectID,
 		ManifestDigest:    project.ManifestDigest,
 		Manifest:          project.Manifest,
+		PublicationMode:   project.PublicationMode,
 		Created:           created,
 		Replayed:          replayed,
 	}

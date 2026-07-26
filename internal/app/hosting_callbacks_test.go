@@ -801,7 +801,7 @@ func TestAuthenticatedDeploymentPollingRepairsTerminalCallbackState(t *testing.T
 			failureCode: "cancelled", callbackState: "delivered"},
 	}
 	for _, testCase := range cases {
-		if _, err := db.Exec(`INSERT INTO hosting_deployments
+		result, err := db.Exec(`INSERT INTO hosting_deployments
 			(hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest,
 			 status, phase, failure_code, failure_message, release_digest, callback_state,
 			 finished_at, created_at, updated_at)
@@ -809,8 +809,23 @@ func TestAuthenticatedDeploymentPollingRepairsTerminalCallbackState(t *testing.T
 			strings.Repeat("b", 40), project.ManifestDigest, "sha256:"+strings.Repeat("c", 64),
 			testCase.status, testCase.phase, testCase.failureCode,
 			"DATABASE_URL=postgres://app:poll-secret@db.internal/app", testCase.releaseDigest,
-			testCase.callbackState, now, now, now); err != nil {
+			testCase.callbackState, now, now, now)
+		if err != nil {
 			t.Fatal(err)
+		}
+		if testCase.status == hostingStatusActive {
+			deploymentID, err := result.LastInsertId()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO hosting_releases
+				(hosting_project_id, hosting_deployment_id, release_digest, commit_sha, artifact_digest,
+				 status, health_evidence_json, route_revision, runtime_endpoint, created_at, activated_at)
+				VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`, project.ID, deploymentID,
+				testCase.releaseDigest, strings.Repeat("b", 40), "sha256:"+strings.Repeat("c", 64),
+				`{"healthy":true,"attempts":1}`, "route-poll", "http://127.0.0.1:8080", now, now); err != nil {
+				t.Fatal(err)
+			}
 		}
 		request := httptest.NewRequest(http.MethodGet,
 			"/api/internal/v1/deployments/"+testCase.externalID, nil)

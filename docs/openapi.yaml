@@ -2625,6 +2625,8 @@ components:
       additionalProperties: false
       required: [default_hostname, manifest]
       properties:
+        publication_mode:
+          $ref: "#/components/schemas/HostingPublicationMode"
         default_hostname:
           type: string
           format: hostname
@@ -2721,7 +2723,7 @@ components:
 
     InternalProject:
       type: object
-      required: [default_hostname, external_project_id, manifest_digest, manifest, created, replayed]
+      required: [default_hostname, external_project_id, manifest_digest, manifest, publication_mode, created, replayed]
       properties:
         default_hostname:
           type: string
@@ -2733,6 +2735,8 @@ components:
           pattern: '^sha256:[a-f0-9]{64}$'
         manifest:
           $ref: "#/components/schemas/HostingProjectManifest"
+        publication_mode:
+          $ref: "#/components/schemas/HostingPublicationMode"
         created:
           type: boolean
         replayed:
@@ -2741,6 +2745,16 @@ components:
     SHA256Digest:
       type: string
       pattern: '^sha256:[a-f0-9]{64}$'
+
+    HostingPublicationMode:
+      type: string
+      enum: [proxy_v1, runtime_only_v1]
+      default: proxy_v1
+      description: >
+        Signed, immutable per-project publication policy. Omission during initial
+        provisioning selects proxy_v1 for legacy compatibility. runtime_only_v1
+        makes a health-gated private runner workload authoritative without claiming
+        proxy, DNS, TLS, or public reachability.
 
     HostingFailureCode:
       type: string
@@ -2861,6 +2875,7 @@ components:
         - artifact_digest
         - status
         - phase
+        - publication_mode
         - callback_state
         - created_at
         - updated_at
@@ -2882,6 +2897,7 @@ components:
         failure_message: {type: string, description: Redacted operator context; clients must use failure_code for logic.}
         release_digest: {$ref: "#/components/schemas/SHA256Digest"}
         previous_release_digest: {$ref: "#/components/schemas/SHA256Digest"}
+        publication_mode: {$ref: "#/components/schemas/HostingPublicationMode"}
         runtime_endpoint:
           type: string
           format: uri
@@ -2936,13 +2952,14 @@ components:
 
     HostingRelease:
       type: object
-      required: [digest, external_deployment_id, commit_sha, artifact_digest, status, created_at]
+      required: [digest, external_deployment_id, commit_sha, artifact_digest, status, publication_mode, created_at]
       properties:
         digest: {$ref: "#/components/schemas/SHA256Digest"}
         external_deployment_id: {$ref: "#/components/schemas/ExternalDeploymentId"}
         commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
         artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
         status: {type: string, enum: [healthy, active, inactive, failed]}
+        publication_mode: {$ref: "#/components/schemas/HostingPublicationMode"}
         health_evidence: {type: object}
         runtime_endpoint:
           type: string
@@ -2956,8 +2973,17 @@ components:
       allOf:
         - oneOf:
             - properties:
-                status: {enum: [healthy, active, inactive]}
+                status: {enum: [healthy, inactive]}
               required: [runtime_endpoint, health_evidence]
+            - properties:
+                status: {const: active}
+                publication_mode: {const: proxy_v1}
+              required: [runtime_endpoint, health_evidence, route_revision, activated_at]
+            - properties:
+                status: {const: active}
+                publication_mode: {const: runtime_only_v1}
+              required: [runtime_endpoint, health_evidence, activated_at]
+              not: {required: [route_revision]}
             - properties:
                 status: {const: failed}
 
@@ -2965,10 +2991,9 @@ components:
       allOf:
         - $ref: "#/components/schemas/HostingRelease"
         - type: object
-          required: [status, route_revision, activated_at]
+          required: [status, activated_at]
           properties:
             status: {type: string, const: active}
-            route_revision: {type: string, minLength: 1}
             activated_at: {type: string, format: date-time}
 
     HostingEvent:

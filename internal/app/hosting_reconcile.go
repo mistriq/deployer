@@ -49,6 +49,9 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 	if err := reconcileHostingRecoveryProxyOperations(ctx); err != nil {
 		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting recovery routing: %w", err))
 	}
+	if err := reconcileHostingRuntimeOnlyActivations(ctx); err != nil {
+		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting runtime-only activation: %w", err))
+	}
 	if err := reconcileHostingActivationOperations(ctx); err != nil {
 		externalErr = errors.Join(externalErr, fmt.Errorf("reconcile hosting activation: %w", err))
 	}
@@ -186,6 +189,84 @@ func reconcileHostingState(ctx context.Context, now time.Time) error {
 	}
 	committed = true
 	return externalErr
+}
+
+func reconcileHostingRuntimeOnlyActivations(ctx context.Context) error {
+	rows, err := db.QueryContext(ctx, `SELECT job.id, job.hosting_deployment_id, deployment.hosting_project_id,
+		job.hosting_runner_id, job.lease_generation, job.lease_token_hash, job.status,
+		project.external_project_id, deployment.external_deployment_id, deployment.commit_sha,
+		deployment.artifact_digest, deployment.release_digest, job.cancel_requested_at,
+		job.lease_expires_at, job.required_cpu_millis, job.required_ram_bytes,
+		job.required_disk_bytes, job.required_pids, release.runtime_endpoint,
+		release.runtime_manifest_json
+		FROM hosting_deployments deployment
+		JOIN hosting_projects project ON project.id=deployment.hosting_project_id
+		JOIN hosting_jobs job ON job.hosting_deployment_id=deployment.id
+		JOIN hosting_releases release ON release.hosting_deployment_id=deployment.id
+		  AND release.release_digest=deployment.release_digest
+		WHERE project.publication_mode=? AND deployment.status='running'
+		  AND deployment.phase='activating' AND job.status='running' AND release.status='healthy'
+		ORDER BY deployment.id`, hostingPublicationRuntimeOnlyV1)
+	if err != nil {
+		return err
+	}
+	type pendingRuntimeActivation struct {
+		state           hostingCompletionState
+		releaseDigest   string
+		runtimeEndpoint string
+		runtimeJSON     string
+	}
+	var pending []pendingRuntimeActivation
+	for rows.Next() {
+		var item pendingRuntimeActivation
+		item.state.PublicationMode = hostingPublicationRuntimeOnlyV1
+		if err := rows.Scan(&item.state.JobID, &item.state.DeploymentID, &item.state.ProjectID,
+			&item.state.RunnerID, &item.state.LeaseGeneration, &item.state.LeaseTokenHash,
+			&item.state.JobStatus, &item.state.ExternalProjectID, &item.state.ExternalDeploymentID,
+			&item.state.CommitSHA, &item.state.ArtifactDigest, &item.releaseDigest,
+			&item.state.CancelRequestedAt, &item.state.LeaseExpiresAt,
+			&item.state.Limits.CPUMillis, &item.state.Limits.RAMBytes,
+			&item.state.Limits.DiskBytes, &item.state.Limits.PIDs,
+			&item.runtimeEndpoint, &item.runtimeJSON); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := json.Unmarshal([]byte(item.runtimeJSON), &item.state.Runtime); err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range pending {
+		if item.state.CancelRequestedAt.Valid {
+			if err := cancelStagedHostingActivation(ctx, &item.state, item.releaseDigest,
+				"durable cancellation intent won during runtime-only activation reconciliation"); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := verifyStagedHostingCandidate(ctx, &item.state, item.releaseDigest, item.runtimeEndpoint); err != nil {
+			// A fresh health request can fail transiently during restart. Keep the
+			// exact healthy staged candidate durable for the next reconciliation;
+			// ordinary lease/runner-loss reconciliation remains authoritative for
+			// terminal stale-runtime handling.
+			continue
+		}
+		cancelled, err := activateHealthyHostingReleaseRuntimeOnly(ctx, &item.state, item.releaseDigest)
+		if err != nil {
+			return err
+		}
+		if cancelled {
+			if err := cancelStagedHostingActivation(ctx, &item.state, item.releaseDigest,
+				"execution disabled while reconciling runtime-only activation"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func reconcileHostingCompensationOperations(ctx context.Context) error {

@@ -69,6 +69,7 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"source-broker-openapi.yaml", "HostingSourceReference", "source_reference",
 		"secret-broker-openapi.yaml", "HostingWorkloadIdentity", "secret_reference_unavailable",
 		"runtime-secrets-v1", "runtime-inventory-v1", "HostingObservedRuntime",
+		"HostingPublicationMode", "publication_mode", "runtime_only_v1", "proxy_v1",
 		"ineligible for new build", "sole published IPv4 binding", "runtime_endpoint",
 		"runtime_instance_lost", "runtime_failure_code", "runtime_recovery_status",
 		"runner_session_superseded", "runtime_instance_missing_observed",

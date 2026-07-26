@@ -342,6 +342,215 @@ func TestHostingRunnerHealthyCandidateRetainsRuntimeCapacity(t *testing.T) {
 	}
 }
 
+func TestRuntimeOnlyHealthyCompletionActivatesWithoutProxyOrRouteRevision(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JRUNTIME", "deployment_01JRUNTIME")
+	if _, err := db.Exec(`UPDATE hosting_projects SET publication_mode=? WHERE id=?`, hostingPublicationRuntimeOnlyV1, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("6", 64)
+	completion := hostingCompletionRequest{
+		Status: "success", ReleaseDigest: digest,
+		ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest),
+		RuntimeEndpoint:       healthyHostingEndpointForTest(t),
+		HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1), "status_code": float64(200)},
+	}
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JRUNTIME")
+	if err != nil || deployment.Status != hostingStatusActive || deployment.PublicationMode != hostingPublicationRuntimeOnlyV1 ||
+		deployment.RuntimeEndpoint != completion.RuntimeEndpoint {
+		t.Fatalf("runtime-only deployment=%+v err=%v", deployment, err)
+	}
+	releases, err := listHostingReleases(t.Context(), project.ID)
+	if err != nil || len(releases) != 1 || releases[0].Status != "active" ||
+		releases[0].PublicationMode != hostingPublicationRuntimeOnlyV1 || releases[0].RouteRevision != "" {
+		t.Fatalf("runtime-only releases=%+v err=%v", releases, err)
+	}
+	if len(fake.activations) != 0 || len(fake.suspensions) != 0 {
+		t.Fatalf("runtime-only completion called proxy: activations=%+v suspensions=%+v", fake.activations, fake.suspensions)
+	}
+	var proxyOperations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_proxy_operations WHERE hosting_project_id=?`, project.ID).Scan(&proxyOperations); err != nil {
+		t.Fatal(err)
+	}
+	if proxyOperations != 0 {
+		t.Fatalf("runtime-only completion created %d proxy operations", proxyOperations)
+	}
+	var callbacks, activationEvents int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM callback_outbox WHERE hosting_deployment_id=?`, deployment.ID).Scan(&callbacks); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_events WHERE hosting_deployment_id=? AND event_type='release_activated'`, deployment.ID).Scan(&activationEvents); err != nil {
+		t.Fatal(err)
+	}
+	if callbacks != 1 || activationEvents != 1 {
+		t.Fatalf("runtime-only durable notifications callbacks=%d events=%d", callbacks, activationEvents)
+	}
+}
+
+func TestRuntimeOnlyRestartReconcilesStagedCandidateWithoutProxy(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	var healthy atomic.Bool
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !healthy.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer health.Close()
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JRUNRST", "deployment_01JRUNRST")
+	if _, err := db.Exec(`UPDATE hosting_projects SET publication_mode=? WHERE id=?`, hostingPublicationRuntimeOnlyV1, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("7", 64)
+	artifact := attachTestReleaseArtifact(t, job.JobID, digest)
+	observeHostingJobEndpointForTest(t, job.JobID, health.URL)
+	state, err := getHostingCompletionState(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stageHealthyHostingRelease(t.Context(), state, hostingCompletionRequest{Status: "success",
+		ReleaseDigest: digest, ReleaseArtifactDigest: artifact, RuntimeEndpoint: health.URL,
+		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	var sequence int
+	var name, path string
+	if err := db.QueryRow(`PRAGMA database_list`).Scan(&sequence, &name, &path); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	staged, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JRUNRST")
+	if err != nil || staged.Status != hostingStatusRunning || staged.Phase != hostingPhaseActivating {
+		t.Fatalf("transient health failure destroyed staged deployment=%+v err=%v", staged, err)
+	}
+	healthy.Store(true)
+	if err := reconcileHostingState(t.Context(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JRUNRST")
+	if err != nil || deployment.Status != hostingStatusActive || deployment.ReleaseDigest != digest {
+		t.Fatalf("reconciled deployment=%+v err=%v", deployment, err)
+	}
+	if len(fake.activations) != 0 {
+		t.Fatalf("restart reconciliation called proxy: %+v", fake.activations)
+	}
+}
+
+func TestRuntimeOnlyActivationStorageFailureKeepsCandidateRetryable(t *testing.T) {
+	withTempDB(t)
+	fake := withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JRUNDBX", "deployment_01JRUNDBX")
+	if _, err := db.Exec(`UPDATE hosting_projects SET publication_mode=? WHERE id=?`, hostingPublicationRuntimeOnlyV1, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("8", 64)
+	completion := hostingCompletionRequest{Status: "success", ReleaseDigest: digest,
+		ReleaseArtifactDigest: attachTestReleaseArtifact(t, job.JobID, digest),
+		RuntimeEndpoint:       healthyHostingEndpointForTest(t),
+		HealthEvidence:        map[string]any{"healthy": true, "attempts": float64(1)}}
+	if _, err := db.Exec(`CREATE TRIGGER fail_runtime_only_activation BEFORE UPDATE OF status ON hosting_releases
+		WHEN NEW.status='active' BEGIN SELECT RAISE(ABORT, 'injected activation storage failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err == nil {
+		t.Fatal("injected storage failure was ignored")
+	}
+	var releaseStatus, deploymentStatus, deploymentPhase string
+	if err := db.QueryRow(`SELECT release.status, deployment.status, deployment.phase
+		FROM hosting_releases release JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+		WHERE release.release_digest=?`, digest).Scan(&releaseStatus, &deploymentStatus, &deploymentPhase); err != nil {
+		t.Fatal(err)
+	}
+	if releaseStatus != "healthy" || deploymentStatus != hostingStatusRunning || deploymentPhase != hostingPhaseActivating {
+		t.Fatalf("transient failure destroyed staged candidate: release=%q deployment=%q/%q", releaseStatus, deploymentStatus, deploymentPhase)
+	}
+	if _, err := db.Exec(`DROP TRIGGER fail_runtime_only_activation`); err != nil {
+		t.Fatal(err)
+	}
+	if err := completeHostingJob(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken, completion); err != nil {
+		t.Fatalf("exact replay did not converge: %v", err)
+	}
+	deployment, err := getHostingDeploymentByExternalID(t.Context(), "deployment_01JRUNDBX")
+	if err != nil || deployment.Status != hostingStatusActive {
+		t.Fatalf("deployment=%+v err=%v", deployment, err)
+	}
+	if len(fake.activations) != 0 {
+		t.Fatalf("runtime-only retry called proxy: %+v", fake.activations)
+	}
+}
+
+func TestRuntimeOnlyStagedCancellationCallbackFailureReplaysAtomically(t *testing.T) {
+	withTempDB(t)
+	withFakeProxy(t)
+	project, _, runnerID, job := createAndClaimHostingJob(t, "project_01JRUNCXL", "deployment_01JRUNCXL")
+	if _, err := db.Exec(`UPDATE hosting_projects SET publication_mode=? WHERE id=?`, hostingPublicationRuntimeOnlyV1, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("3", 64)
+	artifact := attachTestReleaseArtifact(t, job.JobID, digest)
+	endpoint := healthyHostingEndpointForTest(t)
+	observeHostingJobEndpointForTest(t, job.JobID, endpoint)
+	state, err := getHostingCompletionState(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stageHealthyHostingRelease(t.Context(), state, hostingCompletionRequest{Status: "success",
+		ReleaseDigest: digest, ReleaseArtifactDigest: artifact, RuntimeEndpoint: endpoint,
+		HealthEvidence: map[string]any{"healthy": true, "attempts": float64(1)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_jobs SET cancel_requested_at=? WHERE id=?`, formatSQLiteTime(time.Now().UTC()), job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	state, err = getHostingCompletionState(t.Context(), runnerID, job.JobID, job.LeaseGeneration, job.LeaseToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installFailingCallbackInsertTrigger(t)
+	if err := cancelStagedHostingActivation(t.Context(), state, digest, "test cancellation"); err == nil {
+		t.Fatal("callback failure was ignored")
+	}
+	var releaseStatus, jobStatus string
+	if err := db.QueryRow(`SELECT status FROM hosting_releases WHERE release_digest=?`, digest).Scan(&releaseStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_jobs WHERE id=?`, job.JobID).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if releaseStatus != "healthy" || jobStatus != "running" {
+		t.Fatalf("callback failure partially terminalized release=%q job=%q", releaseStatus, jobStatus)
+	}
+	if _, err := db.Exec(`DROP TRIGGER fail_callback_outbox_insert`); err != nil {
+		t.Fatal(err)
+	}
+	if err := cancelStagedHostingActivation(t.Context(), state, digest, "test cancellation"); err != nil {
+		t.Fatalf("cancellation replay failed: %v", err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_releases WHERE release_digest=?`, digest).Scan(&releaseStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM hosting_jobs WHERE id=?`, job.JobID).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if releaseStatus != "failed" || jobStatus != "cancelled" {
+		t.Fatalf("cancellation replay release=%q job=%q", releaseStatus, jobStatus)
+	}
+}
+
 func TestInternalRuntimeEvidenceContractIsScopedAndAuthoritative(t *testing.T) {
 	withTempDB(t)
 	withFakeProxy(t)
@@ -406,6 +615,23 @@ func TestInternalRuntimeEvidenceContractIsScopedAndAuthoritative(t *testing.T) {
 		t.Fatalf("insufficient scope status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 
+	if _, err := db.Exec(`UPDATE hosting_releases SET health_evidence_json='{}' WHERE release_digest=?`, releaseDigest); err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JEVIDENCE", nil)
+	request.Header.Set("Authorization", "Bearer "+reader.Token)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("active deployment without health evidence status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	healthJSON, err := json.Marshal(completion.HealthEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE hosting_releases SET health_evidence_json=? WHERE release_digest=?`, string(healthJSON), releaseDigest); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Exec(`UPDATE hosting_releases SET runtime_endpoint='http://public.example.test:8080' WHERE release_digest=?`, releaseDigest); err != nil {
 		t.Fatal(err)
 	}
@@ -415,6 +641,32 @@ func TestInternalRuntimeEvidenceContractIsScopedAndAuthoritative(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("invalid persisted endpoint status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestFailedReleaseWithoutHealthGateOmitsEmptyHealthEvidence(t *testing.T) {
+	withTempDB(t)
+	project, _, _, job := createAndClaimHostingJob(t, "project_01JNOHEALTH", "deployment_01JNOHEALTH")
+	digest := "sha256:" + strings.Repeat("4", 64)
+	now := formatSQLiteTime(time.Now().UTC())
+	if _, err := db.Exec(`INSERT INTO hosting_releases
+		(hosting_project_id, hosting_deployment_id, release_digest, commit_sha, artifact_digest,
+		 status, health_evidence_json, created_at)
+		SELECT ?, deployment.id, ?, deployment.commit_sha, deployment.artifact_digest, 'failed', '{}', ?
+		FROM hosting_jobs job JOIN hosting_deployments deployment ON deployment.id=job.hosting_deployment_id
+		WHERE job.id=?`, project.ID, digest, now, job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	releases, err := listHostingReleases(t.Context(), project.ID)
+	if err != nil || len(releases) != 1 || releases[0].HealthEvidence != nil {
+		t.Fatalf("failed releases=%+v err=%v", releases, err)
+	}
+	encoded, err := json.Marshal(releases[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "health_evidence") || strings.Contains(string(encoded), "runtime_endpoint") {
+		t.Fatalf("non-health-gated release leaked empty evidence: %s", encoded)
 	}
 }
 
@@ -2685,6 +2937,9 @@ func TestHealthFailurePreservesPreviousActiveRelease(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
 	project, token, runnerID, firstJob := createAndClaimHostingJob(t, "project_01JHEALTH", "deployment_01JGOOD")
+	if _, err := db.Exec(`UPDATE hosting_projects SET publication_mode=? WHERE id=?`, hostingPublicationRuntimeOnlyV1, project.ID); err != nil {
+		t.Fatal(err)
+	}
 	firstDigest := "sha256:" + strings.Repeat("e", 64)
 	if err := completeHostingJob(t.Context(), runnerID, firstJob.JobID, firstJob.LeaseGeneration, firstJob.LeaseToken, hostingCompletionRequest{
 		Status: "success", ReleaseDigest: firstDigest, ReleaseArtifactDigest: attachTestReleaseArtifact(t, firstJob.JobID, firstDigest), RuntimeEndpoint: healthyHostingEndpointForTest(t),
@@ -2720,7 +2975,7 @@ func TestHealthFailurePreservesPreviousActiveRelease(t *testing.T) {
 	if err != nil || failed.Status != hostingStatusFailed || failed.FailureCode != "health_check_failed" {
 		t.Fatalf("unexpected failed deployment: %+v err=%v", failed, err)
 	}
-	if len(fake.activations) != 1 {
+	if len(fake.activations) != 0 {
 		t.Fatalf("unhealthy candidate reached proxy: %#v", fake.activations)
 	}
 }
@@ -2728,7 +2983,10 @@ func TestHealthFailurePreservesPreviousActiveRelease(t *testing.T) {
 func TestDurableCancelBeforeCompletionNeverActivatesCandidate(t *testing.T) {
 	withTempDB(t)
 	fake := withFakeProxy(t)
-	_, token, runnerID, job := createAndClaimHostingJob(t, "project_01JCANCEL", "deployment_01JCANCEL")
+	project, token, runnerID, job := createAndClaimHostingJob(t, "project_01JCANCEL", "deployment_01JCANCEL")
+	if _, err := db.Exec(`UPDATE hosting_projects SET publication_mode=? WHERE id=?`, hostingPublicationRuntimeOnlyV1, project.ID); err != nil {
+		t.Fatal(err)
+	}
 	cancelled, _, err := cancelHostingDeployment(t.Context(), token, "deployment_01JCANCEL", "cancel_deployment_01JCANCEL")
 	if err != nil {
 		t.Fatalf("request cancel: %v", err)

@@ -21,9 +21,11 @@ import (
 )
 
 const (
-	hostingManifestVersion = "v1"
-	maxManifestBodyBytes   = 64 << 10
-	manifestSignatureTTL   = 5 * time.Minute
+	hostingManifestVersion          = "v1"
+	hostingPublicationProxyV1       = "proxy_v1"
+	hostingPublicationRuntimeOnlyV1 = "runtime_only_v1"
+	maxManifestBodyBytes            = 64 << 10
+	manifestSignatureTTL            = 5 * time.Minute
 )
 
 const (
@@ -76,6 +78,7 @@ type HostingRuntimeManifest struct {
 type hostingProjectUpsertRequest struct {
 	ExternalProjectID string                 `json:"-"`
 	DefaultHostname   string                 `json:"default_hostname"`
+	PublicationMode   string                 `json:"publication_mode,omitempty"`
 	Manifest          HostingProjectManifest `json:"manifest"`
 }
 
@@ -96,6 +99,7 @@ type HostingProject struct {
 	RunnerID                 int64                  `json:"runner_id"`
 	DesiredState             string                 `json:"desired_state"`
 	KillSwitchReason         string                 `json:"kill_switch_reason,omitempty"`
+	PublicationMode          string                 `json:"publication_mode"`
 	CreatedAt                time.Time              `json:"created_at"`
 	UpdatedAt                time.Time              `json:"updated_at"`
 }
@@ -105,6 +109,7 @@ type internalProjectResponse struct {
 	ExternalProjectID string                 `json:"external_project_id"`
 	ManifestDigest    string                 `json:"manifest_digest"`
 	Manifest          HostingProjectManifest `json:"manifest"`
+	PublicationMode   string                 `json:"publication_mode"`
 	Created           bool                   `json:"created"`
 	Replayed          bool                   `json:"replayed"`
 }
@@ -200,6 +205,13 @@ func validateHostingProjectRequest(payload *hostingProjectUpsertRequest) error {
 	payload.DefaultHostname = strings.TrimSpace(payload.DefaultHostname)
 	if !validHostingHostname(payload.DefaultHostname) {
 		return fmt.Errorf("default_hostname must be a canonical lowercase DNS hostname")
+	}
+	payload.PublicationMode = strings.TrimSpace(payload.PublicationMode)
+	if payload.PublicationMode == "" {
+		payload.PublicationMode = hostingPublicationProxyV1
+	}
+	if payload.PublicationMode != hostingPublicationProxyV1 && payload.PublicationMode != hostingPublicationRuntimeOnlyV1 {
+		return fmt.Errorf("publication_mode must be proxy_v1 or runtime_only_v1")
 	}
 	manifest := &payload.Manifest
 	manifest.Repository.FullName = strings.TrimSpace(manifest.Repository.FullName)
@@ -346,7 +358,7 @@ func manifestJSONAndDigest(manifest HostingProjectManifest) (string, string, err
 	return string(encoded), "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
-func hostingProjectFromManifest(externalProjectID, defaultHostname string, manifest HostingProjectManifest) (*HostingProject, error) {
+func hostingProjectFromManifest(externalProjectID, defaultHostname, publicationMode string, manifest HostingProjectManifest) (*HostingProject, error) {
 	_, digest, err := manifestJSONAndDigest(manifest)
 	if err != nil {
 		return nil, err
@@ -358,6 +370,7 @@ func hostingProjectFromManifest(externalProjectID, defaultHostname string, manif
 	project := &HostingProject{
 		ExternalProjectID:        externalProjectID,
 		DefaultHostname:          defaultHostname,
+		PublicationMode:          publicationMode,
 		ManifestVersion:          manifest.SchemaVersion,
 		Manifest:                 manifest,
 		ManifestDigest:           digest,
@@ -388,18 +401,19 @@ func deriveHostingPath(root, externalProjectID string) (string, error) {
 func upsertHostingProject(ctx context.Context, externalProjectID string, manifest HostingProjectManifest) (*HostingProject, bool, bool, error) {
 	digest := sha256.Sum256([]byte(externalProjectID))
 	defaultHostname := fmt.Sprintf("project-%x.apps.invalid", digest[:8])
-	return upsertHostingProjectAudited(ctx, externalProjectID, defaultHostname, manifest, nil, "")
+	return upsertHostingProjectAudited(ctx, externalProjectID, defaultHostname, hostingPublicationProxyV1, manifest, nil, "")
 }
 
-func upsertHostingProjectAudited(ctx context.Context, externalProjectID, defaultHostname string, manifest HostingProjectManifest, token *ServiceToken, requestID string) (*HostingProject, bool, bool, error) {
-	payload := hostingProjectUpsertRequest{ExternalProjectID: externalProjectID, DefaultHostname: defaultHostname, Manifest: manifest}
+func upsertHostingProjectAudited(ctx context.Context, externalProjectID, defaultHostname, publicationMode string, manifest HostingProjectManifest, token *ServiceToken, requestID string) (*HostingProject, bool, bool, error) {
+	payload := hostingProjectUpsertRequest{ExternalProjectID: externalProjectID, DefaultHostname: defaultHostname, PublicationMode: publicationMode, Manifest: manifest}
 	if err := validateHostingProjectRequest(&payload); err != nil {
 		return nil, false, false, err
 	}
 	externalProjectID = payload.ExternalProjectID
 	defaultHostname = payload.DefaultHostname
+	publicationMode = payload.PublicationMode
 	manifest = payload.Manifest
-	project, err := hostingProjectFromManifest(externalProjectID, defaultHostname, manifest)
+	project, err := hostingProjectFromManifest(externalProjectID, defaultHostname, publicationMode, manifest)
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -421,7 +435,8 @@ func upsertHostingProjectAudited(ctx context.Context, externalProjectID, default
 	var existingID int64
 	var existingDigest string
 	var existingHostname string
-	err = conn.QueryRowContext(ctx, `SELECT id, manifest_digest, default_hostname FROM hosting_projects WHERE external_project_id=?`, externalProjectID).Scan(&existingID, &existingDigest, &existingHostname)
+	var existingPublicationMode string
+	err = conn.QueryRowContext(ctx, `SELECT id, manifest_digest, default_hostname, publication_mode FROM hosting_projects WHERE external_project_id=?`, externalProjectID).Scan(&existingID, &existingDigest, &existingHostname, &existingPublicationMode)
 	created := false
 	replayed := false
 	switch {
@@ -429,8 +444,8 @@ func upsertHostingProjectAudited(ctx context.Context, externalProjectID, default
 		created = true
 		now := time.Now().UTC()
 		manifestJSON, _, _ := manifestJSONAndDigest(project.Manifest)
-		res, insertErr := conn.ExecContext(ctx, `INSERT INTO hosting_projects (external_project_id, default_hostname, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			project.ExternalProjectID, project.DefaultHostname, project.ManifestVersion, manifestJSON, project.ManifestDigest, project.RepositoryInstallationID, project.RepositoryID, project.RepositoryFullName, project.RuntimeKind, project.ResourceProfile, project.RepoPath, project.DeployPath, project.RunnerID, formatSQLiteTime(now), formatSQLiteTime(now),
+		res, insertErr := conn.ExecContext(ctx, `INSERT INTO hosting_projects (external_project_id, default_hostname, publication_mode, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			project.ExternalProjectID, project.DefaultHostname, project.PublicationMode, project.ManifestVersion, manifestJSON, project.ManifestDigest, project.RepositoryInstallationID, project.RepositoryID, project.RepositoryFullName, project.RuntimeKind, project.ResourceProfile, project.RepoPath, project.DeployPath, project.RunnerID, formatSQLiteTime(now), formatSQLiteTime(now),
 		)
 		if insertErr != nil {
 			return nil, false, false, insertErr
@@ -441,6 +456,9 @@ func upsertHostingProjectAudited(ctx context.Context, externalProjectID, default
 		}
 	case err != nil:
 		return nil, false, false, err
+	case existingPublicationMode != project.PublicationMode:
+		return nil, false, false, &hostingAPIError{Code: errCodeConflict,
+			Message: "publication mode conflicts with the provisioned project", StatusCode: http.StatusConflict}
 	case existingDigest == project.ManifestDigest && existingHostname == project.DefaultHostname:
 		project.ID = existingID
 		replayed = true
@@ -461,7 +479,7 @@ func upsertHostingProjectAudited(ctx context.Context, externalProjectID, default
 		if created {
 			eventType = "hosting_project_created"
 		}
-		metadata, _ := json.Marshal(map[string]any{"external_project_id": externalProjectID, "manifest_digest": project.ManifestDigest})
+		metadata, _ := json.Marshal(map[string]any{"external_project_id": externalProjectID, "manifest_digest": project.ManifestDigest, "publication_mode": project.PublicationMode})
 		if _, err := conn.ExecContext(ctx, `INSERT INTO hosting_audit_events
 			(issuer_token_id, hosting_project_id, event_type, reason, request_id, metadata_json, created_at)
 			VALUES (?, ?, ?, 'control-plane manifest upsert', ?, ?, ?)`, token.ID, project.ID, eventType,
@@ -499,8 +517,8 @@ type hostingProjectQuerier interface {
 func getHostingProjectByIDOn(ctx context.Context, querier hostingProjectQuerier, id int64) (*HostingProject, error) {
 	var project HostingProject
 	var manifestJSON, createdAt, updatedAt string
-	err := querier.QueryRowContext(ctx, `SELECT id, external_project_id, default_hostname, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, desired_state, kill_switch_reason, created_at, updated_at FROM hosting_projects WHERE id=?`, id).Scan(
-		&project.ID, &project.ExternalProjectID, &project.DefaultHostname, &project.ManifestVersion, &manifestJSON, &project.ManifestDigest, &project.RepositoryInstallationID, &project.RepositoryID, &project.RepositoryFullName, &project.RuntimeKind, &project.ResourceProfile, &project.RepoPath, &project.DeployPath, &project.RunnerID, &project.DesiredState, &project.KillSwitchReason, &createdAt, &updatedAt,
+	err := querier.QueryRowContext(ctx, `SELECT id, external_project_id, default_hostname, publication_mode, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, desired_state, kill_switch_reason, created_at, updated_at FROM hosting_projects WHERE id=?`, id).Scan(
+		&project.ID, &project.ExternalProjectID, &project.DefaultHostname, &project.PublicationMode, &project.ManifestVersion, &manifestJSON, &project.ManifestDigest, &project.RepositoryInstallationID, &project.RepositoryID, &project.RepositoryFullName, &project.RuntimeKind, &project.ResourceProfile, &project.RepoPath, &project.DeployPath, &project.RunnerID, &project.DesiredState, &project.KillSwitchReason, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err

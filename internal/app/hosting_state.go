@@ -384,7 +384,7 @@ func getHostingDeploymentOnConn(ctx context.Context, conn *sql.Conn, externalID 
 	return scanHostingDeployment(conn.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
 		d.commit_sha, d.manifest_digest, d.artifact_digest, d.status, d.phase, d.failure_code,
 		d.failure_message, d.release_digest, d.previous_release_digest, d.callback_state,
-		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at
+		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at, p.publication_mode
 		FROM hosting_deployments d JOIN hosting_projects p ON p.id=d.hosting_project_id
 		WHERE d.external_deployment_id=?`, externalID))
 }
@@ -490,7 +490,7 @@ func getHostingDeploymentByIDOnConn(ctx context.Context, conn *sql.Conn, id int6
 	return scanHostingDeployment(conn.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
 		d.commit_sha, d.manifest_digest, d.artifact_digest, d.status, d.phase, d.failure_code,
 		d.failure_message, d.release_digest, d.previous_release_digest, d.callback_state,
-		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at
+		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at, p.publication_mode
 		FROM hosting_deployments d JOIN hosting_projects p ON p.id=d.hosting_project_id WHERE d.id=?`, id))
 }
 
@@ -498,7 +498,7 @@ func getHostingDeploymentByID(ctx context.Context, id int64) (*HostingDeployment
 	return scanHostingDeployment(db.QueryRowContext(ctx, `SELECT d.id, d.external_deployment_id, p.external_project_id,
 		d.commit_sha, d.manifest_digest, d.artifact_digest, d.status, d.phase, d.failure_code,
 		d.failure_message, d.release_digest, d.previous_release_digest, d.callback_state,
-		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at
+		d.cancel_requested_at, d.started_at, d.finished_at, d.created_at, d.updated_at, p.publication_mode
 		FROM hosting_deployments d JOIN hosting_projects p ON p.id=d.hosting_project_id WHERE d.id=?`, id))
 }
 
