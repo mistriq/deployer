@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Persist the control-plane-owned default hostname during project provision and
+  carry it into generation-fenced proxy activation instead of deriving a public
+  URL from the opaque external project ID.
+- Run plain no-build static image assembly with BuildKit network mode `none`,
+  avoiding unsupported custom RUN-network modes when the generated recipe has
+  no customer-controlled build step.
 - Add deployment phase-duration timelines, stable failure-code outcome metrics,
   online-schedulable capacity reporting, and explicit retention cleanup error
   reporting for expired release archives.

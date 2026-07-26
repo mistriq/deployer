@@ -385,7 +385,8 @@ exact generation-fenced activation of the authoritative active release and
 runtime endpoint, never a bare unsuspend; a project with no active release
 remains suspended until a later healthy activation supersedes the intent.
 
-Provision accepts only the versioned hosting manifest documented in OpenAPI:
+Provision accepts the control-plane-owned canonical default hostname plus only
+the versioned hosting manifest documented in OpenAPI:
 GitHub App installation/repository IDs, `static` or `node`, allowlisted build
 fields, paths, port, health path, and a resource profile. A plain static checkout
 has no Node or package build fields; its runtime is exactly
@@ -505,6 +506,7 @@ Register and rotate hosting runners through `/api/hosting-runners`; credentials
 are separate from legacy runner and service-token credentials. The agent
 requires Docker and a pre-created internal, restricted-egress build network,
 accepts only generated static/Node recipes, rejects unsafe tar entries, binds
+plain no-build static image assembly to BuildKit network mode `none`,
 candidate ports to the configured private address, drops all capabilities,
 enables `no-new-privileges`, uses a read-only root filesystem, and enforces CPU,
 RAM, disk, PID, build-time, and temporary-filesystem limits. Before activation
@@ -518,7 +520,8 @@ runtime/health snapshot stored with the release, not a later project manifest.
 
 Every activation, rollback, suspension, resume, recovery and compensation sent
 to the proxy adapter carries a positive, per-project monotonic
-`route_generation`. The adapter must atomically ignore requests below the
+`route_generation`; activation also carries the persisted default hostname.
+The adapter must atomically ignore requests below the
 highest generation it has applied for that project. Deployer persists each
 generation before the network call and reconciles pending operations after
 restart; compensations receive a newer generation. Rollback reconciliation

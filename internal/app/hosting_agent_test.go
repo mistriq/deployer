@@ -20,6 +20,23 @@ import (
 	"time"
 )
 
+func TestHostingBuildNetworkModeIsolatesNoBuildStaticRecipes(t *testing.T) {
+	configured := "hosting-build-egress"
+	noBuild := hostingJobRecipe{Runtime: HostingRuntimeManifest{
+		Kind: "static", OutputDirectory: ".",
+	}}
+	if got := hostingBuildNetworkMode(noBuild, configured); got != "none" {
+		t.Fatalf("no-build static network=%q", got)
+	}
+	withBuild := noBuild
+	withBuild.Runtime.PackageManager = "npm"
+	withBuild.Runtime.NodeVersion = "22"
+	withBuild.Runtime.BuildScript = "build"
+	if got := hostingBuildNetworkMode(withBuild, configured); got != configured {
+		t.Fatalf("build-required network=%q", got)
+	}
+}
+
 func writeHostingTestTar(t *testing.T, headers ...*tar.Header) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "source.tar")

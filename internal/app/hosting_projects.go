@@ -38,6 +38,7 @@ var (
 	packageScriptPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$`)
 	outputDirectoryPattern  = regexp.MustCompile(`^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$`)
 	healthPathPattern       = regexp.MustCompile(`^/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[A-Fa-f0-9]{2})*$`)
+	hostingHostnamePattern  = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 )
 
 func validHostingExternalIDSyntax(value string) bool {
@@ -74,12 +75,14 @@ type HostingRuntimeManifest struct {
 
 type hostingProjectUpsertRequest struct {
 	ExternalProjectID string                 `json:"-"`
+	DefaultHostname   string                 `json:"default_hostname"`
 	Manifest          HostingProjectManifest `json:"manifest"`
 }
 
 type HostingProject struct {
 	ID                       int64                  `json:"id"`
 	ExternalProjectID        string                 `json:"external_project_id"`
+	DefaultHostname          string                 `json:"default_hostname"`
 	ManifestVersion          string                 `json:"manifest_version"`
 	Manifest                 HostingProjectManifest `json:"manifest"`
 	ManifestDigest           string                 `json:"manifest_digest"`
@@ -98,6 +101,7 @@ type HostingProject struct {
 }
 
 type internalProjectResponse struct {
+	DefaultHostname   string                 `json:"default_hostname"`
 	ExternalProjectID string                 `json:"external_project_id"`
 	ManifestDigest    string                 `json:"manifest_digest"`
 	Manifest          HostingProjectManifest `json:"manifest"`
@@ -193,6 +197,10 @@ func validateHostingProjectRequest(payload *hostingProjectUpsertRequest) error {
 	if !validHostingExternalIDForAdmission(payload.ExternalProjectID) {
 		return fmt.Errorf("external_project_id must contain 8-128 safe characters and must not match a credential format")
 	}
+	payload.DefaultHostname = strings.TrimSpace(payload.DefaultHostname)
+	if !validHostingHostname(payload.DefaultHostname) {
+		return fmt.Errorf("default_hostname must be a canonical lowercase DNS hostname")
+	}
 	manifest := &payload.Manifest
 	manifest.Repository.FullName = strings.TrimSpace(manifest.Repository.FullName)
 	manifest.Runtime.Kind = strings.TrimSpace(manifest.Runtime.Kind)
@@ -216,6 +224,10 @@ func validateHostingProjectRequest(payload *hostingProjectUpsertRequest) error {
 		return fmt.Errorf("resource_profile must be starter or standard")
 	}
 	return validateHostingRuntimeManifest(&manifest.Runtime)
+}
+
+func validHostingHostname(value string) bool {
+	return len(value) <= 253 && value == strings.ToLower(value) && !strings.HasSuffix(value, ".") && hostingHostnamePattern.MatchString(value)
 }
 
 func validateHostingRuntimeManifest(runtime *HostingRuntimeManifest) error {
@@ -334,7 +346,7 @@ func manifestJSONAndDigest(manifest HostingProjectManifest) (string, string, err
 	return string(encoded), "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
-func hostingProjectFromManifest(externalProjectID string, manifest HostingProjectManifest) (*HostingProject, error) {
+func hostingProjectFromManifest(externalProjectID, defaultHostname string, manifest HostingProjectManifest) (*HostingProject, error) {
 	_, digest, err := manifestJSONAndDigest(manifest)
 	if err != nil {
 		return nil, err
@@ -345,6 +357,7 @@ func hostingProjectFromManifest(externalProjectID string, manifest HostingProjec
 	}
 	project := &HostingProject{
 		ExternalProjectID:        externalProjectID,
+		DefaultHostname:          defaultHostname,
 		ManifestVersion:          manifest.SchemaVersion,
 		Manifest:                 manifest,
 		ManifestDigest:           digest,
@@ -373,17 +386,20 @@ func deriveHostingPath(root, externalProjectID string) (string, error) {
 }
 
 func upsertHostingProject(ctx context.Context, externalProjectID string, manifest HostingProjectManifest) (*HostingProject, bool, bool, error) {
-	return upsertHostingProjectAudited(ctx, externalProjectID, manifest, nil, "")
+	digest := sha256.Sum256([]byte(externalProjectID))
+	defaultHostname := fmt.Sprintf("project-%x.apps.invalid", digest[:8])
+	return upsertHostingProjectAudited(ctx, externalProjectID, defaultHostname, manifest, nil, "")
 }
 
-func upsertHostingProjectAudited(ctx context.Context, externalProjectID string, manifest HostingProjectManifest, token *ServiceToken, requestID string) (*HostingProject, bool, bool, error) {
-	payload := hostingProjectUpsertRequest{ExternalProjectID: externalProjectID, Manifest: manifest}
+func upsertHostingProjectAudited(ctx context.Context, externalProjectID, defaultHostname string, manifest HostingProjectManifest, token *ServiceToken, requestID string) (*HostingProject, bool, bool, error) {
+	payload := hostingProjectUpsertRequest{ExternalProjectID: externalProjectID, DefaultHostname: defaultHostname, Manifest: manifest}
 	if err := validateHostingProjectRequest(&payload); err != nil {
 		return nil, false, false, err
 	}
 	externalProjectID = payload.ExternalProjectID
+	defaultHostname = payload.DefaultHostname
 	manifest = payload.Manifest
-	project, err := hostingProjectFromManifest(externalProjectID, manifest)
+	project, err := hostingProjectFromManifest(externalProjectID, defaultHostname, manifest)
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -404,7 +420,8 @@ func upsertHostingProjectAudited(ctx context.Context, externalProjectID string, 
 
 	var existingID int64
 	var existingDigest string
-	err = conn.QueryRowContext(ctx, `SELECT id, manifest_digest FROM hosting_projects WHERE external_project_id=?`, externalProjectID).Scan(&existingID, &existingDigest)
+	var existingHostname string
+	err = conn.QueryRowContext(ctx, `SELECT id, manifest_digest, default_hostname FROM hosting_projects WHERE external_project_id=?`, externalProjectID).Scan(&existingID, &existingDigest, &existingHostname)
 	created := false
 	replayed := false
 	switch {
@@ -412,8 +429,8 @@ func upsertHostingProjectAudited(ctx context.Context, externalProjectID string, 
 		created = true
 		now := time.Now().UTC()
 		manifestJSON, _, _ := manifestJSONAndDigest(project.Manifest)
-		res, insertErr := conn.ExecContext(ctx, `INSERT INTO hosting_projects (external_project_id, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			project.ExternalProjectID, project.ManifestVersion, manifestJSON, project.ManifestDigest, project.RepositoryInstallationID, project.RepositoryID, project.RepositoryFullName, project.RuntimeKind, project.ResourceProfile, project.RepoPath, project.DeployPath, project.RunnerID, formatSQLiteTime(now), formatSQLiteTime(now),
+		res, insertErr := conn.ExecContext(ctx, `INSERT INTO hosting_projects (external_project_id, default_hostname, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			project.ExternalProjectID, project.DefaultHostname, project.ManifestVersion, manifestJSON, project.ManifestDigest, project.RepositoryInstallationID, project.RepositoryID, project.RepositoryFullName, project.RuntimeKind, project.ResourceProfile, project.RepoPath, project.DeployPath, project.RunnerID, formatSQLiteTime(now), formatSQLiteTime(now),
 		)
 		if insertErr != nil {
 			return nil, false, false, insertErr
@@ -424,14 +441,16 @@ func upsertHostingProjectAudited(ctx context.Context, externalProjectID string, 
 		}
 	case err != nil:
 		return nil, false, false, err
-	case existingDigest == project.ManifestDigest:
+	case existingDigest == project.ManifestDigest && existingHostname == project.DefaultHostname:
 		project.ID = existingID
 		replayed = true
+	case existingHostname != "" && existingHostname != project.DefaultHostname:
+		return nil, false, false, fmt.Errorf("default hostname conflicts with the provisioned project")
 	default:
 		project.ID = existingID
 		manifestJSON, _, _ := manifestJSONAndDigest(project.Manifest)
-		_, err = conn.ExecContext(ctx, `UPDATE hosting_projects SET manifest_version=?, manifest_json=?, manifest_digest=?, repository_installation_id=?, repository_id=?, repository_full_name=?, runtime_kind=?, resource_profile=?, deploy_path=?, runner_id=?, updated_at=? WHERE id=?`,
-			project.ManifestVersion, manifestJSON, project.ManifestDigest, project.RepositoryInstallationID, project.RepositoryID, project.RepositoryFullName, project.RuntimeKind, project.ResourceProfile, project.DeployPath, project.RunnerID, formatSQLiteTime(time.Now()), project.ID,
+		_, err = conn.ExecContext(ctx, `UPDATE hosting_projects SET default_hostname=?, manifest_version=?, manifest_json=?, manifest_digest=?, repository_installation_id=?, repository_id=?, repository_full_name=?, runtime_kind=?, resource_profile=?, deploy_path=?, runner_id=?, updated_at=? WHERE id=?`,
+			project.DefaultHostname, project.ManifestVersion, manifestJSON, project.ManifestDigest, project.RepositoryInstallationID, project.RepositoryID, project.RepositoryFullName, project.RuntimeKind, project.ResourceProfile, project.DeployPath, project.RunnerID, formatSQLiteTime(time.Now()), project.ID,
 		)
 		if err != nil {
 			return nil, false, false, err
@@ -480,8 +499,8 @@ type hostingProjectQuerier interface {
 func getHostingProjectByIDOn(ctx context.Context, querier hostingProjectQuerier, id int64) (*HostingProject, error) {
 	var project HostingProject
 	var manifestJSON, createdAt, updatedAt string
-	err := querier.QueryRowContext(ctx, `SELECT id, external_project_id, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, desired_state, kill_switch_reason, created_at, updated_at FROM hosting_projects WHERE id=?`, id).Scan(
-		&project.ID, &project.ExternalProjectID, &project.ManifestVersion, &manifestJSON, &project.ManifestDigest, &project.RepositoryInstallationID, &project.RepositoryID, &project.RepositoryFullName, &project.RuntimeKind, &project.ResourceProfile, &project.RepoPath, &project.DeployPath, &project.RunnerID, &project.DesiredState, &project.KillSwitchReason, &createdAt, &updatedAt,
+	err := querier.QueryRowContext(ctx, `SELECT id, external_project_id, default_hostname, manifest_version, manifest_json, manifest_digest, repository_installation_id, repository_id, repository_full_name, runtime_kind, resource_profile, repo_path, deploy_path, runner_id, desired_state, kill_switch_reason, created_at, updated_at FROM hosting_projects WHERE id=?`, id).Scan(
+		&project.ID, &project.ExternalProjectID, &project.DefaultHostname, &project.ManifestVersion, &manifestJSON, &project.ManifestDigest, &project.RepositoryInstallationID, &project.RepositoryID, &project.RepositoryFullName, &project.RuntimeKind, &project.ResourceProfile, &project.RepoPath, &project.DeployPath, &project.RunnerID, &project.DesiredState, &project.KillSwitchReason, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err

@@ -574,6 +574,12 @@ func applyHostingMigrations() error {
 			},
 		},
 		{
+			id: "041_hosting_default_hostname",
+			statements: []string{
+				`ALTER TABLE hosting_projects ADD COLUMN default_hostname TEXT NOT NULL DEFAULT ''`,
+			},
+		},
+		{
 			id: "041_callback_recovery_and_retention",
 			statements: []string{
 				`ALTER TABLE callback_outbox ADD COLUMN finalized_at DATETIME`,

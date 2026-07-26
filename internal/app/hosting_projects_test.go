@@ -63,7 +63,10 @@ func withHostingConfig(t *testing.T) {
 
 func signedManifestRequest(t *testing.T, token, externalProjectID string, manifest HostingProjectManifest, signedAt time.Time) *http.Request {
 	t.Helper()
-	body, err := json.Marshal(hostingProjectUpsertRequest{Manifest: manifest})
+	body, err := json.Marshal(hostingProjectUpsertRequest{
+		DefaultHostname: "customer-app.apps.example.test",
+		Manifest:        manifest,
+	})
 	if err != nil {
 		t.Fatalf("encode manifest: %v", err)
 	}
@@ -229,7 +232,7 @@ func TestInternalProjectProvisionRejectsArbitraryShellAndUnknownFields(t *testin
 	handler.ServeHTTP(rec, req)
 	assertAPIErrorCode(t, rec, http.StatusBadRequest, errCodeInvalidManifest)
 
-	baseBody, err := json.Marshal(hostingProjectUpsertRequest{Manifest: validHostingManifest("node")})
+	baseBody, err := json.Marshal(hostingProjectUpsertRequest{DefaultHostname: "customer-app.apps.example.test", Manifest: validHostingManifest("node")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +276,7 @@ func TestInternalProjectProvisionRejectsBadRequestEnvelopes(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI))
-	validBody, err := json.Marshal(hostingProjectUpsertRequest{Manifest: validHostingManifest("static")})
+	validBody, err := json.Marshal(hostingProjectUpsertRequest{DefaultHostname: "customer-app.apps.example.test", Manifest: validHostingManifest("static")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +346,7 @@ func TestHostingManifestValidationRejectsUnsupportedOrUnsafeFields(t *testing.T)
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
-			payload := hostingProjectUpsertRequest{ExternalProjectID: "project_01JHOSTING", Manifest: validHostingManifest("static")}
+			payload := hostingProjectUpsertRequest{ExternalProjectID: "project_01JHOSTING", DefaultHostname: "customer-app.apps.example.test", Manifest: validHostingManifest("static")}
 			mutate(&payload)
 			if err := validateHostingProjectRequest(&payload); err == nil {
 				t.Fatal("expected manifest to be rejected")
@@ -361,7 +364,7 @@ func TestHostingManifestValidationAcceptsNoBuildStatic(t *testing.T) {
 		t.Run(runtime.OutputDirectory+runtime.NodeVersion, func(t *testing.T) {
 			manifest := validHostingManifest("static")
 			manifest.Runtime = runtime
-			payload := hostingProjectUpsertRequest{ExternalProjectID: "project_01JNOBUILD", Manifest: manifest}
+			payload := hostingProjectUpsertRequest{ExternalProjectID: "project_01JNOBUILD", DefaultHostname: "plain-site.apps.example.test", Manifest: manifest}
 			if err := validateHostingProjectRequest(&payload); err != nil {
 				t.Fatalf("valid no-build static manifest rejected: %v", err)
 			}
@@ -384,7 +387,7 @@ func TestHostingManifestValidationRejectsMalformedNoBuildStatic(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			manifest := validHostingManifest("static")
 			manifest.Runtime = runtime
-			payload := hostingProjectUpsertRequest{ExternalProjectID: "project_01JNOBUILD", Manifest: manifest}
+			payload := hostingProjectUpsertRequest{ExternalProjectID: "project_01JNOBUILD", DefaultHostname: "plain-site.apps.example.test", Manifest: manifest}
 			if err := validateHostingProjectRequest(&payload); err == nil {
 				t.Fatal("malformed no-build static manifest was accepted")
 			}
@@ -399,7 +402,7 @@ func TestInternalProjectProvisionAcceptsExactNoBuildStaticWireShape(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := []byte(`{"manifest":{"schema_version":"v1","repository":{"installation_id":1001,"repository_id":2002,"full_name":"socials-century/plain-site"},"runtime":{"kind":"static","output_directory":"."},"resource_profile":"starter"}}`)
+	body := []byte(`{"default_hostname":"plain-site.apps.example.test","manifest":{"schema_version":"v1","repository":{"installation_id":1001,"repository_id":2002,"full_name":"socials-century/plain-site"},"runtime":{"kind":"static","output_directory":"."},"resource_profile":"starter"}}`)
 	request := signedRawManifestRequest(t, token.Token, "project_01JNOBUILD", body, time.Now())
 	recorder := httptest.NewRecorder()
 	serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI)).ServeHTTP(recorder, request)
@@ -434,7 +437,7 @@ func TestHostingExternalIdentifiersRejectSecretShapedValues(t *testing.T) {
 		"AKIA1234567890ABCDEF",
 	} {
 		for _, candidate := range []string{identifier, "project-" + identifier} {
-			projectRequest := hostingProjectUpsertRequest{ExternalProjectID: candidate,
+			projectRequest := hostingProjectUpsertRequest{ExternalProjectID: candidate, DefaultHostname: "candidate.apps.example.test",
 				Manifest: validHostingManifest("static")}
 			if err := validateHostingProjectRequest(&projectRequest); err == nil {
 				t.Fatalf("secret-shaped external project ID %q was accepted", candidate)

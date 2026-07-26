@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 type proxyActivationRequest struct {
 	OperationID                   string `json:"operation_id"`
 	ExternalProjectID             string `json:"external_project_id"`
+	Hostname                      string `json:"hostname"`
 	ReleaseDigest                 string `json:"release_digest"`
 	RuntimeEndpoint               string `json:"runtime_endpoint"`
 	ExpectedPreviousReleaseDigest string `json:"expected_previous_release_digest,omitempty"`
@@ -57,7 +59,7 @@ func newHostingProxyClient(cfg AppConfig) (hostingProxyClient, error) {
 	}
 	timeout := cfg.ProxyAdapterTimeout
 	if timeout <= 0 {
-		timeout = 15 * time.Second
+		timeout = 130 * time.Second
 	}
 	return &httpHostingProxyClient{baseURL: strings.TrimRight(cfg.ProxyAdapterURL, "/"), token: cfg.ProxyAdapterToken, client: &http.Client{Timeout: timeout}}, nil
 }
@@ -65,6 +67,17 @@ func newHostingProxyClient(cfg AppConfig) (hostingProxyClient, error) {
 func (client *httpHostingProxyClient) Activate(ctx context.Context, request proxyActivationRequest) (*proxyActivationResponse, error) {
 	if request.RouteGeneration <= 0 {
 		return nil, &hostingAPIError{Code: errCodeProxyRejected, Message: "reverse-proxy activation requires a positive route generation", StatusCode: http.StatusBadGateway}
+	}
+	if strings.TrimSpace(request.Hostname) == "" {
+		if db == nil {
+			digest := sha256.Sum256([]byte(request.ExternalProjectID))
+			request.Hostname = fmt.Sprintf("project-%x.apps.invalid", digest[:8])
+		} else if err := db.QueryRowContext(ctx, `SELECT default_hostname FROM hosting_projects WHERE external_project_id=?`, request.ExternalProjectID).Scan(&request.Hostname); err != nil {
+			return nil, &hostingAPIError{Code: errCodeProxyRejected, Message: "reverse-proxy activation hostname is unavailable", StatusCode: http.StatusBadGateway, Err: err}
+		}
+	}
+	if !validHostingHostname(request.Hostname) {
+		return nil, &hostingAPIError{Code: errCodeProxyRejected, Message: "reverse-proxy activation hostname is invalid", StatusCode: http.StatusBadGateway}
 	}
 	var response proxyActivationResponse
 	path := "/api/internal/v1/projects/" + url.PathEscape(request.ExternalProjectID) + "/activate"

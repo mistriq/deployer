@@ -2618,8 +2618,13 @@ components:
     InternalProjectUpsertInput:
       type: object
       additionalProperties: false
-      required: [manifest]
+      required: [default_hostname, manifest]
       properties:
+        default_hostname:
+          type: string
+          format: hostname
+          maxLength: 253
+          description: Canonical lowercase default hostname owned by the control plane.
         manifest:
           $ref: "#/components/schemas/HostingProjectManifest"
 
@@ -2711,8 +2716,12 @@ components:
 
     InternalProject:
       type: object
-      required: [external_project_id, manifest_digest, manifest, created, replayed]
+      required: [default_hostname, external_project_id, manifest_digest, manifest, created, replayed]
       properties:
+        default_hostname:
+          type: string
+          format: hostname
+          maxLength: 253
         external_project_id: {$ref: "#/components/schemas/ExternalProjectId"}
         manifest_digest:
           type: string

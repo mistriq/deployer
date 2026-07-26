@@ -799,7 +799,8 @@ func runHostingWorkload(ctx context.Context, config hostingAgentConfig, job *hos
 	}
 	buildCtx, cancelBuild := context.WithTimeout(ctx, buildTimeout)
 	defer cancelBuild()
-	buildArgs := []string{"build", "--pull", "--no-cache", "--network", config.BuildNetwork,
+	buildNetwork := hostingBuildNetworkMode(job.Recipe, config.BuildNetwork)
+	buildArgs := []string{"build", "--pull", "--no-cache", "--network", buildNetwork,
 		"--memory", strconv.FormatInt(job.Recipe.Limits.RAMBytes, 10),
 		"--memory-swap", strconv.FormatInt(job.Recipe.Limits.RAMBytes, 10),
 		"--cpu-period", "100000", "--cpu-quota", strconv.FormatInt(job.Recipe.Limits.CPUMillis*100, 10),
@@ -836,6 +837,16 @@ func runHostingWorkload(ctx context.Context, config hostingAgentConfig, job *hos
 		return fail("runtime_start_failed", err)
 	}
 	return startHostingRuntime(ctx, config, job, imageTag, releaseDigest, releaseArtifactDigest, true)
+}
+
+func hostingBuildNetworkMode(recipe hostingJobRecipe, configured string) string {
+	if recipe.Runtime.Kind == "static" && !hostingRuntimeRequiresNode(recipe.Runtime) {
+		// A no-build static recipe has no customer-controlled RUN instructions.
+		// BuildKit only accepts default, none, or host here; use the strictly
+		// isolated mode instead of passing the runner's custom egress network.
+		return "none"
+	}
+	return configured
 }
 
 func runHostingRestoreWorkload(ctx context.Context, config hostingAgentConfig, job *hostingClaimedJob) hostingCompletionRequest {
