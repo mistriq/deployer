@@ -396,12 +396,6 @@ func rotateServiceTokenContext(ctx context.Context, id, expectedGeneration int64
 	}
 	now := time.Now().UTC()
 	rawToken := "dpl_" + generateToken()
-	expiresAt := now.Add(overlap)
-	if _, err := conn.ExecContext(ctx, `UPDATE service_token_credentials SET expires_at=?
-		WHERE service_token_id=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>?)`,
-		formatSQLiteTime(expiresAt), id, formatSQLiteTime(expiresAt)); err != nil {
-		return nil, err
-	}
 	credential, err := conn.ExecContext(ctx, `INSERT INTO service_token_credentials (service_token_id, token_hash, created_at) VALUES (?, ?, ?)`, id, hashToken(rawToken), formatSQLiteTime(now))
 	if err != nil {
 		return nil, err
@@ -414,6 +408,16 @@ func rotateServiceTokenContext(ctx context.Context, id, expectedGeneration int64
 		return nil, err
 	}
 	if err := insertServiceTokenAudit(ctx, conn, id, credentialID, "rotated", "trusted-admin", requestID, map[string]any{"overlap_seconds": int64(overlap.Seconds())}, now); err != nil {
+		return nil, err
+	}
+	// Start the old-credential overlap as close to commit as possible. In
+	// particular, token generation and audit persistence must not consume the
+	// advertised overlap while the transaction is still invisible to readers.
+	expiresAt := time.Now().UTC().Add(overlap)
+	if _, err := conn.ExecContext(ctx, `UPDATE service_token_credentials SET expires_at=?
+		WHERE service_token_id=? AND id<>? AND revoked_at IS NULL
+		  AND (expires_at IS NULL OR expires_at>?)`, formatSQLiteTime(expiresAt), id,
+		credentialID, formatSQLiteTime(expiresAt)); err != nil {
 		return nil, err
 	}
 	row := conn.QueryRowContext(ctx, `SELECT t.id, t.name, t.scopes, t.created_at, t.last_used_at, t.revoked_at,
