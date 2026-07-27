@@ -157,6 +157,9 @@ func TestGeneratedHostingRecipesIgnoreCustomerDockerfile(t *testing.T) {
 					t.Fatalf("generated recipe contains %q: %s", forbidden, text)
 				}
 			}
+			if runtime.Kind == "node" && !strings.Contains(text, "COPY --chown=node:node . .\n") {
+				t.Fatalf("node recipe does not preserve unprivileged runtime access: %s", text)
+			}
 			unchanged, err := os.ReadFile(filepath.Join(directory, "Dockerfile"))
 			if err != nil || !bytes.Equal(unchanged, customerDockerfile) {
 				t.Fatalf("customer Dockerfile was changed: %q, %v", unchanged, err)
@@ -195,7 +198,7 @@ func TestGeneratedNoBuildStaticRecipeUsesOnlyNginx(t *testing.T) {
 				}
 			}
 			copyJSON, _ := json.Marshal([]string{test.copySource, "/usr/share/nginx/html/"})
-			if !strings.Contains(text, "COPY "+string(copyJSON)+"\n") {
+			if !strings.Contains(text, "COPY --chown=101:101 "+string(copyJSON)+"\n") {
 				t.Fatalf("no-build recipe does not publish %q: %s", test.output, text)
 			}
 			ignore, err := os.ReadFile(filepath.Join(directory, ".deployer", "Dockerfile.dockerignore"))
@@ -220,7 +223,7 @@ func TestGeneratedBuiltStaticRecipeKeepsNodeBuildStage(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(generated)
-	for _, required := range []string{"FROM node:22-bookworm-slim AS build", "RUN npm ci --ignore-scripts", "RUN npm run build", "COPY --from=build /app/dist /usr/share/nginx/html"} {
+	for _, required := range []string{"FROM node:22-bookworm-slim AS build", "RUN npm ci --ignore-scripts", "RUN npm run build", "COPY --chown=101:101 .deployer/nginx.conf /etc/nginx/conf.d/default.conf", "COPY --chown=101:101 --from=build /app/dist /usr/share/nginx/html"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("built static recipe is missing %q: %s", required, text)
 		}

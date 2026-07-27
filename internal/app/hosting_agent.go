@@ -1473,7 +1473,7 @@ func writeGeneratedHostingRecipe(sourceDir string, recipe hostingJobRecipe) erro
 		if err != nil {
 			return err
 		}
-		dockerfile = fmt.Sprintf("FROM nginxinc/nginx-unprivileged:1.27-alpine\nCOPY %s\nEXPOSE 8080\n", copyInstruction)
+		dockerfile = fmt.Sprintf("FROM nginxinc/nginx-unprivileged:1.27-alpine\nCOPY --chown=101:101 %s\nEXPOSE 8080\n", copyInstruction)
 		if err := os.WriteFile(filepath.Join(directory, "Dockerfile.dockerignore"), []byte(".deployer\n"), 0640); err != nil {
 			return err
 		}
@@ -1482,7 +1482,7 @@ func writeGeneratedHostingRecipe(sourceDir string, recipe hostingJobRecipe) erro
 		if err != nil {
 			return err
 		}
-		dockerfile = fmt.Sprintf("FROM node:%s-bookworm-slim AS build\nWORKDIR /app\nCOPY . .\nRUN %s\nRUN %s\nFROM nginxinc/nginx-unprivileged:1.27-alpine\nCOPY .deployer/nginx.conf /etc/nginx/conf.d/default.conf\nCOPY --from=build /app/%s /usr/share/nginx/html\nEXPOSE 8080\n", recipe.Runtime.NodeVersion, install, runBuild, recipe.Runtime.OutputDirectory)
+		dockerfile = fmt.Sprintf("FROM node:%s-bookworm-slim AS build\nWORKDIR /app\nCOPY . .\nRUN %s\nRUN %s\nFROM nginxinc/nginx-unprivileged:1.27-alpine\nCOPY --chown=101:101 .deployer/nginx.conf /etc/nginx/conf.d/default.conf\nCOPY --chown=101:101 --from=build /app/%s /usr/share/nginx/html\nEXPOSE 8080\n", recipe.Runtime.NodeVersion, install, runBuild, recipe.Runtime.OutputDirectory)
 		nginx := "server { listen 8080; server_name _; root /usr/share/nginx/html; location / { try_files $uri $uri/ /index.html; } }\n"
 		if err := os.WriteFile(filepath.Join(directory, "nginx.conf"), []byte(nginx), 0640); err != nil {
 			return err
@@ -1496,7 +1496,7 @@ func writeGeneratedHostingRecipe(sourceDir string, recipe hostingJobRecipe) erro
 		if recipe.Runtime.BuildScript != "" {
 			buildStep = "RUN " + runBuild + "\n"
 		}
-		dockerfile = fmt.Sprintf("FROM node:%s-bookworm-slim\nWORKDIR /app\nCOPY . .\nRUN %s\n%sENV NODE_ENV=production\nENV PORT=%d\nUSER node\nEXPOSE %d\nCMD %s\n", recipe.Runtime.NodeVersion, install, buildStep, recipe.Runtime.Port, recipe.Runtime.Port, command)
+		dockerfile = fmt.Sprintf("FROM node:%s-bookworm-slim\nWORKDIR /app\nCOPY --chown=node:node . .\nRUN %s\n%sENV NODE_ENV=production\nENV PORT=%d\nUSER node\nEXPOSE %d\nCMD %s\n", recipe.Runtime.NodeVersion, install, buildStep, recipe.Runtime.Port, recipe.Runtime.Port, command)
 	}
 	return os.WriteFile(filepath.Join(directory, "Dockerfile"), []byte(dockerfile), 0640)
 }
