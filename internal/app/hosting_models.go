@@ -643,6 +643,21 @@ func applyHostingMigrations() error {
 					ON hosting_runtime_stops(hosting_release_id) WHERE status='pending'`,
 			},
 		},
+		{
+			id: "044_hosting_observation_pages",
+			statements: []string{
+				`ALTER TABLE hosting_logs ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1))`,
+				`ALTER TABLE hosting_logs ADD COLUMN dropped_bytes INTEGER NOT NULL DEFAULT 0 CHECK (dropped_bytes >= 0)`,
+				`CREATE TABLE hosting_stream_expiry_watermarks (
+					hosting_deployment_id INTEGER NOT NULL REFERENCES hosting_deployments(id) ON DELETE CASCADE,
+					stream TEXT NOT NULL CHECK (stream IN ('events','logs')),
+					expired_through_id INTEGER NOT NULL CHECK (expired_through_id > 0),
+					expired_through_at DATETIME NOT NULL,
+					updated_at DATETIME NOT NULL,
+					PRIMARY KEY (hosting_deployment_id, stream)
+				)`,
+			},
+		},
 	}
 
 	for _, migration := range migrations {

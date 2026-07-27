@@ -1202,6 +1202,30 @@ paths:
         "405": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
 
+  /api/internal/v1/projects/{externalProjectId}/runtime-health:
+    get:
+      tags: [internal]
+      summary: Read authoritative current project runtime health
+      description: >
+        Requires deployments:read. Returns the latest project event ID as a
+        decimal-string resource version plus the raw private active-release
+        endpoint and redacted health evidence for control-plane reconciliation.
+      operationId: getInternalProjectRuntimeHealth
+      security: [{serviceBearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ExternalProjectId"
+      responses:
+        "200":
+          description: Authoritative current runtime health; active_release is null when the project has no active release.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HostingRuntimeHealth"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "405": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+
   /api/internal/v1/projects/{externalProjectId}/rollback:
     post:
       tags: [internal]
@@ -1484,9 +1508,9 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/HostingDeployment"}
         "404": {$ref: "#/components/responses/Error"}
+        "400": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
-        "400": {$ref: "#/components/responses/Error"}
         "405": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
@@ -1500,15 +1524,16 @@ paths:
       security: [{serviceBearerAuth: []}]
       parameters:
         - $ref: "#/components/parameters/ExternalDeploymentId"
+        - $ref: "#/components/parameters/BeforeId"
+        - $ref: "#/components/parameters/EventPageLimit"
       responses:
         "200":
-          description: Ordered redacted events with stable phases, failure codes, and per-phase elapsed durations.
+          description: Newest bounded page, with items returned in chronological order, explicit retention gaps, stable failure codes, and exact per-phase elapsed durations.
           content:
             application/json:
-              schema:
-                type: array
-                items: {$ref: "#/components/schemas/HostingEvent"}
+              schema: {$ref: "#/components/schemas/HostingEventPage"}
         "404": {$ref: "#/components/responses/Error"}
+        "400": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "405": {$ref: "#/components/responses/Error"}
@@ -1523,15 +1548,16 @@ paths:
       security: [{serviceBearerAuth: []}]
       parameters:
         - $ref: "#/components/parameters/ExternalDeploymentId"
+        - $ref: "#/components/parameters/BeforeId"
+        - $ref: "#/components/parameters/LogPageLimit"
       responses:
         "200":
-          description: Ordered redacted log chunks.
+          description: Newest bounded page, with items returned in chronological order and at most 512 KiB of message bytes.
           content:
             application/json:
-              schema:
-                type: array
-                items: {$ref: "#/components/schemas/HostingLog"}
+              schema: {$ref: "#/components/schemas/HostingLogPage"}
         "404": {$ref: "#/components/responses/Error"}
+        "400": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "405": {$ref: "#/components/responses/Error"}
@@ -2415,6 +2441,22 @@ components:
         maxLength: 128
         pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
         x-new-admission-forbidden-pattern: '(?:(?:dpl_|htr_|wli_|ghp_|gho_|ghu_|ghs_|github_pat_|sk_live_|xox[baprs]-)[A-Za-z0-9_.-]{8,}|AKIA[A-Z0-9]{16})'
+    BeforeId:
+      name: before_id
+      in: query
+      required: false
+      description: Exclusive decimal-string event or log ID; selects the next older page.
+      schema: {type: string, pattern: '^[1-9][0-9]{0,18}$'}
+    EventPageLimit:
+      name: limit
+      in: query
+      required: false
+      schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+    LogPageLimit:
+      name: limit
+      in: query
+      required: false
+      schema: {type: integer, minimum: 1, maximum: 50, default: 25}
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -3041,9 +3083,10 @@ components:
 
     HostingEvent:
       type: object
+      additionalProperties: false
       required: [id, event_type, phase, metadata, created_at, phase_duration_seconds]
       properties:
-        id: {type: integer, format: int64}
+        id: {$ref: "#/components/schemas/DecimalId"}
         event_type:
           type: string
           description: >
@@ -3056,7 +3099,7 @@ components:
             runtime_recovery_failed/runtime_recovery_cancelled variants.
         phase: {type: string, enum: [queued, fetching_source, building, starting_candidate, health_checking, activating, active, failed, cancelling, cancelled, rolling_back]}
         failure_code: {$ref: "#/components/schemas/HostingFailureCode"}
-        metadata: {type: object, description: Redacted structured metadata.}
+        metadata: {type: object, description: Redacted structured metadata; oversized or invalid metadata is replaced by a bounded safe marker.}
         created_at: {type: string, format: date-time}
         phase_duration_seconds:
           type: number
@@ -3065,12 +3108,110 @@ components:
 
     HostingLog:
       type: object
-      required: [id, stream, message, created_at]
+      additionalProperties: false
+      required: [id, stream, message, truncated, dropped_bytes, created_at]
       properties:
-        id: {type: integer, format: int64}
+        id: {$ref: "#/components/schemas/DecimalId"}
         stream: {type: string, enum: [build, runtime, system]}
-        message: {type: string, description: Redacted bounded log message.}
+        message: {type: string, maxLength: 65536, description: Redacted UTF-8-safe suffix of the submitted log message.}
+        truncated: {type: boolean}
+        dropped_bytes: {type: integer, format: int64, minimum: 0, description: Redacted prefix bytes omitted before persistence.}
         created_at: {type: string, format: date-time}
+
+    DecimalId:
+      type: string
+      pattern: '^[1-9][0-9]{0,18}$'
+
+    HostingStreamPage:
+      type: object
+      additionalProperties: false
+      required: [has_more, next_before_id]
+      properties:
+        has_more: {type: boolean}
+        next_before_id:
+          oneOf:
+            - {$ref: "#/components/schemas/DecimalId"}
+            - {type: "null"}
+
+    HostingStreamRetention:
+      type: object
+      additionalProperties: false
+      required: [days, history_truncated, cursor_expired, expired_through_id, expired_through_at]
+      properties:
+        days: {type: integer, minimum: 0}
+        history_truncated: {type: boolean}
+        cursor_expired: {type: boolean}
+        expired_through_id:
+          oneOf:
+            - {$ref: "#/components/schemas/DecimalId"}
+            - {type: "null"}
+        expired_through_at:
+          oneOf:
+            - {type: string, format: date-time}
+            - {type: "null"}
+
+    HostingEventPage:
+      type: object
+      additionalProperties: false
+      required: [items, page, retention]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: "#/components/schemas/HostingEvent"}
+        page: {$ref: "#/components/schemas/HostingStreamPage"}
+        retention: {$ref: "#/components/schemas/HostingStreamRetention"}
+
+    HostingLogPage:
+      type: object
+      additionalProperties: false
+      required: [items, page, retention]
+      properties:
+        items:
+          type: array
+          maxItems: 50
+          items: {$ref: "#/components/schemas/HostingLog"}
+        page: {$ref: "#/components/schemas/HostingStreamPage"}
+        retention: {$ref: "#/components/schemas/HostingStreamRetention"}
+
+    HostingRuntimeHealth:
+      type: object
+      additionalProperties: false
+      required: [resource_version, observed_at, active_release, runtime_status, recovery, last_probe_at]
+      properties:
+        resource_version:
+          type: string
+          pattern: '^(?:0|[1-9][0-9]{0,18})$'
+        observed_at: {type: string, format: date-time}
+        active_release:
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [release_digest, external_deployment_id, commit_sha, artifact_digest, publication_mode]
+              properties:
+                release_digest: {$ref: "#/components/schemas/SHA256Digest"}
+                external_deployment_id: {$ref: "#/components/schemas/ExternalDeploymentId"}
+                commit_sha: {type: string, pattern: '^[a-f0-9]{40}$'}
+                artifact_digest: {$ref: "#/components/schemas/SHA256Digest"}
+                publication_mode: {$ref: "#/components/schemas/HostingPublicationMode"}
+            - {type: "null"}
+        runtime_status: {type: string, enum: [available, checking, recovering, unavailable]}
+        runtime_failure_code: {$ref: "#/components/schemas/HostingFailureCode"}
+        recovery:
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [id, status]
+              properties:
+                id: {$ref: "#/components/schemas/DecimalId"}
+                status: {type: string, enum: [queued, leased, running, succeeded, failed, cancelled]}
+            - {type: "null"}
+        last_probe_at:
+          oneOf:
+            - {type: string, format: date-time}
+            - {type: "null"}
+        runtime_endpoint: {type: string, format: uri, description: Private runner-authoritative endpoint; never expose directly to browsers.}
+        health_evidence: {type: object, description: Raw redacted authoritative evidence for the control plane.}
 
     HostingLogInput:
       type: object

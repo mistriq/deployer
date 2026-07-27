@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+const (
+	maxHostingLogBytesPerDeployment = 4 << 20
+	maxHostingEventsPerDeployment   = 10_000
+)
+
 type hostingMetricsResponse struct {
 	ObservedAt time.Time `json:"observed_at"`
 	Window     string    `json:"window"`
@@ -187,10 +192,35 @@ func cleanupHostingRecords(ctx context.Context, cfg AppConfig, now time.Time) er
 		_, err := tx.ExecContext(ctx, query, formatSQLiteTime(now.Add(-time.Duration(days)*24*time.Hour)))
 		return err
 	}
-	if err := deleteOlder(`DELETE FROM hosting_logs WHERE created_at<?`, cfg.HostingLogRetentionDays); err != nil {
+	if cfg.HostingLogRetentionDays > 0 {
+		if err := expireHostingStreamRows(ctx, tx, "logs", `SELECT hosting_deployment_id, id, created_at
+			FROM hosting_logs WHERE created_at<?`, formatSQLiteTime(now.Add(-time.Duration(cfg.HostingLogRetentionDays)*24*time.Hour)), now); err != nil {
+			return err
+		}
+	}
+	if cfg.HostingEventRetentionDays > 0 {
+		cutoff := formatSQLiteTime(now.Add(-time.Duration(cfg.HostingEventRetentionDays) * 24 * time.Hour))
+		if err := expireHostingStreamRows(ctx, tx, "events", `SELECT hosting_deployment_id, id, created_at
+			FROM hosting_events WHERE hosting_deployment_id IS NOT NULL AND created_at<?`, cutoff, now); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM hosting_events WHERE hosting_deployment_id IS NULL AND created_at<?`, cutoff); err != nil {
+			return err
+		}
+	}
+	if err := expireHostingStreamRows(ctx, tx, "logs", `SELECT hosting_deployment_id, id, created_at FROM (
+		SELECT hosting_deployment_id, id, created_at,
+		SUM(length(CAST(message AS BLOB))) OVER (
+			PARTITION BY hosting_deployment_id ORDER BY id DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+		) AS retained_bytes FROM hosting_logs
+	) WHERE retained_bytes>?`, maxHostingLogBytesPerDeployment, now); err != nil {
 		return err
 	}
-	if err := deleteOlder(`DELETE FROM hosting_events WHERE created_at<?`, cfg.HostingEventRetentionDays); err != nil {
+	if err := expireHostingStreamRows(ctx, tx, "events", `SELECT hosting_deployment_id, id, created_at FROM (
+		SELECT hosting_deployment_id, id, created_at,
+		ROW_NUMBER() OVER (PARTITION BY hosting_deployment_id ORDER BY id DESC) AS retained_rows
+		FROM hosting_events WHERE hosting_deployment_id IS NOT NULL
+	) WHERE retained_rows>?`, maxHostingEventsPerDeployment, now); err != nil {
 		return err
 	}
 	if err := deleteOlder(`DELETE FROM hosting_releases WHERE status IN ('inactive','failed') AND created_at<?`, cfg.HostingReleaseRetentionDays); err != nil {
@@ -264,6 +294,62 @@ func cleanupHostingRecords(ctx context.Context, cfg AppConfig, now time.Time) er
 	}
 	for _, id := range runnerIDs {
 		if err := recomputeHostingRunnerCapacity(ctx, conn, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func expireHostingStreamRows(ctx context.Context, tx *sql.Tx, stream, query string, argument any, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, query, argument)
+	if err != nil {
+		return err
+	}
+	type expiry struct {
+		maximumID int64
+		maximumAt time.Time
+		ids       []int64
+	}
+	byDeployment := make(map[int64]*expiry)
+	for rows.Next() {
+		var deploymentID, id int64
+		var createdAt string
+		if err := rows.Scan(&deploymentID, &id, &createdAt); err != nil {
+			rows.Close()
+			return err
+		}
+		entry := byDeployment[deploymentID]
+		if entry == nil {
+			entry = &expiry{}
+			byDeployment[deploymentID] = entry
+		}
+		entry.ids = append(entry.ids, id)
+		if id > entry.maximumID {
+			entry.maximumID = id
+		}
+		created := parseSQLiteTime(createdAt)
+		if created.After(entry.maximumAt) {
+			entry.maximumAt = created
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	table := "hosting_" + stream
+	for deploymentID, entry := range byDeployment {
+		for _, id := range entry.ids {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE hosting_deployment_id=? AND id=?`, deploymentID, id); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO hosting_stream_expiry_watermarks
+			(hosting_deployment_id, stream, expired_through_id, expired_through_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(hosting_deployment_id, stream) DO UPDATE SET
+			expired_through_id=MAX(expired_through_id, excluded.expired_through_id),
+			expired_through_at=MAX(expired_through_at, excluded.expired_through_at),
+			updated_at=excluded.updated_at`, deploymentID, stream, entry.maximumID,
+			formatSQLiteTime(entry.maximumAt), formatSQLiteTime(now)); err != nil {
 			return err
 		}
 	}

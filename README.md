@@ -313,6 +313,7 @@ Private control-plane API:
 - `GET /api/internal/v1/deployments/:externalDeploymentId/events`
 - `GET /api/internal/v1/deployments/:externalDeploymentId/logs`
 - `GET /api/internal/v1/projects/:externalProjectId/releases`
+- `GET /api/internal/v1/projects/:externalProjectId/runtime-health`
 - `POST /api/internal/v1/projects/:externalProjectId/rollback`
 - `POST /api/internal/v1/projects/:externalProjectId/suspend`
 - `POST /api/internal/v1/projects/:externalProjectId/resume`
@@ -327,6 +328,18 @@ runner-authoritative `runtime_endpoint` and redacted `health_evidence` after a
 runner reports an endpoint that passes Deployer validation and health gating.
 The endpoint is intended for private control-plane verification and recovery;
 it is not a public customer URL.
+
+Deployment event and log reads return bounded newest pages while ordering the
+items within each page chronologically. `before_id` is an optional strict
+decimal-string exclusive cursor. Event pages default to 50 and allow at most
+100 items; log pages default to 25 and allow at most 50 items and 512 KiB of
+message bytes. Responses include `has_more`/`next_before_id` plus the configured
+retention window and durable history/cursor-expiry metadata. Events use the
+next retained event even across page boundaries for phase duration. Log chunks
+are redacted before UTF-8-safe suffix truncation and report `truncated` and
+`dropped_bytes`. Age cleanup retains durable per-deployment stream watermarks;
+hard cleanup ceilings retain at most 4 MiB of log messages and 10,000 events per
+deployment without weakening the 30/90-day age policies.
 
 Rollback selects an immutable release instance with both its
 `external_deployment_id` and `release_digest`; a digest alone is intentionally

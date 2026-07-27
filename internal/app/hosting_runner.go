@@ -14,11 +14,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	hostingJobLeaseDuration = 2 * time.Minute
-	maxHostingLogChunkBytes = 64 << 10
+	hostingJobLeaseDuration   = 2 * time.Minute
+	maxHostingLogChunkBytes   = 64 << 10
+	maxHostingLogRequestBytes = 128 << 10
 )
 
 type HostingRunner struct {
@@ -1390,6 +1392,18 @@ type hostingLogRequest struct {
 	Message string `json:"message"`
 }
 
+func truncateHostingLogMessage(message string) (string, bool, int64) {
+	redacted := redactSecrets(message)
+	if len(redacted) <= maxHostingLogChunkBytes {
+		return redacted, false, 0
+	}
+	dropped := len(redacted) - maxHostingLogChunkBytes
+	for dropped < len(redacted) && !utf8.RuneStart(redacted[dropped]) {
+		dropped++
+	}
+	return redacted[dropped:], true, int64(dropped)
+}
+
 func handleHostingJobLogs(w http.ResponseWriter, r *http.Request, jobID int64) {
 	if !requireMethod(w, r, http.MethodPost) || !requireJSONContentType(w, r) {
 		return
@@ -1406,21 +1420,19 @@ func handleHostingJobLogs(w http.ResponseWriter, r *http.Request, jobID int64) {
 		return
 	}
 	var input hostingLogRequest
-	if !decodeInternalJSON(w, r, maxHostingLogChunkBytes, &input) {
+	if !decodeInternalJSON(w, r, maxHostingLogRequestBytes, &input) {
 		return
 	}
 	if input.Stream != "build" && input.Stream != "runtime" && input.Stream != "system" {
 		jsonErrorCode(w, errCodeValidation, "invalid log stream", http.StatusBadRequest)
 		return
 	}
-	input.Message = redactSecrets(input.Message)
-	if len(input.Message) > maxHostingLogChunkBytes {
-		input.Message = input.Message[len(input.Message)-maxHostingLogChunkBytes:]
-	}
-	result, err := db.ExecContext(r.Context(), `INSERT INTO hosting_logs (hosting_deployment_id, stream, message, created_at)
-		SELECT hosting_deployment_id, ?, ?, ? FROM hosting_jobs WHERE id=? AND hosting_deployment_id=?
+	message, truncated, droppedBytes := truncateHostingLogMessage(input.Message)
+	result, err := db.ExecContext(r.Context(), `INSERT INTO hosting_logs
+		(hosting_deployment_id, stream, message, truncated, dropped_bytes, created_at)
+		SELECT hosting_deployment_id, ?, ?, ?, ?, ? FROM hosting_jobs WHERE id=? AND hosting_deployment_id=?
 		  AND hosting_runner_id=? AND lease_generation=? AND lease_token_hash=?
-		  AND status IN ('leased','running') AND lease_expires_at>?`, input.Stream, input.Message,
+		  AND status IN ('leased','running') AND lease_expires_at>?`, input.Stream, message, truncated, droppedBytes,
 		formatSQLiteTime(time.Now().UTC()), jobID, deploymentID, runner.ID, generation, hashToken(token), formatSQLiteTime(time.Now().UTC()))
 	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "persist hosting log failed", http.StatusInternalServerError)

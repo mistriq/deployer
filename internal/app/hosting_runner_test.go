@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type fakeProxyClient struct {
@@ -4047,6 +4048,18 @@ func TestHostingLeaseMutationsRejectExpiryAndRedactLogs(t *testing.T) {
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_logs`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("log count=%d err=%v", count, err)
+	}
+}
+
+func TestHostingLogTruncationRedactsBeforeUTF8SafeSuffix(t *testing.T) {
+	secret := "Authorization: Bearer super-secret-value"
+	message := strings.Repeat("x", maxHostingLogChunkBytes) + "\n" + secret + "\n" + strings.Repeat("é", maxHostingLogChunkBytes)
+	stored, truncated, dropped := truncateHostingLogMessage(message)
+	if !truncated || dropped <= 0 || len(stored) > maxHostingLogChunkBytes || !utf8.ValidString(stored) {
+		t.Fatalf("truncation stored_bytes=%d truncated=%v dropped=%d valid=%v", len(stored), truncated, dropped, utf8.ValidString(stored))
+	}
+	if strings.Contains(stored, "super-secret-value") {
+		t.Fatal("truncated message retained the secret")
 	}
 }
 

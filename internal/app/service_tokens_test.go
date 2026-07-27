@@ -862,6 +862,7 @@ func TestInternalRoutesRequireTheirDocumentedServiceTokenScopes(t *testing.T) {
 		{http.MethodGet, "/api/internal/v1/deployments/deploy_01JAUTHMATRIX", serviceScopeDeploymentsRead},
 		{http.MethodGet, "/api/internal/v1/deployments/deploy_01JAUTHMATRIX/events", serviceScopeDeploymentsRead},
 		{http.MethodGet, "/api/internal/v1/deployments/deploy_01JAUTHMATRIX/logs", serviceScopeDeploymentsRead},
+		{http.MethodGet, "/api/internal/v1/projects/project_01JAUTHMATRIX/runtime-health", serviceScopeDeploymentsRead},
 		{http.MethodPost, "/api/internal/v1/projects/project_01JAUTHMATRIX/deployments", serviceScopeDeploymentsWrite},
 		{http.MethodPost, "/api/internal/v1/projects/project_01JAUTHMATRIX/rollback", serviceScopeDeploymentsWrite},
 		{http.MethodPost, "/api/internal/v1/deployments/deploy_01JAUTHMATRIX/cancel", serviceScopeDeploymentsWrite},

@@ -327,25 +327,22 @@ func handleHostingRecoveryLogs(w http.ResponseWriter, r *http.Request, recoveryI
 		return
 	}
 	var input hostingLogRequest
-	if !decodeInternalJSON(w, r, maxHostingLogChunkBytes, &input) {
+	if !decodeInternalJSON(w, r, maxHostingLogRequestBytes, &input) {
 		return
 	}
 	if input.Stream != "runtime" && input.Stream != "system" {
 		jsonErrorCode(w, errCodeValidation, "recovery logs must use runtime or system stream", http.StatusBadRequest)
 		return
 	}
-	input.Message = redactSecrets(input.Message)
-	if len(input.Message) > maxHostingLogChunkBytes {
-		input.Message = input.Message[len(input.Message)-maxHostingLogChunkBytes:]
-	}
+	message, truncated, droppedBytes := truncateHostingLogMessage(input.Message)
 	now := time.Now().UTC()
 	result, err := db.ExecContext(r.Context(), `INSERT INTO hosting_logs
-		(hosting_deployment_id, stream, message, created_at)
-		SELECT release.hosting_deployment_id, ?, ?, ? FROM hosting_runtime_recoveries recovery
+		(hosting_deployment_id, stream, message, truncated, dropped_bytes, created_at)
+		SELECT release.hosting_deployment_id, ?, ?, ?, ?, ? FROM hosting_runtime_recoveries recovery
 		JOIN hosting_releases release ON release.id=recovery.hosting_release_id
 		WHERE recovery.id=? AND recovery.hosting_runner_id=? AND recovery.lease_generation=?
 		  AND recovery.lease_token_hash=? AND recovery.status IN ('leased','running')
-		  AND recovery.lease_expires_at>?`, input.Stream, input.Message, formatSQLiteTime(now), recoveryID,
+		  AND recovery.lease_expires_at>?`, input.Stream, message, truncated, droppedBytes, formatSQLiteTime(now), recoveryID,
 		runner.ID, generation, hashToken(token), formatSQLiteTime(now))
 	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "persist recovery log failed", http.StatusInternalServerError)

@@ -34,6 +34,7 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"/api/internal/v1/projects/{externalProjectId}:",
 		"/api/internal/v1/projects/{externalProjectId}/deployments:",
 		"/api/internal/v1/projects/{externalProjectId}/releases:",
+		"/api/internal/v1/projects/{externalProjectId}/runtime-health:",
 		"/api/internal/v1/projects/{externalProjectId}/rollback:",
 		"/api/internal/v1/projects/{externalProjectId}/suspend:",
 		"/api/internal/v1/projects/{externalProjectId}/resume:",
@@ -74,6 +75,9 @@ func TestOpenAPIDocumentsEveryHostingContractBoundary(t *testing.T) {
 		"runtime_instance_lost", "runtime_failure_code", "runtime_recovery_status",
 		"runner_session_superseded", "runtime_instance_missing_observed",
 		"runtime-adoptions.json", "cleanup_authorized", "512 KiB", "maxItems: 1024",
+		"HostingEventPage", "HostingLogPage", "HostingRuntimeHealth", "DecimalId",
+		"BeforeId", "EventPageLimit", "LogPageLimit", "resource_version",
+		"truncated", "dropped_bytes", "history_truncated", "cursor_expired",
 	}
 	for _, value := range required {
 		if !strings.Contains(document, value) {

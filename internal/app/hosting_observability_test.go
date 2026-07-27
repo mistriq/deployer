@@ -50,20 +50,237 @@ func TestHostingEventTimelineReportsPhaseDurationsAndStableFailureCodes(t *testi
 	handler := serviceTokenAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleInternalDeploymentEvents(w, r, "deployment_01JTIMELINE")
 	}))
-	req := httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JTIMELINE/events", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JTIMELINE/events?limit=2", nil)
 	req.Header.Set("Authorization", "Bearer "+token.Token)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("timeline status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var events []hostingEventResponse
-	if err := json.NewDecoder(bytes.NewReader(rec.Body.Bytes())).Decode(&events); err != nil {
+	var page hostingEventPageResponse
+	if err := json.NewDecoder(bytes.NewReader(rec.Body.Bytes())).Decode(&page); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 3 || events[0].PhaseDurationSeconds != 7 || events[1].PhaseDurationSeconds != 12 ||
-		events[2].PhaseDurationSeconds != 0 || events[2].FailureCode != "build_failed" {
-		t.Fatalf("timeline events=%+v", events)
+	if len(page.Items) != 2 || page.Items[0].PhaseDurationSeconds != 12 || page.Items[1].PhaseDurationSeconds != 0 ||
+		page.Items[1].FailureCode != "build_failed" || !page.Page.HasMore || page.Page.NextBeforeID == nil ||
+		page.Items[0].ID != *page.Page.NextBeforeID {
+		t.Fatalf("timeline page=%+v", page)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JTIMELINE/events?before_id="+*page.Page.NextBeforeID+"&limit=2", nil)
+	req.Header.Set("Authorization", "Bearer "+token.Token)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("older timeline status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].PhaseDurationSeconds != 7 || page.Page.HasMore {
+		t.Fatalf("older timeline page=%+v", page)
+	}
+}
+
+func TestHostingLogPagesAreBoundedChronologicalAndStrict(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JLOGPAGE")
+	now := time.Now().UTC().Truncate(time.Second)
+	result, err := db.Exec(`INSERT INTO hosting_deployments
+		(hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest,
+		 status, phase, callback_state, created_at, updated_at)
+		VALUES (?, 'deployment_01JLOGPAGE', ?, ?, ?, 'running', 'building', 'pending', ?, ?)`,
+		project.ID, strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64),
+		formatSQLiteTime(now), formatSQLiteTime(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentID, _ := result.LastInsertId()
+	for index, message := range []string{"oldest", "middle", "newest"} {
+		if _, err := db.Exec(`INSERT INTO hosting_logs
+			(hosting_deployment_id, stream, message, truncated, dropped_bytes, created_at)
+			VALUES (?, 'system', ?, ?, ?, ?)`, deploymentID, message, index == 1, index*7,
+			formatSQLiteTime(now.Add(time.Duration(index)*time.Second))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := serviceTokenAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleInternalDeploymentLogs(w, r, "deployment_01JLOGPAGE")
+	}))
+	request := func(query string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JLOGPAGE/logs"+query, nil)
+		req.Header.Set("Authorization", "Bearer "+token.Token)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	rec := request("?limit=2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("log page status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var page hostingLogPageResponse
+	if err := json.NewDecoder(rec.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || page.Items[0].Message != "middle" || page.Items[1].Message != "newest" ||
+		!page.Items[0].Truncated || page.Items[0].DroppedBytes != 7 || !page.Page.HasMore ||
+		page.Page.NextBeforeID == nil || page.Items[0].ID != *page.Page.NextBeforeID {
+		t.Fatalf("log page=%+v", page)
+	}
+	if rec := request("?limit=01"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("noncanonical limit status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := request("?limit=1&limit=2"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("duplicate limit status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := request("?unknown=1"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown query status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHostingLogPageByteCapContinuesWithoutSkippingRows(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JLOGBYTES")
+	now := time.Now().UTC().Truncate(time.Second)
+	result, err := db.Exec(`INSERT INTO hosting_deployments
+		(hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest,
+		 status, phase, callback_state, created_at, updated_at)
+		VALUES (?, 'deployment_01JLOGBYTES', ?, ?, ?, 'running', 'building', 'pending', ?, ?)`,
+		project.ID, strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64),
+		formatSQLiteTime(now), formatSQLiteTime(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentID, _ := result.LastInsertId()
+	message := strings.Repeat("x", maxHostingLogChunkBytes)
+	for index := 0; index < 10; index++ {
+		if _, err := db.Exec(`INSERT INTO hosting_logs (hosting_deployment_id, stream, message, created_at)
+			VALUES (?, 'build', ?, ?)`, deploymentID, message, formatSQLiteTime(now.Add(time.Duration(index)*time.Second))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(before string) hostingLogPageResponse {
+		t.Helper()
+		path := "/api/internal/v1/deployments/deployment_01JLOGBYTES/logs?limit=50"
+		if before != "" {
+			path += "&before_id=" + before
+		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+token.Token)
+		rec := httptest.NewRecorder()
+		serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI)).ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("log byte page status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var page hostingLogPageResponse
+		if err := json.NewDecoder(rec.Body).Decode(&page); err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+	first := read("")
+	if len(first.Items) != 8 || !first.Page.HasMore || first.Page.NextBeforeID == nil {
+		t.Fatalf("first byte page=%+v", first.Page)
+	}
+	second := read(*first.Page.NextBeforeID)
+	if len(second.Items) != 2 || second.Page.HasMore || second.Items[len(second.Items)-1].ID >= first.Items[0].ID {
+		t.Fatalf("second byte page=%+v items=%+v", second.Page, second.Items)
+	}
+}
+
+func TestHostingEventMetadataUsesBoundedSafeFallback(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JEVENTBOUND")
+	now := time.Now().UTC().Truncate(time.Second)
+	result, err := db.Exec(`INSERT INTO hosting_deployments
+		(hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest,
+		 status, phase, callback_state, created_at, updated_at)
+		VALUES (?, 'deployment_01JEVENTBOUND', ?, ?, ?, 'running', 'building', 'pending', ?, ?)`,
+		project.ID, strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64),
+		formatSQLiteTime(now), formatSQLiteTime(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentID, _ := result.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO hosting_events
+		(hosting_project_id, hosting_deployment_id, event_type, phase, metadata_json, created_at)
+		VALUES (?, ?, 'bounded', 'building', ?, ?)`, project.ID, deploymentID,
+		`{"detail":"`+strings.Repeat("x", maxHostingEventMetadataBytes)+`"}`, formatSQLiteTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JEVENTBOUND/events", nil)
+	req.Header.Set("Authorization", "Bearer "+token.Token)
+	rec := httptest.NewRecorder()
+	serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI)).ServeHTTP(rec, req)
+	var page hostingEventPageResponse
+	if rec.Code != http.StatusOK {
+		t.Fatalf("event metadata status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].Metadata["truncated"] != true || page.Items[0].Metadata["redacted"] != true {
+		t.Fatalf("event metadata=%#v", page.Items)
+	}
+}
+
+func TestInternalProjectRuntimeHealthReturnsAuthoritativeActiveRelease(t *testing.T) {
+	withTempDB(t)
+	project, token := provisionDeploymentTestProject(t, "project_01JRUNTIMEHEALTH")
+	limits, _ := hostingLimitsForProfile(project.ResourceProfile)
+	runnerID := insertHostingRunnerForTest(t, "runtime-health-runner", limits)
+	now := time.Now().UTC().Truncate(time.Second)
+	result, err := db.Exec(`INSERT INTO hosting_deployments
+		(hosting_project_id, external_deployment_id, commit_sha, manifest_digest, artifact_digest,
+		 status, phase, release_digest, callback_state, created_at, updated_at, finished_at)
+		VALUES (?, 'deployment_01JRUNTIMEHEALTH', ?, ?, ?, 'active', 'active', ?, 'delivered', ?, ?, ?)`,
+		project.ID, strings.Repeat("a", 40), project.ManifestDigest, "sha256:"+strings.Repeat("b", 64),
+		"sha256:"+strings.Repeat("d", 64), formatSQLiteTime(now), formatSQLiteTime(now), formatSQLiteTime(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentID, _ := result.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO hosting_releases
+		(hosting_project_id, hosting_deployment_id, release_digest, commit_sha, artifact_digest,
+		 status, health_evidence_json, runtime_endpoint, runtime_runner_id, runtime_observed_at,
+		 created_at, activated_at)
+		VALUES (?, ?, ?, ?, ?, 'active', ?, 'http://127.0.0.1:8080', ?, ?, ?, ?)`, project.ID,
+		deploymentID, "sha256:"+strings.Repeat("d", 64), strings.Repeat("a", 40),
+		"sha256:"+strings.Repeat("b", 64), `{"healthy":true,"attempts":1,"status_code":200}`,
+		runnerID, formatSQLiteTime(now), formatSQLiteTime(now.Add(-time.Minute)), formatSQLiteTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordHostingEvent(t.Context(), conn, project.ID, deploymentID, "release_activated", hostingPhaseActive, "", nil, now); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	conn.Close()
+
+	handler := serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI))
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/v1/projects/project_01JRUNTIMEHEALTH/runtime-health", nil)
+	req.Header.Set("Authorization", "Bearer "+token.Token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("runtime health status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var health hostingRuntimeHealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&health); err != nil {
+		t.Fatal(err)
+	}
+	if health.ResourceVersion == "0" || health.ActiveRelease == nil ||
+		health.ActiveRelease.ExternalDeploymentID != "deployment_01JRUNTIMEHEALTH" ||
+		health.RuntimeStatus != "available" || health.RuntimeEndpoint != "http://127.0.0.1:8080" ||
+		health.LastProbeAt == nil || !health.LastProbeAt.Equal(now) {
+		t.Fatalf("runtime health=%+v", health)
+	}
+	evidence, ok := health.HealthEvidence.(map[string]any)
+	if !ok || evidence["healthy"] != true {
+		t.Fatalf("runtime health evidence=%#v", health.HealthEvidence)
 	}
 }
 
@@ -193,6 +410,34 @@ func TestCleanupHostingRecordsAppliesConfiguredRetention(t *testing.T) {
 		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil || count != 0 {
 			t.Fatalf("%s count=%d err=%v", table, count, err)
 		}
+	}
+	for _, stream := range []string{"logs", "events"} {
+		var expiredID int64
+		var expiredAt string
+		if err := db.QueryRow(`SELECT expired_through_id, expired_through_at
+			FROM hosting_stream_expiry_watermarks WHERE hosting_deployment_id=? AND stream=?`,
+			deployment.ID, stream).Scan(&expiredID, &expiredAt); err != nil || expiredID < 1 || expiredAt == "" {
+			t.Fatalf("%s expiry watermark id=%d at=%q err=%v", stream, expiredID, expiredAt, err)
+		}
+	}
+	var expiredEventID int64
+	if err := db.QueryRow(`SELECT expired_through_id FROM hosting_stream_expiry_watermarks
+		WHERE hosting_deployment_id=? AND stream='events'`, deployment.ID).Scan(&expiredEventID); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/v1/deployments/deployment_01JRETAIN/events?before_id="+itoa(expiredEventID), nil)
+	req.Header.Set("Authorization", "Bearer "+token.Token)
+	rec := httptest.NewRecorder()
+	serviceTokenAuthMiddleware(http.HandlerFunc(handleInternalAPI)).ServeHTTP(rec, req)
+	var expiredPage hostingEventPageResponse
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expired cursor status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&expiredPage); err != nil {
+		t.Fatal(err)
+	}
+	if !expiredPage.Retention.HistoryTruncated || !expiredPage.Retention.CursorExpired {
+		t.Fatalf("expired cursor retention=%+v", expiredPage.Retention)
 	}
 	var oldAudits int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM hosting_audit_events WHERE reason='old'`).Scan(&oldAudits); err != nil || oldAudits != 0 {

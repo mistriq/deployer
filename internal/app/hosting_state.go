@@ -10,12 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type hostingEventResponse struct {
-	ID                   int64          `json:"id"`
+	ID                   string         `json:"id"`
 	EventType            string         `json:"event_type"`
 	Phase                string         `json:"phase"`
 	FailureCode          string         `json:"failure_code,omitempty"`
@@ -25,10 +26,188 @@ type hostingEventResponse struct {
 }
 
 type hostingLogResponse struct {
-	ID        int64     `json:"id"`
-	Stream    string    `json:"stream"`
-	Message   string    `json:"message"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           string    `json:"id"`
+	Stream       string    `json:"stream"`
+	Message      string    `json:"message"`
+	Truncated    bool      `json:"truncated"`
+	DroppedBytes int64     `json:"dropped_bytes"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type hostingStreamPage struct {
+	HasMore      bool    `json:"has_more"`
+	NextBeforeID *string `json:"next_before_id"`
+}
+
+type hostingStreamRetention struct {
+	Days             int        `json:"days"`
+	HistoryTruncated bool       `json:"history_truncated"`
+	CursorExpired    bool       `json:"cursor_expired"`
+	ExpiredThroughID *string    `json:"expired_through_id"`
+	ExpiredThroughAt *time.Time `json:"expired_through_at"`
+}
+
+type hostingEventPageResponse struct {
+	Items     []hostingEventResponse `json:"items"`
+	Page      hostingStreamPage      `json:"page"`
+	Retention hostingStreamRetention `json:"retention"`
+}
+
+type hostingLogPageResponse struct {
+	Items     []hostingLogResponse   `json:"items"`
+	Page      hostingStreamPage      `json:"page"`
+	Retention hostingStreamRetention `json:"retention"`
+}
+
+const (
+	maxHostingEventMetadataBytes  = 2 << 10
+	maxHostingLogPageMessageBytes = 512 << 10
+)
+
+type hostingRuntimeHealthRelease struct {
+	ReleaseDigest        string `json:"release_digest"`
+	ExternalDeploymentID string `json:"external_deployment_id"`
+	CommitSHA            string `json:"commit_sha"`
+	ArtifactDigest       string `json:"artifact_digest"`
+	PublicationMode      string `json:"publication_mode"`
+}
+
+type hostingRuntimeRecoveryHealth struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+type hostingRuntimeHealthResponse struct {
+	ResourceVersion    string                        `json:"resource_version"`
+	ObservedAt         time.Time                     `json:"observed_at"`
+	ActiveRelease      *hostingRuntimeHealthRelease  `json:"active_release"`
+	RuntimeStatus      string                        `json:"runtime_status"`
+	RuntimeFailureCode string                        `json:"runtime_failure_code,omitempty"`
+	Recovery           *hostingRuntimeRecoveryHealth `json:"recovery"`
+	LastProbeAt        *time.Time                    `json:"last_probe_at"`
+	RuntimeEndpoint    string                        `json:"runtime_endpoint,omitempty"`
+	HealthEvidence     any                           `json:"health_evidence,omitempty"`
+}
+
+func handleInternalProjectRuntimeHealth(w http.ResponseWriter, r *http.Request, externalProjectID string) {
+	if !requireMethod(w, r, http.MethodGet) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsRead) {
+		return
+	}
+	var projectID int64
+	var projectUpdatedAt string
+	if err := db.QueryRowContext(r.Context(), `SELECT id, updated_at FROM hosting_projects WHERE external_project_id=?`, externalProjectID).Scan(&projectID, &projectUpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			jsonErrorCode(w, errCodeProjectNotFound, "project not found", http.StatusNotFound)
+			return
+		}
+		jsonErrorCode(w, errCodeInternal, "read project runtime health failed", http.StatusInternalServerError)
+		return
+	}
+	response := hostingRuntimeHealthResponse{
+		ResourceVersion: "0",
+		ObservedAt:      parseSQLiteTime(projectUpdatedAt),
+		RuntimeStatus:   "unavailable",
+	}
+	var eventID sql.NullInt64
+	var eventAt sql.NullString
+	if err := db.QueryRowContext(r.Context(), `SELECT id, created_at FROM hosting_events
+		WHERE hosting_project_id=? ORDER BY id DESC LIMIT 1`, projectID).Scan(&eventID, &eventAt); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		jsonErrorCode(w, errCodeInternal, "read project runtime version failed", http.StatusInternalServerError)
+		return
+	}
+	if eventID.Valid {
+		response.ResourceVersion = strconv.FormatInt(eventID.Int64, 10)
+		response.ObservedAt = parseSQLiteTime(eventAt.String)
+	}
+	var deploymentID int64
+	var runtimeObservedAt sql.NullString
+	release := hostingRuntimeHealthRelease{}
+	err := db.QueryRowContext(r.Context(), `SELECT release.hosting_deployment_id, release.release_digest,
+		deployment.external_deployment_id, release.commit_sha, release.artifact_digest, release.runtime_observed_at
+		FROM hosting_releases release
+		JOIN hosting_deployments deployment ON deployment.id=release.hosting_deployment_id
+		WHERE release.hosting_project_id=? AND release.status='active'`, projectID).Scan(
+		&deploymentID, &release.ReleaseDigest, &release.ExternalDeploymentID, &release.CommitSHA,
+		&release.ArtifactDigest, &runtimeObservedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		jsonResponse(w, response)
+		return
+	}
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "read active runtime health failed", http.StatusInternalServerError)
+		return
+	}
+	deployment, err := getHostingDeploymentByExternalID(r.Context(), release.ExternalDeploymentID)
+	if err != nil || deployment.ID != deploymentID {
+		jsonErrorCode(w, errCodeInternal, "read authoritative runtime health failed", http.StatusInternalServerError)
+		return
+	}
+	response.ActiveRelease = &release
+	response.ActiveRelease.PublicationMode = deployment.PublicationMode
+	response.RuntimeStatus = deployment.RuntimeStatus
+	response.RuntimeFailureCode = deployment.RuntimeFailureCode
+	if deployment.RuntimeRecoveryID != 0 {
+		response.Recovery = &hostingRuntimeRecoveryHealth{
+			ID: strconv.FormatInt(deployment.RuntimeRecoveryID, 10), Status: deployment.RuntimeRecoveryStatus,
+		}
+	}
+	response.RuntimeEndpoint = deployment.RuntimeEndpoint
+	response.HealthEvidence = deployment.HealthEvidence
+	if runtimeObservedAt.Valid {
+		probeAt := parseSQLiteTime(runtimeObservedAt.String)
+		response.LastProbeAt = &probeAt
+	}
+	jsonResponse(w, response)
+}
+
+func parseHostingStreamPage(w http.ResponseWriter, r *http.Request, defaultLimit, maximumLimit int) (*int64, int, bool) {
+	values := r.URL.Query()
+	for key, entries := range values {
+		if (key != "before_id" && key != "limit") || len(entries) != 1 {
+			jsonErrorCode(w, errCodeValidation, "invalid pagination query", http.StatusBadRequest)
+			return nil, 0, false
+		}
+	}
+	limit := defaultLimit
+	if raw := values.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || strconv.Itoa(parsed) != raw || parsed < 1 || parsed > maximumLimit {
+			jsonErrorCode(w, errCodeValidation, "invalid pagination limit", http.StatusBadRequest)
+			return nil, 0, false
+		}
+		limit = parsed
+	}
+	var beforeID *int64
+	if raw := values.Get("before_id"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 1 || strconv.FormatInt(parsed, 10) != raw {
+			jsonErrorCode(w, errCodeValidation, "invalid pagination cursor", http.StatusBadRequest)
+			return nil, 0, false
+		}
+		beforeID = &parsed
+	}
+	return beforeID, limit, true
+}
+
+func hostingStreamRetentionState(ctx context.Context, deploymentID int64, stream string, days int, beforeID *int64) (hostingStreamRetention, error) {
+	retention := hostingStreamRetention{Days: days}
+	var expiredID int64
+	var expiredAt string
+	err := db.QueryRowContext(ctx, `SELECT expired_through_id, expired_through_at
+		FROM hosting_stream_expiry_watermarks WHERE hosting_deployment_id=? AND stream=?`, deploymentID, stream).Scan(&expiredID, &expiredAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return retention, nil
+	}
+	if err != nil {
+		return retention, err
+	}
+	id := strconv.FormatInt(expiredID, 10)
+	at := parseSQLiteTime(expiredAt)
+	retention.HistoryTruncated = true
+	retention.ExpiredThroughID = &id
+	retention.ExpiredThroughAt = &at
+	retention.CursorExpired = beforeID != nil && *beforeID <= expiredID
+	return retention, nil
 }
 
 type internalCapabilitiesResponse struct {
@@ -139,10 +318,26 @@ func handleInternalDeploymentEvents(w http.ResponseWriter, r *http.Request, exte
 	if !requireMethod(w, r, http.MethodGet) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsRead) {
 		return
 	}
+	beforeID, limit, ok := parseHostingStreamPage(w, r, 50, 100)
+	if !ok {
+		return
+	}
+	var deploymentID int64
+	if err := db.QueryRowContext(r.Context(), `SELECT id FROM hosting_deployments WHERE external_deployment_id=?`, externalDeploymentID).Scan(&deploymentID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
+			return
+		}
+		jsonErrorCode(w, errCodeInternal, "read deployment state failed", http.StatusInternalServerError)
+		return
+	}
 	rows, err := db.QueryContext(r.Context(), `SELECT e.id, e.event_type, e.phase, e.failure_code,
-		e.metadata_json, e.created_at FROM hosting_events e
-		JOIN hosting_deployments d ON d.id=e.hosting_deployment_id
-		WHERE d.external_deployment_id=? ORDER BY e.id`, externalDeploymentID)
+		e.metadata_json, e.created_at,
+		(SELECT following.created_at FROM hosting_events following
+		 WHERE following.hosting_deployment_id=e.hosting_deployment_id AND following.id>e.id
+		 ORDER BY following.id LIMIT 1)
+		FROM hosting_events e WHERE e.hosting_deployment_id=? AND (? IS NULL OR e.id<?)
+		ORDER BY e.id DESC LIMIT ?`, deploymentID, beforeID, beforeID, limit+1)
 	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "read deployment events failed", http.StatusInternalServerError)
 		return
@@ -151,48 +346,70 @@ func handleInternalDeploymentEvents(w http.ResponseWriter, r *http.Request, exte
 	events := make([]hostingEventResponse, 0)
 	for rows.Next() {
 		var event hostingEventResponse
+		var id int64
 		var metadataJSON, createdAt string
-		if err := rows.Scan(&event.ID, &event.EventType, &event.Phase, &event.FailureCode, &metadataJSON, &createdAt); err != nil {
+		var followingAt sql.NullString
+		if err := rows.Scan(&id, &event.EventType, &event.Phase, &event.FailureCode, &metadataJSON, &createdAt, &followingAt); err != nil {
 			jsonErrorCode(w, errCodeInternal, "read deployment event failed", http.StatusInternalServerError)
 			return
 		}
+		event.ID = strconv.FormatInt(id, 10)
 		metadataJSON = redactSecrets(metadataJSON)
-		if err := json.Unmarshal([]byte(metadataJSON), &event.Metadata); err != nil {
-			event.Metadata = map[string]any{"redacted": true}
+		if len(metadataJSON) > maxHostingEventMetadataBytes {
+			event.Metadata = map[string]any{"redacted": true, "truncated": true}
+		} else if err := json.Unmarshal([]byte(metadataJSON), &event.Metadata); err != nil {
+			event.Metadata = map[string]any{"redacted": true, "invalid": true}
 		}
 		event.CreatedAt = parseSQLiteTime(createdAt)
+		if followingAt.Valid {
+			event.PhaseDurationSeconds = maxFloat(0, parseSQLiteTime(followingAt.String).Sub(event.CreatedAt).Seconds())
+		}
 		events = append(events, event)
 	}
 	if err := rows.Err(); err != nil {
 		jsonErrorCode(w, errCodeInternal, "read deployment events failed", http.StatusInternalServerError)
 		return
 	}
-	if len(events) == 0 {
-		if _, err := getHostingDeploymentByExternalID(r.Context(), externalDeploymentID); err != nil {
-			if !errors.Is(err, sql.ErrNoRows) {
-				jsonErrorCode(w, errCodeInternal, "read deployment state failed", http.StatusInternalServerError)
-				return
-			}
-			jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
-			return
-		}
+	hasMore := len(events) > limit
+	if hasMore {
+		events = events[:limit]
 	}
-	for index := range events {
-		if index+1 >= len(events) {
-			continue
-		}
-		events[index].PhaseDurationSeconds = maxFloat(0, events[index+1].CreatedAt.Sub(events[index].CreatedAt).Seconds())
+	for left, right := 0, len(events)-1; left < right; left, right = left+1, right-1 {
+		events[left], events[right] = events[right], events[left]
 	}
-	jsonResponse(w, events)
+	var nextBeforeID *string
+	if hasMore && len(events) > 0 {
+		value := events[0].ID
+		nextBeforeID = &value
+	}
+	retention, err := hostingStreamRetentionState(r.Context(), deploymentID, "events", appConfig.HostingEventRetentionDays, beforeID)
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "read deployment event retention failed", http.StatusInternalServerError)
+		return
+	}
+	jsonResponse(w, hostingEventPageResponse{Items: events, Page: hostingStreamPage{HasMore: hasMore, NextBeforeID: nextBeforeID}, Retention: retention})
 }
 
 func handleInternalDeploymentLogs(w http.ResponseWriter, r *http.Request, externalDeploymentID string) {
 	if !requireMethod(w, r, http.MethodGet) || !requireServiceTokenScope(w, r, serviceScopeDeploymentsRead) {
 		return
 	}
-	rows, err := db.QueryContext(r.Context(), `SELECT l.id, l.stream, l.message, l.created_at
-		FROM hosting_logs l JOIN hosting_deployments d ON d.id=l.hosting_deployment_id
-		WHERE d.external_deployment_id=? ORDER BY l.id`, externalDeploymentID)
+	beforeID, limit, ok := parseHostingStreamPage(w, r, 25, 50)
+	if !ok {
+		return
+	}
+	var deploymentID int64
+	if err := db.QueryRowContext(r.Context(), `SELECT id FROM hosting_deployments WHERE external_deployment_id=?`, externalDeploymentID).Scan(&deploymentID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
+			return
+		}
+		jsonErrorCode(w, errCodeInternal, "read deployment state failed", http.StatusInternalServerError)
+		return
+	}
+	rows, err := db.QueryContext(r.Context(), `SELECT l.id, l.stream, l.message, l.truncated, l.dropped_bytes, l.created_at
+		FROM hosting_logs l WHERE l.hosting_deployment_id=? AND (? IS NULL OR l.id<?)
+		ORDER BY l.id DESC LIMIT ?`, deploymentID, beforeID, beforeID, limit+1)
 	if err != nil {
 		jsonErrorCode(w, errCodeInternal, "read deployment logs failed", http.StatusInternalServerError)
 		return
@@ -201,11 +418,15 @@ func handleInternalDeploymentLogs(w http.ResponseWriter, r *http.Request, extern
 	logs := make([]hostingLogResponse, 0)
 	for rows.Next() {
 		var entry hostingLogResponse
+		var id int64
+		var truncated int
 		var createdAt string
-		if err := rows.Scan(&entry.ID, &entry.Stream, &entry.Message, &createdAt); err != nil {
+		if err := rows.Scan(&id, &entry.Stream, &entry.Message, &truncated, &entry.DroppedBytes, &createdAt); err != nil {
 			jsonErrorCode(w, errCodeInternal, "read deployment log failed", http.StatusInternalServerError)
 			return
 		}
+		entry.ID = strconv.FormatInt(id, 10)
+		entry.Truncated = truncated != 0
 		entry.Message = redactSecrets(entry.Message)
 		entry.CreatedAt = parseSQLiteTime(createdAt)
 		logs = append(logs, entry)
@@ -214,17 +435,32 @@ func handleInternalDeploymentLogs(w http.ResponseWriter, r *http.Request, extern
 		jsonErrorCode(w, errCodeInternal, "read deployment logs failed", http.StatusInternalServerError)
 		return
 	}
-	if len(logs) == 0 {
-		if _, err := getHostingDeploymentByExternalID(r.Context(), externalDeploymentID); err != nil {
-			if !errors.Is(err, sql.ErrNoRows) {
-				jsonErrorCode(w, errCodeInternal, "read deployment state failed", http.StatusInternalServerError)
-				return
-			}
-			jsonErrorCode(w, errCodeDeploymentNotFound, "deployment not found", http.StatusNotFound)
-			return
+	selected := 0
+	messageBytes := 0
+	for selected < len(logs) && selected < limit {
+		nextBytes := len(logs[selected].Message)
+		if selected > 0 && messageBytes+nextBytes > maxHostingLogPageMessageBytes {
+			break
 		}
+		messageBytes += nextBytes
+		selected++
 	}
-	jsonResponse(w, logs)
+	hasMore := selected < len(logs)
+	logs = logs[:selected]
+	for left, right := 0, len(logs)-1; left < right; left, right = left+1, right-1 {
+		logs[left], logs[right] = logs[right], logs[left]
+	}
+	var nextBeforeID *string
+	if hasMore && len(logs) > 0 {
+		value := logs[0].ID
+		nextBeforeID = &value
+	}
+	retention, err := hostingStreamRetentionState(r.Context(), deploymentID, "logs", appConfig.HostingLogRetentionDays, beforeID)
+	if err != nil {
+		jsonErrorCode(w, errCodeInternal, "read deployment log retention failed", http.StatusInternalServerError)
+		return
+	}
+	jsonResponse(w, hostingLogPageResponse{Items: logs, Page: hostingStreamPage{HasMore: hasMore, NextBeforeID: nextBeforeID}, Retention: retention})
 }
 
 func handleInternalDeploymentCancel(w http.ResponseWriter, r *http.Request, externalDeploymentID string) {

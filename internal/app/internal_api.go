@@ -86,6 +86,8 @@ func handleInternalProject(w http.ResponseWriter, r *http.Request) {
 		handleInternalDeploymentCreate(w, r, externalProjectID)
 	case "releases":
 		handleInternalReleases(w, r, externalProjectID)
+	case "runtime-health":
+		handleInternalProjectRuntimeHealth(w, r, externalProjectID)
 	case "rollback":
 		handleInternalRollback(w, r, externalProjectID)
 	case "suspend":
