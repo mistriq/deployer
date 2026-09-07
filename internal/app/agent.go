@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,9 +22,10 @@ import (
 )
 
 var (
-	agentControlClient  = &http.Client{Timeout: getenvDurationDefault("DEPLOYER_AGENT_CONTROL_TIMEOUT", 45*time.Second)}
-	agentArtifactClient = &http.Client{Timeout: getenvDurationDefault("DEPLOYER_AGENT_ARTIFACT_TIMEOUT", 30*time.Minute)}
-	agentCommands       = systemCommands
+	agentControlClient        = &http.Client{Timeout: getenvDurationDefault("DEPLOYER_AGENT_CONTROL_TIMEOUT", 45*time.Second)}
+	agentArtifactClient       = &http.Client{Timeout: getenvDurationDefault("DEPLOYER_AGENT_ARTIFACT_TIMEOUT", 30*time.Minute)}
+	agentCommands             = systemCommands
+	agentRestorePreservePaths = restorePreservePaths
 )
 
 const agentHTTPAttempts = 3
@@ -444,6 +446,8 @@ func executeFilesJob(serverURL, token string, job *Job) {
 	}
 
 	preserveDir := ""
+	preserveBackups := 0
+	retainPreserveBackup := func() {}
 	if len(preservePaths) > 0 {
 		startGroup("Preserve Backup")
 		preserveDir, err = os.MkdirTemp("", "preserve-*")
@@ -453,11 +457,29 @@ func executeFilesJob(serverURL, token string, job *Job) {
 			reportComplete("failed", "preserve backup: "+err.Error())
 			return
 		}
-		defer os.RemoveAll(preserveDir)
+		removePreserveDir := true
+		defer func() {
+			if removePreserveDir {
+				_ = os.RemoveAll(preserveDir)
+			}
+		}()
+		retainPreserveBackup = func() {
+			if preserveBackups == 0 || !removePreserveDir {
+				return
+			}
+			removePreserveDir = false
+			sendLogf("Recovery backup retained at %s", preserveDir)
+		}
 
-		preserved := backupPreservePaths(job.DeployDir, preserveDir, preservePaths, sendLogf)
-		sendLogf("Backed up %d items", preserved)
+		var backupErr error
+		preserveBackups, backupErr = backupPreservePaths(job.DeployDir, preserveDir, preservePaths, sendLogf)
+		sendLogf("Backed up %d items", preserveBackups)
 		endGroup()
+		if backupErr != nil {
+			sendLogf("Preserve backup failed: %s", backupErr)
+			reportComplete("failed", "preserve backup: "+backupErr.Error())
+			return
+		}
 	}
 
 	// Step 3: Extract files
@@ -476,6 +498,7 @@ func executeFilesJob(serverURL, token string, job *Job) {
 	if err := extractTarGz(archivePath, job.DeployDir); err != nil {
 		sendLogf("Extract failed: %s", err)
 		endGroup()
+		retainPreserveBackup()
 		reportComplete("failed", "extract files: "+err.Error())
 		return
 	}
@@ -485,9 +508,15 @@ func executeFilesJob(serverURL, token string, job *Job) {
 	// Step 4: Restore preserve files
 	if preserveDir != "" && len(preservePaths) > 0 {
 		startGroup("Preserve Restore")
-		restored := restorePreservePaths(job.DeployDir, preserveDir, preservePaths, sendLogf)
+		restored, restoreErr := agentRestorePreservePaths(job.DeployDir, preserveDir, preservePaths, sendLogf)
 		sendLogf("Restored %d items", restored)
 		endGroup()
+		if restoreErr != nil {
+			sendLogf("Preserve restore failed: %s", restoreErr)
+			retainPreserveBackup()
+			reportComplete("failed", "preserve restore: "+restoreErr.Error())
+			return
+		}
 	}
 
 	// Step 5: Set permissions
@@ -572,8 +601,9 @@ func parsePreservePaths(raw string) ([]string, error) {
 	return paths, nil
 }
 
-func backupPreservePaths(deployDir, preserveDir string, preservePaths []string, sendLogf func(string, ...interface{})) int {
+func backupPreservePaths(deployDir, preserveDir string, preservePaths []string, sendLogf func(string, ...interface{})) (int, error) {
 	preserved := 0
+	var errs []error
 	for _, p := range preservePaths {
 		src := filepath.Join(deployDir, p)
 		if _, err := os.Lstat(src); os.IsNotExist(err) {
@@ -581,42 +611,48 @@ func backupPreservePaths(deployDir, preserveDir string, preservePaths []string, 
 			continue
 		} else if err != nil {
 			sendLogf("  %s (stat failed: %s)", p, err)
+			errs = append(errs, fmt.Errorf("%s: stat: %w", p, err))
 			continue
 		}
 		dst := filepath.Join(preserveDir, p)
 		if err := copyPreservePath(src, dst); err != nil {
 			sendLogf("  %s (backup failed: %s)", p, err)
+			errs = append(errs, fmt.Errorf("%s: backup: %w", p, err))
 		} else {
 			sendLogf("  %s (backed up)", p)
 			preserved++
 		}
 	}
-	return preserved
+	return preserved, errors.Join(errs...)
 }
 
-func restorePreservePaths(deployDir, preserveDir string, preservePaths []string, sendLogf func(string, ...interface{})) int {
+func restorePreservePaths(deployDir, preserveDir string, preservePaths []string, sendLogf func(string, ...interface{})) (int, error) {
 	restored := 0
+	var errs []error
 	for _, p := range preservePaths {
 		src := filepath.Join(preserveDir, p)
 		if _, err := os.Lstat(src); os.IsNotExist(err) {
 			continue
 		} else if err != nil {
 			sendLogf("  %s (restore stat failed: %s)", p, err)
+			errs = append(errs, fmt.Errorf("%s: restore stat: %w", p, err))
 			continue
 		}
 		dst := filepath.Join(deployDir, p)
 		if err := os.RemoveAll(dst); err != nil {
 			sendLogf("  %s (restore remove failed: %s)", p, err)
+			errs = append(errs, fmt.Errorf("%s: restore remove: %w", p, err))
 			continue
 		}
 		if err := copyPreservePath(src, dst); err != nil {
 			sendLogf("  %s (restore failed: %s)", p, err)
+			errs = append(errs, fmt.Errorf("%s: restore: %w", p, err))
 		} else {
 			sendLogf("  %s (restored)", p)
 			restored++
 		}
 	}
-	return restored
+	return restored, errors.Join(errs...)
 }
 
 func copyPreservePath(src, dst string) error {

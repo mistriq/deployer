@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -405,7 +406,7 @@ func TestBackupAndRestorePreservePaths(t *testing.T) {
 	}
 
 	paths := []string{".env", "storage", "missing.json"}
-	if preserved := backupPreservePaths(deployDir, preserveDir, paths, logf); preserved != 2 {
+	if preserved, err := backupPreservePaths(deployDir, preserveDir, paths, logf); err != nil || preserved != 2 {
 		t.Fatalf("expected two preserved paths, got %d; logs=%v", preserved, logs)
 	}
 
@@ -422,7 +423,7 @@ func TestBackupAndRestorePreservePaths(t *testing.T) {
 		t.Fatalf("write archive data: %v", err)
 	}
 
-	if restored := restorePreservePaths(deployDir, preserveDir, paths, logf); restored != 2 {
+	if restored, err := restorePreservePaths(deployDir, preserveDir, paths, logf); err != nil || restored != 2 {
 		t.Fatalf("expected two restored paths, got %d; logs=%v", restored, logs)
 	}
 
@@ -442,6 +443,259 @@ func TestBackupAndRestorePreservePaths(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(deployDir, "missing.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected missing preserve path to remain absent, got %v", err)
+	}
+}
+
+func TestExecuteFilesJobPreservesRecoveryBackupAfterExtractionFailure(t *testing.T) {
+	oldControlClient, oldArtifactClient := agentControlClient, agentArtifactClient
+	t.Cleanup(func() {
+		agentControlClient = oldControlClient
+		agentArtifactClient = oldArtifactClient
+	})
+
+	deployDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(deployDir, ".env"), []byte("keep-me"), 0600); err != nil {
+		t.Fatalf("write preserved file: %v", err)
+	}
+
+	var logs []string
+	var completion struct {
+		Status string
+		Error  string
+	}
+	archivePath := filepath.Join(t.TempDir(), "partially-valid.tar.gz")
+	if err := writeTestTarGz(archivePath, func(tw *tar.Writer) error {
+		content := []byte("archive-secret")
+		if err := tw.WriteHeader(&tar.Header{Name: ".env", Mode: 0644, Size: int64(len(content))}); err != nil {
+			return err
+		}
+		if _, err := tw.Write(content); err != nil {
+			return err
+		}
+		return tw.WriteHeader(&tar.Header{Name: "unsafe-link", Typeflag: tar.TypeSymlink, Linkname: "target", Mode: 0777})
+	}); err != nil {
+		t.Fatalf("write partially valid archive: %v", err)
+	}
+	archive, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatalf("read partially valid archive: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/artifact/91":
+			_, _ = w.Write(archive)
+		case "/api/agent/log/91":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read log: %v", err)
+			}
+			logs = append(logs, string(body))
+		case "/api/agent/complete/91":
+			if err := json.NewDecoder(r.Body).Decode(&completion); err != nil {
+				t.Fatalf("decode completion: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	agentControlClient = server.Client()
+	agentArtifactClient = server.Client()
+
+	executeFilesJob(server.URL, "token", &Job{
+		BuildID:   91,
+		DeployDir: deployDir,
+		Mode:      "files",
+		Preserve:  ".env\nmissing.json",
+	})
+
+	if completion.Status != "failed" || !strings.Contains(completion.Error, "extract files") {
+		t.Fatalf("unexpected completion: %+v", completion)
+	}
+	joinedLogs := strings.Join(logs, "")
+	const marker = "Recovery backup retained at "
+	idx := strings.Index(joinedLogs, marker)
+	if idx < 0 {
+		t.Fatalf("expected retained recovery backup log, got %q", joinedLogs)
+	}
+	backupDir := strings.TrimSpace(joinedLogs[idx+len(marker):])
+	backupDir = strings.Split(backupDir, "\n")[0]
+	t.Cleanup(func() { _ = os.RemoveAll(backupDir) })
+	got, err := os.ReadFile(filepath.Join(backupDir, ".env"))
+	if err != nil {
+		t.Fatalf("read retained recovery backup: %v", err)
+	}
+	if string(got) != "keep-me" {
+		t.Fatalf("unexpected retained content %q", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(deployDir, ".env")); err != nil || string(got) != "archive-secret" {
+		t.Fatalf("expected partial extraction to replace live file, got %q err=%v", got, err)
+	}
+}
+
+func TestExecuteFilesJobAbortsWhenPreserveBackupFails(t *testing.T) {
+	oldControlClient, oldArtifactClient := agentControlClient, agentArtifactClient
+	t.Cleanup(func() {
+		agentControlClient = oldControlClient
+		agentArtifactClient = oldArtifactClient
+	})
+
+	deployDir := t.TempDir()
+	socketPath := filepath.Join(deployDir, "state.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("create preserved socket: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	archivePath := filepath.Join(t.TempDir(), "files.tar.gz")
+	if err := writeTestTarGz(archivePath, func(tw *tar.Writer) error {
+		content := []byte("must-not-extract")
+		if err := tw.WriteHeader(&tar.Header{Name: "new-file.txt", Mode: 0644, Size: int64(len(content))}); err != nil {
+			return err
+		}
+		_, err := tw.Write(content)
+		return err
+	}); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	archive, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+
+	var completion struct {
+		Status string
+		Error  string
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/artifact/93":
+			_, _ = w.Write(archive)
+		case "/api/agent/log/93":
+			w.WriteHeader(http.StatusOK)
+		case "/api/agent/complete/93":
+			if err := json.NewDecoder(r.Body).Decode(&completion); err != nil {
+				t.Fatalf("decode completion: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	agentControlClient = server.Client()
+	agentArtifactClient = server.Client()
+
+	executeFilesJob(server.URL, "token", &Job{BuildID: 93, DeployDir: deployDir, Mode: "files", Preserve: "state.sock"})
+
+	if completion.Status != "failed" || !strings.Contains(completion.Error, "preserve backup") {
+		t.Fatalf("unexpected completion: %+v", completion)
+	}
+	if _, err := os.Stat(filepath.Join(deployDir, "new-file.txt")); !os.IsNotExist(err) {
+		t.Fatalf("archive was extracted despite preserve backup failure: %v", err)
+	}
+}
+
+func TestExecuteFilesJobReportsRestoreFailureAndRetainsRecoveryBackup(t *testing.T) {
+	oldControlClient, oldArtifactClient := agentControlClient, agentArtifactClient
+	oldRestore := agentRestorePreservePaths
+	t.Cleanup(func() {
+		agentControlClient = oldControlClient
+		agentArtifactClient = oldArtifactClient
+		agentRestorePreservePaths = oldRestore
+	})
+
+	archivePath := filepath.Join(t.TempDir(), "files.tar.gz")
+	if err := writeTestTarGz(archivePath, func(tw *tar.Writer) error {
+		content := []byte("new-release")
+		if err := tw.WriteHeader(&tar.Header{Name: "index.html", Mode: 0644, Size: int64(len(content))}); err != nil {
+			return err
+		}
+		_, err := tw.Write(content)
+		return err
+	}); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	archive, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+
+	deployDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(deployDir, ".env"), []byte("keep-me"), 0600); err != nil {
+		t.Fatalf("write preserved file: %v", err)
+	}
+	agentRestorePreservePaths = func(_ string, _ string, _ []string, _ func(string, ...interface{})) (int, error) {
+		return 0, fmt.Errorf("restore permission denied")
+	}
+
+	var logs []string
+	var completion struct {
+		Status string
+		Error  string
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/artifact/92":
+			_, _ = w.Write(archive)
+		case "/api/agent/log/92":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read log: %v", err)
+			}
+			logs = append(logs, string(body))
+		case "/api/agent/complete/92":
+			if err := json.NewDecoder(r.Body).Decode(&completion); err != nil {
+				t.Fatalf("decode completion: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	agentControlClient = server.Client()
+	agentArtifactClient = server.Client()
+
+	executeFilesJob(server.URL, "token", &Job{BuildID: 92, DeployDir: deployDir, Mode: "files", Preserve: ".env"})
+
+	if completion.Status != "failed" || !strings.Contains(completion.Error, "preserve restore: restore permission denied") {
+		t.Fatalf("unexpected completion: %+v", completion)
+	}
+	joinedLogs := strings.Join(logs, "")
+	if !strings.Contains(joinedLogs, "Files extracted successfully") || !strings.Contains(joinedLogs, "Preserve restore failed: restore permission denied") {
+		t.Fatalf("expected extraction and restore failure logs, got %q", joinedLogs)
+	}
+	const marker = "Recovery backup retained at "
+	idx := strings.Index(joinedLogs, marker)
+	if idx < 0 {
+		t.Fatalf("expected retained recovery backup log, got %q", joinedLogs)
+	}
+	backupDir := strings.Split(strings.TrimSpace(joinedLogs[idx+len(marker):]), "\n")[0]
+	t.Cleanup(func() { _ = os.RemoveAll(backupDir) })
+	if got, err := os.ReadFile(filepath.Join(backupDir, ".env")); err != nil || string(got) != "keep-me" {
+		t.Fatalf("expected retained preserved file, got %q err=%v", got, err)
+	}
+}
+
+func TestRestorePreservePathsReportsFailure(t *testing.T) {
+	preserveDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(preserveDir, ".env"), []byte("keep-me"), 0600); err != nil {
+		t.Fatalf("write preserve source: %v", err)
+	}
+	deployFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(deployFile, []byte("file"), 0644); err != nil {
+		t.Fatalf("write deploy file: %v", err)
+	}
+	var logs []string
+	logf := func(format string, args ...interface{}) { logs = append(logs, fmt.Sprintf(format, args...)) }
+
+	restored, err := restorePreservePaths(deployFile, preserveDir, []string{".env", "optional.json"}, logf)
+	if err == nil || restored != 0 {
+		t.Fatalf("expected restore failure and no restored paths, got restored=%d err=%v", restored, err)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "restore remove failed") {
+		t.Fatalf("expected restore failure log, got %v", logs)
 	}
 }
 
