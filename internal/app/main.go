@@ -42,10 +42,14 @@ func Run() {
 		logFatal("startup_error", "failed to prepare runtime directories", err, nil)
 	}
 
-	// Init database
-	if err := initDB(appConfig.DBPath); err != nil {
+	if appConfig.DatabaseURL == "" {
+		logFatal("config_error", "DEPLOYER_DATABASE_URL is required; see docs/postgresql-migration.md for SQLite migration", nil, nil)
+	}
+	// PostgreSQL is the supported runtime database. SQLite is retained only for
+	// tests and as a read-only migration source.
+	if err := initPostgres(appConfig.DatabaseURL); err != nil {
 		logFatal("startup_error", "failed to init database", err, map[string]interface{}{
-			"db_path": appConfig.DBPath,
+			"database": "postgres",
 		})
 	}
 	defer db.Close()

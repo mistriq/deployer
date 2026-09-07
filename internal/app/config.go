@@ -10,6 +10,7 @@ import (
 
 type AppConfig struct {
 	Addr                   string
+	DatabaseURL            string
 	DBPath                 string
 	PublicURL              string
 	ArtifactDir            string
@@ -43,6 +44,7 @@ func securityStatus() SecurityStatus {
 func loadConfig() AppConfig {
 	cfg := AppConfig{
 		Addr:                   getenvDefault("DEPLOYER_ADDR", "127.0.0.1:9090"),
+		DatabaseURL:            strings.TrimSpace(os.Getenv("DEPLOYER_DATABASE_URL")),
 		DBPath:                 getenvDefault("DEPLOYER_DB_PATH", "deployer.db"),
 		PublicURL:              strings.TrimRight(os.Getenv("DEPLOYER_PUBLIC_URL"), "/"),
 		ArtifactDir:            getenvDefault("DEPLOYER_ARTIFACT_DIR", filepath.Join(os.TempDir(), "deployer-artifacts")),

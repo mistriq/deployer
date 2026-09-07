@@ -1,7 +1,7 @@
 # Deployer
 
 Deployer is a small self-hosted CI/CD tool written in Go. It runs as a single
-binary with an embedded web UI, a SQLite database, live build logs over SSE, and
+binary with an embedded web UI, a PostgreSQL database, live build logs over SSE, and
 polling agents for remote machines.
 
 The project is intended for maintainers who want a lightweight deployment
@@ -15,7 +15,7 @@ This repository is being prepared for a first public release. Review
 ## Features
 
 - Single Go binary with embedded HTML/CSS/JavaScript.
-- SQLite storage.
+- PostgreSQL storage with versioned migrations and a verified SQLite importer.
 - Docker deploy mode: build an image, transfer it to a runner, load it, and
   restart Docker Compose services.
 - Files deploy mode: package files, transfer them to a runner, preserve selected
@@ -80,7 +80,8 @@ URL through your authorization gateway.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `DEPLOYER_ADDR` | `127.0.0.1:9090` | HTTP listen address. |
-| `DEPLOYER_DB_PATH` | `deployer.db` | SQLite database path. |
+| `DEPLOYER_DATABASE_URL` | required | PostgreSQL connection URL. |
+| `DEPLOYER_DB_PATH` | `deployer.db` | Legacy SQLite path used by tests and the migration source. |
 | `DEPLOYER_PUBLIC_URL` | empty | Public URL used in generated runner setup commands. |
 | `DEPLOYER_ARTIFACT_DIR` | `/tmp/deployer-artifacts` | Managed server-side build artifact directory. |
 | `DEPLOYER_SNAPSHOT_DIR` | `/tmp/deployer-snapshots` | Managed server-side snapshot artifact directory. |
@@ -116,7 +117,7 @@ ExecStart=/opt/deployer/deployer
 Restart=always
 RestartSec=3
 Environment=DEPLOYER_ADDR=127.0.0.1:9090
-Environment=DEPLOYER_DB_PATH=/var/lib/deployer/deployer.db
+Environment=DEPLOYER_DATABASE_URL=postgres://deployer:change-me@127.0.0.1:5432/deployer
 Environment=DEPLOYER_ARTIFACT_DIR=/var/lib/deployer/artifacts
 Environment=DEPLOYER_SNAPSHOT_DIR=/var/lib/deployer/snapshots
 Environment=DEPLOYER_ARTIFACT_RETENTION_HOURS=24
@@ -354,25 +355,13 @@ channels are still tracked in `TODO.md`.
 
 ## Database Operations
 
-SQLite uses WAL mode. The default database path is `deployer.db`, and the
-recommended service path is `/var/lib/deployer/deployer.db`. New timestamps are
-stored as UTC RFC3339 values. Build artifacts and snapshots are stored in
+PostgreSQL is the supported production database. Back it up using the backup
+and recovery process appropriate for the PostgreSQL service. Build artifacts and snapshots are stored in
 `DEPLOYER_ARTIFACT_DIR` and `DEPLOYER_SNAPSHOT_DIR`.
 
-Back up the database while the server is stopped, or use SQLite's online backup
-tooling so the `deployer.db`, `deployer.db-wal`, and `deployer.db-shm` state is
-captured consistently.
-
-Example stopped backup:
-
-```bash
-systemctl --user stop deployer
-cp /var/lib/deployer/deployer.db /var/backups/deployer.db
-systemctl --user start deployer
-```
-
-Restore by stopping the service, replacing the database file with a known-good
-backup, and starting the service again. Do not publish database backups.
+Existing SQLite installations should follow the [PostgreSQL migration and
+recovery procedure](docs/postgresql-migration.md). The original SQLite database
+is preserved as the recovery source. Do not publish database backups.
 
 Persisted build logs are capped at 4 MiB per build. By default, stale artifact
 files are removed after 24 hours and build logs are cleared after 30 days. Set
@@ -423,13 +412,13 @@ go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
 Use a temporary database for local development:
 
 ```bash
-DEPLOYER_DB_PATH=/tmp/deployer-dev.db go run ./cmd/deployer
+DEPLOYER_DATABASE_URL='postgres://deployer:password@127.0.0.1:5432/deployer_dev?sslmode=disable' go run ./cmd/deployer
 ```
 
 Seed public-safe screenshot data into an empty temporary database:
 
 ```bash
-DEPLOYER_DEMO_MODE=true DEPLOYER_DB_PATH=/tmp/deployer-demo.db go run ./cmd/deployer
+DEPLOYER_DEMO_MODE=true DEPLOYER_DATABASE_URL='postgres://deployer:password@127.0.0.1:5432/deployer_demo?sslmode=disable' go run ./cmd/deployer
 ```
 
 ## Repository Layout

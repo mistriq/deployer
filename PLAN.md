@@ -4,6 +4,8 @@ Build a reliable foundation, then deliver features that improve everyday deploym
 
 ## 1. Migrate to PostgreSQL
 
+**Status: complete (2026-09-08).** PostgreSQL-backed tests verify import contents, concurrent claims/logs/heartbeats, a disposable files deployment preserving uploads, and restart/authentication recovery. Preservation safety was committed in `5f4f246`. Production cutover has not been performed; the rehearsal and recovery procedure is in `docs/postgresql-migration.md`.
+
 - Add PostgreSQL storage and versioned schema migrations.
 - Provide a repeatable SQLite import preserving project and runner IDs, token hashes, settings, build/job history, annotations, and other persisted records.
 - Verify imported record counts, relationships, timestamps, and authentication compatibility without exposing secrets.
