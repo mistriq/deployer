@@ -242,12 +242,8 @@ func handleAgentLog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Append to build log in DB
-	build, err := getBuild(buildID)
-	if err == nil {
-		build.Log += logText
-		logOperationalError("update build log", updateBuild(build))
-	}
+	// Append without overwriting concurrently updated build status or log lines.
+	logOperationalError("append build log", appendBuildLog(buildID, logText))
 
 	w.WriteHeader(http.StatusOK)
 }
