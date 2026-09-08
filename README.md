@@ -61,7 +61,7 @@ Recommended production setup:
 Prerequisites:
 
 - Linux host for server and runners.
-- Go 1.25 or newer for development. Release checks currently use Go 1.26.4.
+- Go 1.25 or newer for development. Release checks currently use Go 1.26.6.
 - Git for source checkout and optional `git pull` before deploys.
 - Docker with the Compose plugin for Docker mode.
 - `tar`, `gzip`, `curl`, `ssh`, and `scp` for agent and remote operations.
