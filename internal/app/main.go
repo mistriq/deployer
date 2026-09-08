@@ -543,7 +543,9 @@ func handleAPIProject(w http.ResponseWriter, r *http.Request) {
 			jsonErrorCode(w, errCodeProjectNotFound, "project not found", http.StatusNotFound)
 			return
 		}
-		buildID, err := builder.Deploy(project, "manual")
+		buildID, err := mcpIdempotentBuild("deploy", project, r.Header.Get("Idempotency-Key"), func(triggeredBy string) (int64, error) {
+			return builder.Deploy(project, triggeredBy)
+		})
 		if err != nil {
 			jsonErrorCode(w, deployConflictErrorCode(err), err.Error(), http.StatusConflict)
 			return
@@ -562,7 +564,9 @@ func handleAPIProject(w http.ResponseWriter, r *http.Request) {
 			jsonErrorCode(w, errCodeProjectNotFound, "project not found", http.StatusNotFound)
 			return
 		}
-		buildID, err := builder.FetchRemoteSnapshot(project, "snapshot")
+		buildID, err := mcpIdempotentBuild("snapshot", project, r.Header.Get("Idempotency-Key"), func(triggeredBy string) (int64, error) {
+			return builder.FetchRemoteSnapshot(project, triggeredBy)
+		})
 		if err != nil {
 			jsonErrorCode(w, deployConflictErrorCode(err), err.Error(), http.StatusConflict)
 			return

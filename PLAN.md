@@ -18,6 +18,8 @@ Build a reliable foundation, then deliver features that improve everyday deploym
 
 ## 2. Add a focused MCP integration
 
+**Status: complete (2026-09-08).** Verified with an official MCP SDK client and PostgreSQL-backed API tests for scoped authorization, previews, deployment/failure follow-up, snapshot upload, concurrent retries, and crash recovery. The isolated Stage 2 full test suite passes; setup is documented in `docs/mcp.md`.
+
 - Expose typed tools for listing projects and runners, reading project summaries/configuration, and inspecting recent builds.
 - Expose bounded logs, structured events, failure summaries, and generated runbooks.
 - Provide deployment previews showing source version, target, preserve paths, hooks, and health checks.
