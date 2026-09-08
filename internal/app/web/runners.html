@@ -103,7 +103,7 @@
                     {{end}}
                 </div>
                 <div class="workflow-info">
-                    <div class="workflow-title">{{.Runner.Name}}</div>
+                    <div class="workflow-title"><a href="/runners/{{.Runner.ID}}">{{.Runner.Name}}</a></div>
                     <div class="workflow-meta">
                         {{if .Runner.Labels}}{{.Runner.Labels}} ·{{end}}
                         {{if eq .Runner.Status "online"}}<span style="color:var(--success)">Online</span>{{else}}<span style="color:var(--text-muted)">Offline</span>{{end}}

@@ -41,6 +41,10 @@ func handleAgentPoll(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
+	if err := ensureRunnerOperationsSchema(); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	runner, err := authenticateAgent(r)
 	if err != nil {
 		jsonErrorCode(w, agentAuthErrorCode(err), err.Error(), http.StatusUnauthorized)
@@ -49,6 +53,13 @@ func handleAgentPoll(w http.ResponseWriter, r *http.Request) {
 
 	// Update heartbeat
 	logOperationalError("update runner heartbeat", updateRunnerHeartbeatContext(r.Context(), runner.ID))
+	if queued, err := runnerHasQueuedOperation(runner.ID); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if queued {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 
 	// Long-poll: check for pending jobs every 2s, timeout after 30s
 	ctx := r.Context()
@@ -64,7 +75,7 @@ func handleAgentPoll(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 
-		job, err := claimPendingJobContext(ctx, runner.ID)
+		job, err := claimPendingDeploymentForRunner(ctx, runner.ID)
 		if err == nil && job != nil {
 			logOperationalError("update runner heartbeat", updateRunnerHeartbeatContext(ctx, runner.ID))
 
@@ -83,6 +94,68 @@ func handleAgentPoll(w http.ResponseWriter, r *http.Request) {
 		// Update heartbeat while polling
 		logOperationalError("update runner heartbeat", updateRunnerHeartbeatContext(ctx, runner.ID))
 	}
+}
+
+// handleAgentOperationPoll is intentionally separate from deployment polling so
+// older agents keep the existing Job response format.
+func handleAgentOperationPoll(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	if err := ensureRunnerOperationsSchema(); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	runner, err := authenticateAgent(r)
+	if err != nil {
+		jsonErrorCode(w, agentAuthErrorCode(err), err.Error(), http.StatusUnauthorized)
+		return
+	}
+	logOperationalError("update runner heartbeat", updateRunnerHeartbeatContext(r.Context(), runner.ID))
+	op, err := claimRunnerOperation(r.Context(), runner.ID)
+	if err == sql.ErrNoRows {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonResponse(w, op)
+}
+
+func handleAgentOperationComplete(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	runner, err := authenticateAgent(r)
+	if err != nil {
+		jsonErrorCode(w, agentAuthErrorCode(err), err.Error(), http.StatusUnauthorized)
+		return
+	}
+	id, suffix, ok := parseIDPath(r.URL.Path, "/api/agent/operations/complete/")
+	if !ok || suffix != "" {
+		jsonErrorCode(w, errCodeValidation, "invalid operation id", http.StatusBadRequest)
+		return
+	}
+	var result struct {
+		Status  string `json:"status"`
+		Summary string `json:"summary"`
+		Log     string `json:"log"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxOperationLogBytes+4096)).Decode(&result); err != nil {
+		jsonErrorCode(w, errCodeValidation, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := completeRunnerOperation(runner.ID, id, result.Status, result.Summary, result.Log); err != nil {
+		if err == sql.ErrNoRows {
+			jsonErrorCode(w, errCodeJobNotFound, "operation not found", http.StatusNotFound)
+		} else {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleAgentArtifact — serve the docker image tar to the agent
@@ -242,7 +315,6 @@ func handleAgentLog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Append without overwriting concurrently updated build status or log lines.
 	logOperationalError("append build log", appendBuildLog(buildID, logText))
 
 	w.WriteHeader(http.StatusOK)
@@ -324,6 +396,7 @@ func handleAgentComplete(w http.ResponseWriter, r *http.Request) {
 	} else {
 		logOperationalError("update failed job", updateJobStatusWithError(job.ID, "failed", build.ErrorCode))
 	}
+	clearRunnerDeploymentTask(runner.ID, job.ID)
 
 	// Close SSE stream
 	broker.Close(buildID)
@@ -350,12 +423,26 @@ func handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
+	if err := ensureRunnerOperationsSchema(); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	runner, err := authenticateAgent(r)
 	if err != nil {
 		jsonErrorCode(w, agentAuthErrorCode(err), err.Error(), http.StatusUnauthorized)
 		return
 	}
-
+	if r.ContentLength != 0 {
+		var telemetry RunnerTelemetry
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&telemetry); err != nil {
+			jsonErrorCode(w, errCodeValidation, "invalid telemetry", http.StatusBadRequest)
+			return
+		}
+		if err := saveRunnerTelemetry(runner.ID, telemetry); err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 	logOperationalError("update runner heartbeat", updateRunnerHeartbeat(runner.ID))
 	w.WriteHeader(http.StatusOK)
 }
@@ -436,6 +523,36 @@ func handleAPIRunner(w http.ResponseWriter, r *http.Request) {
 		handleAPIRunnerHistory(w, r, id)
 		return
 	}
+	if suffix == "operations" {
+		switch r.Method {
+		case http.MethodGet:
+			ops, err := listRunnerOperations(id, 50)
+			if err != nil {
+				jsonError(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			jsonResponse(w, ops)
+		case http.MethodPost:
+			var request struct {
+				ProjectID int64  `json:"project_id"`
+				Kind      string `json:"kind"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				jsonErrorCode(w, errCodeValidation, "invalid JSON", http.StatusBadRequest)
+				return
+			}
+			op, err := queueRunnerOperation(id, request.ProjectID, request.Kind)
+			if err != nil {
+				jsonErrorCode(w, errCodeValidation, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			jsonResponse(w, op)
+		default:
+			jsonMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
+		return
+	}
 	if suffix != "" {
 		http.NotFound(w, r)
 		return
@@ -467,8 +584,58 @@ func handleAPIRunner(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func handleAPIRunnerOperation(w http.ResponseWriter, r *http.Request) {
+	id, suffix, ok := parseIDPath(r.URL.Path, "/api/runner-operations/")
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if suffix == "" && r.Method == http.MethodGet {
+		op, err := getRunnerOperation(id)
+		if err == sql.ErrNoRows {
+			jsonErrorCode(w, errCodeJobNotFound, "operation not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		jsonResponse(w, op)
+		return
+	}
+	if suffix == "cancel" && r.Method == http.MethodPost {
+		ok, err := cancelPendingRunnerOperation(id)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			jsonErrorCode(w, errCodeValidation, "operation is not pending", http.StatusBadRequest)
+			return
+		}
+		jsonResponse(w, map[string]string{"status": "cancelled"})
+		return
+	}
+	jsonMethodNotAllowed(w, http.MethodPost)
+}
+
 // handleRunnersPage — HTML page for runner management
 func handleRunnersPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/runners" && r.URL.Path != "/runners/" {
+		id, suffix, ok := parseIDPath(r.URL.Path, "/runners/")
+		if !ok || suffix != "" {
+			http.NotFound(w, r)
+			return
+		}
+		detail, err := getRunnerDetail(id)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		projects, _ := listProjects()
+		tmpl.ExecuteTemplate(w, "runner_detail.html", map[string]interface{}{"Detail": detail, "Projects": projects})
+		return
+	}
 	runners, err := listRunners()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

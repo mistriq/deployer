@@ -132,9 +132,13 @@ func (s *mcpServer) tools() []mcpTool {
 	noArgs := objectSchema([]string{}, map[string]interface{}{})
 	projectID := objectSchema([]string{"project_id"}, map[string]interface{}{"project_id": intProp("Project ID")})
 	buildID := objectSchema([]string{"build_id"}, map[string]interface{}{"build_id": intProp("Build ID")})
+	runnerID := objectSchema([]string{"runner_id"}, map[string]interface{}{"runner_id": intProp("Runner ID")})
+	operationID := objectSchema([]string{"operation_id"}, map[string]interface{}{"operation_id": intProp("Operation ID")})
 	tools := []mcpTool{
 		{Name: "projects_list", Description: "List deployment projects and their latest builds.", InputSchema: noArgs},
 		{Name: "runners_list", Description: "List deployment runners.", InputSchema: noArgs},
+		{Name: "runner_detail", Description: "Read runner telemetry, active task, deployment queue, and recent operations.", InputSchema: runnerID},
+		{Name: "operation_get", Description: "Read a runner operation and its bounded output.", InputSchema: operationID},
 		{Name: "project_summary", Description: "Read a project operational summary.", InputSchema: projectID},
 		{Name: "project_config", Description: "Read a project configuration with secret values redacted.", InputSchema: projectID},
 		{Name: "builds_recent", Description: "Inspect recent project builds.", InputSchema: projectID},
@@ -150,6 +154,8 @@ func (s *mcpServer) tools() []mcpTool {
 			mcpTool{Name: "deployment_trigger", Description: "Start a deployment asynchronously and return its build ID. Retries with the same key return the same build.", InputSchema: writeProject},
 			mcpTool{Name: "build_cancel", Description: "Cancel a running build.", InputSchema: buildID},
 			mcpTool{Name: "snapshot_request", Description: "Request a remote snapshot asynchronously and return its build ID.", InputSchema: writeProject},
+			mcpTool{Name: "operation_queue", Description: "Queue an authorized fixed runner operation.", InputSchema: objectSchema([]string{"runner_id", "project_id", "kind"}, map[string]interface{}{"runner_id": intProp("Runner ID"), "project_id": intProp("Project ID"), "kind": map[string]interface{}{"type": "string", "enum": []string{"health_check", "compose_status", "compose_restart", "compose_stop", "compose_logs"}}})},
+			mcpTool{Name: "operation_cancel", Description: "Cancel a pending runner operation.", InputSchema: operationID},
 		)
 	}
 	return tools
@@ -163,13 +169,25 @@ func (s *mcpServer) call(ctx context.Context, p mcpCallParams) (mcpCallResult, e
 		}
 		return int64(v), nil
 	}
-	var method, path, token string
+	var method, path, token, requestBody string
 	method, token = http.MethodGet, s.readToken
 	switch p.Name {
 	case "projects_list":
 		path = "/api/projects"
 	case "runners_list":
 		path = "/api/runners"
+	case "runner_detail":
+		v, e := id("runner_id")
+		if e != nil {
+			return mcpCallResult{}, e
+		}
+		path = "/api/runners/" + strconv.FormatInt(v, 10)
+	case "operation_get":
+		v, e := id("operation_id")
+		if e != nil {
+			return mcpCallResult{}, e
+		}
+		path = "/api/runner-operations/" + strconv.FormatInt(v, 10)
 	case "project_summary", "project_config", "builds_recent", "project_runbook", "deployment_preview":
 		v, e := id("project_id")
 		if e != nil {
@@ -215,14 +233,46 @@ func (s *mcpServer) call(ctx context.Context, p mcpCallParams) (mcpCallResult, e
 		}
 		path = "/api/builds/" + strconv.FormatInt(v, 10) + "/cancel"
 		method, token = http.MethodPost, s.writeToken
+	case "operation_queue":
+		if s.writeToken == "" {
+			return mcpCallResult{}, errors.New("write access is not configured")
+		}
+		runner, e := id("runner_id")
+		if e != nil {
+			return mcpCallResult{}, e
+		}
+		project, e := id("project_id")
+		if e != nil {
+			return mcpCallResult{}, e
+		}
+		kind, ok := p.Arguments["kind"].(string)
+		if !ok || !validRunnerOperationKind(kind) {
+			return mcpCallResult{}, errors.New("invalid operation kind")
+		}
+		path = "/api/runners/" + strconv.FormatInt(runner, 10) + "/operations"
+		method, token = http.MethodPost, s.writeToken
+		requestBody = fmt.Sprintf(`{"project_id":%d,"kind":%q}`, project, kind)
+	case "operation_cancel":
+		if s.writeToken == "" {
+			return mcpCallResult{}, errors.New("write access is not configured")
+		}
+		v, e := id("operation_id")
+		if e != nil {
+			return mcpCallResult{}, e
+		}
+		path = "/api/runner-operations/" + strconv.FormatInt(v, 10) + "/cancel"
+		method, token = http.MethodPost, s.writeToken
 	default:
 		return mcpCallResult{}, fmt.Errorf("unknown tool %q", p.Name)
 	}
 	headers := map[string]string{}
+	if requestBody != "" {
+		headers["Content-Type"] = "application/json"
+	}
 	if key, ok := p.Arguments["idempotency_key"].(string); ok {
 		headers["Idempotency-Key"] = strings.TrimSpace(key)
 	}
-	raw, err := s.request(ctx, method, path, token, headers)
+	raw, err := s.requestWithBody(ctx, method, path, token, headers, requestBody)
 	if err != nil {
 		return mcpCallResult{}, err
 	}
@@ -248,6 +298,10 @@ func (s *mcpServer) call(ctx context.Context, p mcpCallParams) (mcpCallResult, e
 }
 
 func (s *mcpServer) request(ctx context.Context, method, path, token string, headers map[string]string) ([]byte, error) {
+	return s.requestWithBody(ctx, method, path, token, headers, "")
+}
+
+func (s *mcpServer) requestWithBody(ctx context.Context, method, path, token string, headers map[string]string, body string) ([]byte, error) {
 	base, err := url.Parse(s.baseURL)
 	if err != nil {
 		return nil, err
@@ -257,7 +311,7 @@ func (s *mcpServer) request(ctx context.Context, method, path, token string, hea
 		return nil, err
 	}
 	endpoint := base.ResolveReference(rel)
-	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -271,17 +325,17 @@ func (s *mcpServer) request(ctx context.Context, method, path, token string, hea
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, (6<<20)+1))
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, (6<<20)+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(body) > 6<<20 {
+	if len(responseBody) > 6<<20 {
 		return nil, errors.New("Deployer API response exceeded 6 MiB safety limit")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("Deployer API %s: %s", resp.Status, strings.TrimSpace(string(redactJSON(body))))
+		return nil, fmt.Errorf("Deployer API %s: %s", resp.Status, strings.TrimSpace(string(redactJSON(responseBody))))
 	}
-	return body, nil
+	return responseBody, nil
 }
 
 func boundMCPResult(tool string, value interface{}) interface{} {

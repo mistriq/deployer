@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -135,6 +136,16 @@ func runAgent() {
 
 	// Main poll loop
 	for {
+		op, err := agentPollOperation(*serverURL, *token)
+		if err != nil {
+			logStructured("error", "agent_operation_poll_failed", map[string]interface{}{"error": err})
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if op != nil {
+			executeRunnerOperation(*serverURL, *token, op)
+			continue
+		}
 		job, err := agentPoll(*serverURL, *token)
 		if err != nil {
 			logStructured("error", "agent_poll_failed", map[string]interface{}{
@@ -206,7 +217,11 @@ func newAgentRequest(method, reqURL, token string, body io.Reader) (*http.Reques
 }
 
 func agentHeartbeat(serverURL, token string) error {
-	req, err := newAgentRequest(http.MethodPost, serverURL+"/api/agent/heartbeat", token, nil)
+	payload, err := json.Marshal(agentTelemetry())
+	if err != nil {
+		return err
+	}
+	req, err := newAgentRequest(http.MethodPost, serverURL+"/api/agent/heartbeat", token, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -220,6 +235,188 @@ func agentHeartbeat(serverURL, token string) error {
 		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+func agentTelemetry() RunnerTelemetry {
+	host, _ := os.Hostname()
+	telemetry := RunnerTelemetry{AgentVersion: buildVersion, Hostname: host, OSName: runtime.GOOS}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if output, err := agentCommands.Output(ctx, "", "df", "-Pk", "."); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		if len(lines) > 1 {
+			fields := strings.Fields(lines[len(lines)-1])
+			if len(fields) >= 4 {
+				var total, free int64
+				if _, err := fmt.Sscan(fields[1], &total); err == nil {
+					telemetry.DiskTotalBytes = total * 1024
+				}
+				if _, err := fmt.Sscan(fields[3], &free); err == nil {
+					telemetry.DiskFreeBytes = free * 1024
+				}
+			}
+		}
+	}
+	if raw, err := os.ReadFile("/proc/uptime"); err == nil {
+		var seconds float64
+		if _, err := fmt.Sscan(string(raw), &seconds); err == nil {
+			telemetry.UptimeSeconds = int64(seconds)
+		}
+	}
+	if output, err := agentCommands.Output(ctx, "", "docker", "version", "--format", "{{.Server.Version}}"); err == nil {
+		telemetry.DockerAvailable = true
+		telemetry.DockerVersion = strings.TrimSpace(string(output))
+	}
+	return telemetry
+}
+
+func agentPollOperation(serverURL, token string) (*RunnerOperation, error) {
+	req, err := newAgentRequest(http.MethodGet, serverURL+"/api/agent/operations/poll", token, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := agentControlClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+	var op RunnerOperation
+	if err := json.NewDecoder(resp.Body).Decode(&op); err != nil {
+		return nil, err
+	}
+	return &op, nil
+}
+
+func executeRunnerOperation(serverURL, token string, op *RunnerOperation) {
+	var output string
+	var err error
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	job := &Job{DeployDir: op.DeployDir, ComposeFile: op.ComposeFile, ComposeServices: op.ComposeServices, HealthURL: op.HealthURL, HealthContainer: op.HealthContainer}
+	switch op.Kind {
+	case operationHealthCheck:
+		output, err = runOperationHealthCheck(ctx, job)
+	case operationComposeStatus:
+		output, err = runBoundedOperationCommand(ctx, op.DeployDir, "docker", "compose", "-f", op.ComposeFile, "ps")
+	case operationComposeRestart:
+		args := append([]string{"compose", "-f", op.ComposeFile, "restart"}, strings.Fields(op.ComposeServices)...)
+		output, err = runBoundedOperationCommand(ctx, op.DeployDir, "docker", args...)
+	case operationComposeStop:
+		args := append([]string{"compose", "-f", op.ComposeFile, "stop"}, strings.Fields(op.ComposeServices)...)
+		output, err = runBoundedOperationCommand(ctx, op.DeployDir, "docker", args...)
+	case operationComposeLogs:
+		args := append([]string{"compose", "-f", op.ComposeFile, "logs", "--tail", "200", "--no-color"}, strings.Fields(op.ComposeServices)...)
+		output, err = runBoundedOperationCommand(ctx, op.DeployDir, "docker", args...)
+	default:
+		err = fmt.Errorf("unsupported operation %q", op.Kind)
+	}
+	status, summary := "succeeded", "completed"
+	if err != nil {
+		status = "failed"
+		summary = err.Error()
+	}
+	if len(output) > maxOperationLogBytes {
+		output = output[:maxOperationLogBytes] + "\n[output truncated]"
+	}
+	if completeErr := agentCompleteOperation(serverURL, token, op.ID, status, summary, output); completeErr != nil {
+		logStructured("error", "agent_operation_complete_failed", map[string]interface{}{"operation_id": op.ID, "error": completeErr})
+	}
+}
+
+func runOperationHealthCheck(ctx context.Context, job *Job) (string, error) {
+	if job.HealthContainer != "" {
+		output, err := runBoundedOperationCommand(ctx, "", "docker", "inspect", "--format", "{{.State.Health.Status}}", job.HealthContainer)
+		if err != nil {
+			return output, err
+		}
+		if strings.TrimSpace(output) != "healthy" {
+			return output, fmt.Errorf("container %s is not healthy", job.HealthContainer)
+		}
+		return output, nil
+	}
+	if job.HealthURL == "" {
+		return "", fmt.Errorf("no health check configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, job.HealthURL, nil)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return string(body), fmt.Errorf("health URL returned status %d", resp.StatusCode)
+	}
+	return string(body), nil
+}
+
+func runBoundedOperationCommand(ctx context.Context, dir, name string, args ...string) (string, error) {
+	command, reader, err := agentCommands.Start(ctx, dir, name, args...)
+	if err != nil {
+		return "", err
+	}
+	defer reader.Close()
+	output := &cappedOperationOutput{limit: maxOperationLogBytes}
+	_, readErr := io.Copy(output, reader) // capped writer keeps draining the pipe.
+	waitErr := command.Wait()
+	if readErr != nil {
+		return output.String(), readErr
+	}
+	return output.String(), waitErr
+}
+
+type cappedOperationOutput struct {
+	bytes.Buffer
+	limit int
+}
+
+func (b *cappedOperationOutput) Write(p []byte) (int, error) {
+	if remaining := b.limit - b.Len(); remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.Buffer.Write(p[:remaining])
+		} else {
+			_, _ = b.Buffer.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func agentCompleteOperation(serverURL, token string, id int64, status, summary, log string) error {
+	payload, _ := json.Marshal(map[string]string{"status": status, "summary": summary, "log": log})
+	var lastErr error
+	for attempt := 0; attempt < agentHTTPAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(agentRetryDelay(attempt))
+		}
+		req, err := newAgentRequest(http.MethodPost, fmt.Sprintf("%s/api/agent/operations/complete/%d", serverURL, id), token, bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := agentControlClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return nil
+		}
+		lastErr = fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+	return lastErr
 }
 
 func agentPoll(serverURL, token string) (*Job, error) {

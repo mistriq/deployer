@@ -53,6 +53,9 @@ func Run() {
 		})
 	}
 	defer db.Close()
+	if err := ensureRunnerOperationsSchema(); err != nil {
+		logFatal("startup_error", "failed to prepare runner operations", err, nil)
+	}
 	cleanupRuntimeState(appConfig)
 	if err := seedDemoDataIfEnabled(appConfig); err != nil {
 		logFatal("startup_error", "failed to seed demo data", err, nil)
@@ -137,6 +140,16 @@ func Run() {
 			return securityStatus()
 		},
 		"compactPath": compactPath,
+		"formatBytes": func(value int64) string {
+			units := []string{"B", "KB", "MB", "GB", "TB"}
+			n := float64(value)
+			i := 0
+			for n >= 1024 && i < len(units)-1 {
+				n /= 1024
+				i++
+			}
+			return fmt.Sprintf("%.1f %s", n, units[i])
+		},
 	}).ParseFS(webFS, "web/*.html")
 	if err != nil {
 		logFatal("startup_error", "failed to parse templates", err, nil)
@@ -179,9 +192,12 @@ func Run() {
 	mux.HandleFunc("/api/builds/", handleAPIBuild)
 	mux.HandleFunc("/api/runners", handleAPIRunners)
 	mux.HandleFunc("/api/runners/", handleAPIRunner)
+	mux.HandleFunc("/api/runner-operations/", handleAPIRunnerOperation)
 
 	// Agent API routes
 	mux.HandleFunc("/api/agent/poll", handleAgentPoll)
+	mux.HandleFunc("/api/agent/operations/poll", handleAgentOperationPoll)
+	mux.HandleFunc("/api/agent/operations/complete/", handleAgentOperationComplete)
 	mux.HandleFunc("/api/agent/artifact/", handleAgentArtifact)
 	mux.HandleFunc("/api/agent/snapshot/", handleAgentSnapshotUpload)
 	mux.HandleFunc("/api/agent/log/", handleAgentLog)

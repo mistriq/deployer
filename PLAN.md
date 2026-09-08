@@ -47,6 +47,8 @@ This step can be developed independently of the database migration if earlier fe
 
 ## 4. Add runner visibility and remote operations
 
+**Status: complete (2026-09-08).** The isolated PostgreSQL-backed full suite passes, including concurrent runner claims, cancellation, legacy-agent rejection, a recovering HTTP health endpoint, and an actual disposable Docker status/log/restart/stop lifecycle. Populated desktop/mobile runner views were checked, and the operations are available through the API and scoped MCP tools.
+
 - Add runner detail pages with hostname, OS, agent version, uptime, disk space, Docker availability, heartbeat freshness, and current job.
 - Show pending/running jobs, runner assignment, and cancellation of pending work.
 - Add bounded service status and recent Compose log inspection.

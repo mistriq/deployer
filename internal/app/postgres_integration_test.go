@@ -157,6 +157,105 @@ func isolatedPostgres(t *testing.T, rawURL string) string {
 	return u.String()
 }
 
+func TestPostgresOperationAndDeploymentClaimsSerializePerRunner(t *testing.T) {
+	u := isolatedPostgres(t, postgresTestURL(t))
+	old := db
+	t.Cleanup(func() {
+		if db != nil {
+			db.Close()
+		}
+		db = old
+	})
+	if err := initPostgres(u); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRunnerOperationsSchema(); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Name: "operation-claim-runner"}
+	if err := createRunner(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateRunnerHeartbeat(r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRunnerTelemetry(r.ID, RunnerTelemetry{DockerAvailable: true}); err != nil {
+		t.Fatal(err)
+	}
+	p := &Project{Name: "operation-claim-project", RepoPath: "/tmp/repo", ImageName: "image", DeployDir: "/tmp/target", RunnerID: r.ID, HealthURL: "https://example.test/health"}
+	if err := createProject(p); err != nil {
+		t.Fatal(err)
+	}
+	b, err := createBuild(p.ID, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := createJob(b.ID, r.ID, p, "/tmp/artifact"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queueRunnerOperation(r.ID, p.ID, operationHealthCheck); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var opWon, deployWon int
+	var mu sync.Mutex
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if op, err := claimRunnerOperation(context.Background(), r.ID); err == nil && op != nil {
+				mu.Lock()
+				opWon++
+				mu.Unlock()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if job, err := claimPendingDeploymentForRunner(context.Background(), r.ID); err == nil && job != nil {
+				mu.Lock()
+				deployWon++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if opWon != 1 || deployWon != 0 {
+		t.Fatalf("claims must serialize operation before deployment: op=%d deploy=%d", opWon, deployWon)
+	}
+	if err := completeRunnerOperation(r.ID, 1, "succeeded", "done", ""); err != nil {
+		t.Fatal(err)
+	}
+	job, err := claimPendingDeploymentForRunner(context.Background(), r.ID)
+	if err != nil || job == nil {
+		t.Fatalf("deployment did not resume after op completion: job=%+v err=%v", job, err)
+	}
+	clearRunnerDeploymentTask(r.ID, job.ID)
+	if _, err := queueRunnerOperation(r.ID, p.ID, operationHealthCheck); err != nil {
+		t.Fatal(err)
+	}
+	var claimed, cancelled bool
+	wg = sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := claimRunnerOperation(context.Background(), r.ID)
+		mu.Lock()
+		claimed = err == nil
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		ok, _ := cancelPendingRunnerOperation(2)
+		mu.Lock()
+		cancelled = ok
+		mu.Unlock()
+	}()
+	wg.Wait()
+	if claimed && cancelled {
+		t.Fatal("pending operation was both claimed and cancelled")
+	}
+}
+
 func TestPostgresConcurrentClaimsHeartbeatsAndLogs(t *testing.T) {
 	u := isolatedPostgres(t, postgresTestURL(t))
 	old := db
