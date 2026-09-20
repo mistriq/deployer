@@ -1,5 +1,15 @@
 # Real Runtime test — 20 September 2026, 12:33 UTC
 
+## Follow-up resolved — 15:16 UTC
+
+After the maintainer's node restart, the same real project persisted; node started at 15:14:52 UTC, was healthy and no longer draining. No node settings were changed in this follow-up.
+
+New deployment `dep_06gbys0n8j78kzr8anqn539fn4`, external/idempotency key `dep_codex_real_retry_1a0bf641458`, reached **active** at 15:16:50 UTC using the same pinned public image below. Repeating submission returned the same ID; history contains exactly one entry for the new external ID. Original failed deployment history was preserved.
+
+Release `rel_06gbys0yye5hf83rwek9tdn7q4` matches the project's active pointer and route `rte_06gbys18t4ga4sfk2g25gd2va4`. Desired and applied revisions both equal **1**. Public `https://prj-codex-real-1a0bece7651.apps.socialscentury.com/` returned **200**, expected `Welcome to nginx!` content and `X-Socen-Route: rte_06gbys18t4ga4sfk2g25gd2va4@1`, with standard TLS certificate/hostname verification enabled. Deployment and release logs both returned 200 with 34 lines.
+
+The test container is left active for inspection. [Success evidence](runtime-real-success-evidence.json) records the exact lifecycle, release, route, log counts and HTTPS proof. This proves actual remote Docker/public hosting; it does not prove portal checkout/build/private-registry push. Local Docker still times out after 8 seconds, and the portal's registry remains local. The historical failure below is resolved for this real Runtime smoke test.
+
 User explicitly authorized testing the real node without the sandbox header. Confirmed `node_id=runtime-01`, `driver=docker`, `proxy=file`, `store=file`. This test is separate from all previous mock sandbox results.
 
 ## Result: container works, public activation fails
