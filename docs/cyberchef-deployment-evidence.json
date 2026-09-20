@@ -1,0 +1,130 @@
+{
+  "checked_at": "2026-09-20T18:22:33.590Z",
+  "app": "CyberChef",
+  "source": "https://github.com/gchq/CyberChef",
+  "url": "https://cyberchef-1a0c00d3a47.apps.socialscentury.com/",
+  "project_id": "prj_codex_cyberchef_1a0c00d3a47",
+  "deployment": {
+    "id": "dep_06gc03brdydy4nyzgp9hccs4kr",
+    "project_id": "prj_codex_cyberchef_1a0c00d3a47",
+    "external_id": "dep_prj_codex_cyberchef_1a0c00d3a47",
+    "idempotency_key": "dep_prj_codex_cyberchef_1a0c00d3a47",
+    "phase": "active",
+    "artifact": {
+      "image": "ghcr.io/gchq/cyberchef",
+      "digest": "sha256:fa74354a9c5dd014c8dacee843eb9218fb13465d678d8b049e97bc26a69a1640"
+    },
+    "manifest": {
+      "version": 1,
+      "kind": "static",
+      "policy_version": "policy-2026-07",
+      "runtime": {
+        "port": 8080,
+        "user": "10001:10001",
+        "read_only_root": true,
+        "tmpfs": [
+          {
+            "path": "/tmp",
+            "size_mb": 64
+          }
+        ]
+      },
+      "health": {
+        "path": "/",
+        "expect_status_min": 200,
+        "expect_status_max": 299,
+        "timeout_ms": 2000,
+        "interval_ms": 500,
+        "retries": 20,
+        "grace_period_ms": 1000
+      },
+      "resources": {
+        "cpu_millis": 500,
+        "memory_mb": 256,
+        "pids_limit": 128,
+        "disk_mb": 1024
+      },
+      "network": {
+        "websocket": false,
+        "egress_allowed": true,
+        "max_body_bytes": 10485760,
+        "rate_limit_rps": 50
+      }
+    },
+    "release_id": "rel_06gc03cmb0frcwdhjk2m7ftmsr",
+    "attempt": 0,
+    "created_at": "2026-09-20T18:21:43.40721155Z",
+    "updated_at": "2026-09-20T18:21:55.658195072Z",
+    "started_at": "2026-09-20T18:21:43.749541241Z",
+    "finished_at": "2026-09-20T18:21:55.658195353Z",
+    "events": [
+      {
+        "phase": "queued",
+        "at": "2026-09-20T18:21:43.40721155Z",
+        "message": "accepted by runtime node runtime-01"
+      },
+      {
+        "phase": "pulling",
+        "at": "2026-09-20T18:21:43.749541241Z",
+        "message": "resolving artifact by digest",
+        "duration_ms": 342
+      },
+      {
+        "phase": "deploying",
+        "at": "2026-09-20T18:21:50.231281128Z",
+        "message": "starting candidate container",
+        "duration_ms": 6481
+      },
+      {
+        "phase": "health_check",
+        "at": "2026-09-20T18:21:51.299778611Z",
+        "message": "probing candidate",
+        "duration_ms": 1068
+      },
+      {
+        "phase": "health_check",
+        "at": "2026-09-20T18:21:52.814193562Z",
+        "message": "healthy after 1 probe(s)",
+        "duration_ms": 1002
+      },
+      {
+        "phase": "activating",
+        "at": "2026-09-20T18:21:52.844440441Z",
+        "message": "switching public route",
+        "duration_ms": 30
+      },
+      {
+        "phase": "active",
+        "at": "2026-09-20T18:21:55.498834666Z",
+        "message": "release is serving traffic",
+        "duration_ms": 2654
+      }
+    ]
+  },
+  "route": {
+    "route_id": "rte_06gc03cy0e29m42g7a7xbz5wa0",
+    "project_id": "prj_codex_cyberchef_1a0c00d3a47",
+    "hostname": "cyberchef-1a0c00d3a47.apps.socialscentury.com",
+    "upstream_host": "172.16.6.2",
+    "upstream_port": 8080,
+    "status": "active",
+    "websocket": false,
+    "max_body_bytes": 10485760,
+    "rate_limit_rps": 50,
+    "desired_revision": 2,
+    "applied_revision": 2,
+    "release_id": "rel_06gc03cmb0frcwdhjk2m7ftmsr",
+    "updated_at": "2026-09-20T18:21:55.195307915Z",
+    "applied_at": "2026-09-20T18:21:55.051207182Z"
+  },
+  "https_status": 200,
+  "route_header": "rte_06gc03cy0e29m42g7a7xbz5wa0@2",
+  "runtime_log_count": 28,
+  "browser_test": {
+    "input": "Hello from Molo",
+    "operation": "To Base64",
+    "observed_output": "SGVsbG8gZnJvbSBNb2xv",
+    "passed": true
+  },
+  "scope": "Official prebuilt CyberChef image on real Docker Runtime; no local build or portal build/push verification"
+}
