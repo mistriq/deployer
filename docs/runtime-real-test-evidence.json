@@ -1,0 +1,455 @@
+{
+  "observed_at": "2026-09-20T12:34:44.766Z",
+  "scope": "real runtime-01; user authorized non-sandbox test",
+  "project": {
+    "id": "prj_codex_real_1a0bece7651",
+    "slug": "prj-codex-real-1a0bece7651",
+    "hostname": "prj-codex-real-1a0bece7651.apps.socialscentury.com",
+    "status": "active",
+    "kill_switch": false,
+    "manifest": {
+      "version": 1,
+      "kind": "static",
+      "policy_version": "policy-2026-07",
+      "runtime": {
+        "port": 8080,
+        "user": "10001:10001",
+        "read_only_root": true,
+        "tmpfs": [
+          {
+            "path": "/tmp",
+            "size_mb": 64
+          }
+        ]
+      },
+      "health": {
+        "path": "/",
+        "expect_status_min": 200,
+        "expect_status_max": 299,
+        "timeout_ms": 2000,
+        "interval_ms": 500,
+        "retries": 10,
+        "grace_period_ms": 1000
+      },
+      "resources": {
+        "cpu_millis": 500,
+        "memory_mb": 256,
+        "pids_limit": 128,
+        "disk_mb": 1024
+      },
+      "network": {
+        "websocket": false,
+        "egress_allowed": true,
+        "max_body_bytes": 1048576,
+        "rate_limit_rps": 20
+      }
+    },
+    "env_version": 0,
+    "created_at": "2026-09-20T12:33:17.080104243Z",
+    "updated_at": "2026-09-20T12:33:17.080104334Z",
+    "retention_until": "0001-01-01T00:00:00Z"
+  },
+  "history": {
+    "items": [
+      {
+        "id": "dep_06gbxkmx8bb6c1cc3twxgrd9p0",
+        "project_id": "prj_codex_real_1a0bece7651",
+        "external_id": "dep_prj_codex_real_1a0bece7651",
+        "idempotency_key": "dep_prj_codex_real_1a0bece7651",
+        "phase": "failed",
+        "failure_code": "ROUTE_APPLY_FAILED",
+        "failure_message": "ROUTE_APPLY_FAILED: proxy configuration for revision 5 failed validation; revision 4 restored",
+        "artifact": {
+          "image": "docker.io/nginxinc/nginx-unprivileged",
+          "digest": "sha256:cc92c08186c41fba80d9ca5fdffe09458bbc4bc94e8025586add6806ba768719"
+        },
+        "manifest": {
+          "version": 1,
+          "kind": "static",
+          "policy_version": "policy-2026-07",
+          "runtime": {
+            "port": 8080,
+            "user": "10001:10001",
+            "read_only_root": true,
+            "tmpfs": [
+              {
+                "path": "/tmp",
+                "size_mb": 64
+              }
+            ]
+          },
+          "health": {
+            "path": "/",
+            "expect_status_min": 200,
+            "expect_status_max": 299,
+            "timeout_ms": 2000,
+            "interval_ms": 500,
+            "retries": 10,
+            "grace_period_ms": 1000
+          },
+          "resources": {
+            "cpu_millis": 500,
+            "memory_mb": 256,
+            "pids_limit": 128,
+            "disk_mb": 1024
+          },
+          "network": {
+            "websocket": false,
+            "egress_allowed": true,
+            "max_body_bytes": 1048576,
+            "rate_limit_rps": 20
+          }
+        },
+        "release_id": "rel_06gbxkqcxawt3v0kwpsf49zwmm",
+        "attempt": 0,
+        "created_at": "2026-09-20T12:33:26.850208693Z",
+        "updated_at": "2026-09-20T12:33:50.573759169Z",
+        "started_at": "2026-09-20T12:33:27.16172326Z",
+        "finished_at": "2026-09-20T12:33:50.573759309Z",
+        "events": [
+          {
+            "phase": "queued",
+            "at": "2026-09-20T12:33:26.850208693Z",
+            "message": "accepted by runtime node runtime-01"
+          },
+          {
+            "phase": "pulling",
+            "at": "2026-09-20T12:33:27.16172326Z",
+            "message": "resolving artifact by digest",
+            "duration_ms": 311
+          },
+          {
+            "phase": "deploying",
+            "at": "2026-09-20T12:33:30.164160891Z",
+            "message": "starting candidate container",
+            "duration_ms": 3002
+          },
+          {
+            "phase": "health_check",
+            "at": "2026-09-20T12:33:31.154421098Z",
+            "message": "probing candidate",
+            "duration_ms": 990
+          },
+          {
+            "phase": "health_check",
+            "at": "2026-09-20T12:33:32.671680167Z",
+            "message": "healthy after 1 probe(s)",
+            "duration_ms": 1001
+          },
+          {
+            "phase": "activating",
+            "at": "2026-09-20T12:33:32.783289353Z",
+            "message": "switching public route",
+            "duration_ms": 111
+          },
+          {
+            "phase": "queued",
+            "at": "2026-09-20T12:33:35.856085403Z",
+            "message": "restarting after a transient failure (attempt 2)",
+            "duration_ms": 3072
+          },
+          {
+            "phase": "pulling",
+            "at": "2026-09-20T12:33:36.144830451Z",
+            "message": "resolving artifact by digest",
+            "duration_ms": 288
+          },
+          {
+            "phase": "deploying",
+            "at": "2026-09-20T12:33:37.011969243Z",
+            "message": "starting candidate container",
+            "duration_ms": 867
+          },
+          {
+            "phase": "health_check",
+            "at": "2026-09-20T12:33:38.250080503Z",
+            "message": "probing candidate",
+            "duration_ms": 1238
+          },
+          {
+            "phase": "health_check",
+            "at": "2026-09-20T12:33:39.741069823Z",
+            "message": "healthy after 1 probe(s)",
+            "duration_ms": 1000
+          },
+          {
+            "phase": "activating",
+            "at": "2026-09-20T12:33:39.960073641Z",
+            "message": "switching public route",
+            "duration_ms": 219
+          },
+          {
+            "phase": "queued",
+            "at": "2026-09-20T12:33:45.437999594Z",
+            "message": "restarting after a transient failure (attempt 3)",
+            "duration_ms": 5477
+          },
+          {
+            "phase": "pulling",
+            "at": "2026-09-20T12:33:45.741141905Z",
+            "message": "resolving artifact by digest",
+            "duration_ms": 303
+          },
+          {
+            "phase": "deploying",
+            "at": "2026-09-20T12:33:46.896725267Z",
+            "message": "starting candidate container",
+            "duration_ms": 1155
+          },
+          {
+            "phase": "health_check",
+            "at": "2026-09-20T12:33:47.870181433Z",
+            "message": "probing candidate",
+            "duration_ms": 973
+          },
+          {
+            "phase": "health_check",
+            "at": "2026-09-20T12:33:49.339787801Z",
+            "message": "healthy after 1 probe(s)",
+            "duration_ms": 1001
+          },
+          {
+            "phase": "activating",
+            "at": "2026-09-20T12:33:49.341997956Z",
+            "message": "switching public route",
+            "duration_ms": 2
+          },
+          {
+            "phase": "failed",
+            "at": "2026-09-20T12:33:50.573694087Z",
+            "code": "ROUTE_APPLY_FAILED",
+            "message": "ROUTE_APPLY_FAILED: proxy configuration for revision 5 failed validation; revision 4 restored"
+          }
+        ]
+      }
+    ],
+    "count": 1
+  },
+  "releases": {
+    "items": [
+      {
+        "id": "rel_06gbxkqcxawt3v0kwpsf49zwmm",
+        "project_id": "prj_codex_real_1a0bece7651",
+        "deployment_id": "dep_06gbxkmx8bb6c1cc3twxgrd9p0",
+        "artifact": {
+          "image": "docker.io/nginxinc/nginx-unprivileged",
+          "digest": "sha256:cc92c08186c41fba80d9ca5fdffe09458bbc4bc94e8025586add6806ba768719"
+        },
+        "manifest": {
+          "version": 1,
+          "kind": "static",
+          "policy_version": "policy-2026-07",
+          "runtime": {
+            "port": 8080,
+            "user": "10001:10001",
+            "read_only_root": true,
+            "tmpfs": [
+              {
+                "path": "/tmp",
+                "size_mb": 64
+              }
+            ]
+          },
+          "health": {
+            "path": "/",
+            "expect_status_min": 200,
+            "expect_status_max": 299,
+            "timeout_ms": 2000,
+            "interval_ms": 500,
+            "retries": 10,
+            "grace_period_ms": 1000
+          },
+          "resources": {
+            "cpu_millis": 500,
+            "memory_mb": 256,
+            "pids_limit": 128,
+            "disk_mb": 1024
+          },
+          "network": {
+            "websocket": false,
+            "egress_allowed": true,
+            "max_body_bytes": 1048576,
+            "rate_limit_rps": 20
+          }
+        },
+        "container_id": "bb5097c1279dcda6c9647f90f55eaccf808a6513ba6d32da700ae9cf11774c19",
+        "container_name": "socen-prj_codex_real_1a0bece7651-rel_06gbxkqcxawt3v0kwpsf49zwmm",
+        "network_id": "22f13571801b66746962141358c62d65ba22b319cc730f43fee9f194fc24e235",
+        "internal_host": "172.16.5.2",
+        "internal_port": 8080,
+        "status": "failed",
+        "env_version": 0,
+        "restarts": 0,
+        "created_at": "2026-09-20T12:33:47.242679559Z",
+        "retired_at": "2026-09-20T12:33:50.550639667Z"
+      },
+      {
+        "id": "rel_06gbxkp6dvsxhzqkqdtmgqrk48",
+        "project_id": "prj_codex_real_1a0bece7651",
+        "deployment_id": "dep_06gbxkmx8bb6c1cc3twxgrd9p0",
+        "artifact": {
+          "image": "docker.io/nginxinc/nginx-unprivileged",
+          "digest": "sha256:cc92c08186c41fba80d9ca5fdffe09458bbc4bc94e8025586add6806ba768719"
+        },
+        "manifest": {
+          "version": 1,
+          "kind": "static",
+          "policy_version": "policy-2026-07",
+          "runtime": {
+            "port": 8080,
+            "user": "10001:10001",
+            "read_only_root": true,
+            "tmpfs": [
+              {
+                "path": "/tmp",
+                "size_mb": 64
+              }
+            ]
+          },
+          "health": {
+            "path": "/",
+            "expect_status_min": 200,
+            "expect_status_max": 299,
+            "timeout_ms": 2000,
+            "interval_ms": 500,
+            "retries": 10,
+            "grace_period_ms": 1000
+          },
+          "resources": {
+            "cpu_millis": 500,
+            "memory_mb": 256,
+            "pids_limit": 128,
+            "disk_mb": 1024
+          },
+          "network": {
+            "websocket": false,
+            "egress_allowed": true,
+            "max_body_bytes": 1048576,
+            "rate_limit_rps": 20
+          }
+        },
+        "container_id": "f189a4b62f321aaa49f5e82d795bed28073e2799a72d40d01ed87effcddf42f7",
+        "container_name": "socen-prj_codex_real_1a0bece7651-rel_06gbxkp6dvsxhzqkqdtmgqrk48",
+        "network_id": "22f13571801b66746962141358c62d65ba22b319cc730f43fee9f194fc24e235",
+        "internal_host": "172.16.5.2",
+        "internal_port": 8080,
+        "status": "failed",
+        "env_version": 0,
+        "restarts": 0,
+        "created_at": "2026-09-20T12:33:37.390946754Z",
+        "retired_at": "2026-09-20T12:33:41.340085876Z"
+      },
+      {
+        "id": "rel_06gbxknb67dan5wk3gqjahh24r",
+        "project_id": "prj_codex_real_1a0bece7651",
+        "deployment_id": "dep_06gbxkmx8bb6c1cc3twxgrd9p0",
+        "artifact": {
+          "image": "docker.io/nginxinc/nginx-unprivileged",
+          "digest": "sha256:cc92c08186c41fba80d9ca5fdffe09458bbc4bc94e8025586add6806ba768719"
+        },
+        "manifest": {
+          "version": 1,
+          "kind": "static",
+          "policy_version": "policy-2026-07",
+          "runtime": {
+            "port": 8080,
+            "user": "10001:10001",
+            "read_only_root": true,
+            "tmpfs": [
+              {
+                "path": "/tmp",
+                "size_mb": 64
+              }
+            ]
+          },
+          "health": {
+            "path": "/",
+            "expect_status_min": 200,
+            "expect_status_max": 299,
+            "timeout_ms": 2000,
+            "interval_ms": 500,
+            "retries": 10,
+            "grace_period_ms": 1000
+          },
+          "resources": {
+            "cpu_millis": 500,
+            "memory_mb": 256,
+            "pids_limit": 128,
+            "disk_mb": 1024
+          },
+          "network": {
+            "websocket": false,
+            "egress_allowed": true,
+            "max_body_bytes": 1048576,
+            "rate_limit_rps": 20
+          }
+        },
+        "container_id": "34cd8a14cbafd3917ed51615d8df00e6ba1426d1af090db2ed90e4c29da8e3db",
+        "container_name": "socen-prj_codex_real_1a0bece7651-rel_06gbxknb67dan5wk3gqjahh24r",
+        "network_id": "22f13571801b66746962141358c62d65ba22b319cc730f43fee9f194fc24e235",
+        "internal_host": "172.16.5.2",
+        "internal_port": 8080,
+        "status": "failed",
+        "env_version": 0,
+        "restarts": 0,
+        "created_at": "2026-09-20T12:33:30.417167117Z",
+        "retired_at": "2026-09-20T12:33:33.880785073Z"
+      }
+    ],
+    "count": 3
+  },
+  "routes": {
+    "items": [],
+    "count": 0
+  },
+  "node_after": {
+    "node_id": "runtime-01",
+    "hostname": "zephyr",
+    "version": "dev",
+    "driver": "docker",
+    "proxy": "file",
+    "started_at": "2026-09-20T10:41:38.871820816Z",
+    "now": "2026-09-20T12:33:57.87906015Z",
+    "total": {
+      "cpu_millis": 4000,
+      "memory_mb": 7889,
+      "disk_mb": 236992,
+      "releases": 0,
+      "free_ram_mb": 2950,
+      "free_disk_mb": 145137,
+      "load_pct": 32,
+      "uptime_seconds": 6739
+    },
+    "allocated": {
+      "cpu_millis": 0,
+      "memory_mb": 0,
+      "disk_mb": 0,
+      "releases": 0
+    },
+    "reserve": {
+      "cpu_millis": 400,
+      "memory_mb": 788,
+      "disk_mb": 23699,
+      "releases": 0
+    },
+    "projects": 1,
+    "active_releases": 0,
+    "running_releases": 0,
+    "restarts": 0,
+    "pending_jobs": 0,
+    "dead_letters": 0,
+    "routes_diverged": 0,
+    "draining": true,
+    "global_stop": false,
+    "healthy": false,
+    "reason": "node is draining"
+  },
+  "public_https": {
+    "hostname": "prj-codex-real-1a0bece7651.apps.socialscentury.com",
+    "dns_ipv4": [
+      "217.154.71.237"
+    ],
+    "error": "ERR_TLS_CERT_ALTNAME_INVALID"
+  },
+  "drain_restored": true
+}
