@@ -43,7 +43,7 @@ func TestBuildPinsCommitAndPublishesDigest(t *testing.T) {
 	tmp := t.TempDir()
 	digest := "sha256:" + strings.Repeat("a", 64)
 	calls := 0
-	b := Builder{AllowLocalRepositories: true, TempDir: tmp}
+	b := Builder{AllowLocalRepositories: true, TempDir: tmp, CLIPluginDirs: []string{"/trusted/plugins"}}
 	b.Runner = runnerFunc(func(ctx context.Context, c Command) ([]byte, error) {
 		for _, e := range c.Env {
 			if strings.HasPrefix(e, "SENTINEL_SECRET=") {
@@ -76,6 +76,17 @@ func TestBuildPinsCommitAndPublishesDigest(t *testing.T) {
 				if err != nil || st.Mode().Perm() != 0600 {
 					t.Fatal("unsafe Docker credential file")
 				}
+				data, err := os.ReadFile(filepath.Join(p, "config.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var config map[string]json.RawMessage
+				if err = json.Unmarshal(data, &config); err != nil {
+					t.Fatal(err)
+				}
+				if len(config) != 2 || string(config["cliPluginsExtraDirs"]) != `["/trusted/plugins"]` || strings.Contains(string(data), "HOST_AUTH_SENTINEL") || config["credsStore"] != nil {
+					t.Fatalf("unexpected config fields: %v", config)
+				}
 			}
 		}
 		for i, a := range c.Args {
@@ -87,6 +98,9 @@ func TestBuildPinsCommitAndPublishesDigest(t *testing.T) {
 		t.Fatal("missing metadata")
 		return nil, nil
 	})
+	hostConfig := t.TempDir()
+	os.WriteFile(filepath.Join(hostConfig, "config.json"), []byte(`{"auths":{"host.registry":{"auth":"HOST_AUTH_SENTINEL"}},"credsStore":"desktop"}`), 0600)
+	t.Setenv("DOCKER_CONFIG", hostConfig)
 	t.Setenv("SENTINEL_SECRET", "sensitive")
 	resolved, e := b.Resolve(context.Background(), repo, "HEAD")
 	if e != nil || resolved != sha {

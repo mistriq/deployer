@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -106,9 +107,11 @@ func (SystemRunner) Run(ctx context.Context, c Command) ([]byte, error) {
 
 type Builder struct {
 	AllowLocalRepositories bool
-	Runner                 Runner
-	TempDir                string
-	Timeout                time.Duration
+	// CLIPluginDirs lists trusted Docker CLI plugin directories, not credentials.
+	CLIPluginDirs []string
+	Runner        Runner
+	TempDir       string
+	Timeout       time.Duration
 }
 
 var shaPattern = regexp.MustCompile(`^[a-f0-9]{40}([a-f0-9]{24})?$`)
@@ -146,6 +149,17 @@ func (b *Builder) Build(ctx context.Context, r Request, log func(string)) (Artif
 		return artifact, err
 	}
 	auth := map[string]any{"auths": map[string]any{}}
+	pluginDirs := b.CLIPluginDirs
+	if len(pluginDirs) == 0 && runtime.GOOS == "darwin" {
+		const desktopPlugins = "/Applications/Docker.app/Contents/Resources/cli-plugins"
+		if info, e := os.Stat(desktopPlugins); e == nil && info.IsDir() {
+			pluginDirs = []string{desktopPlugins}
+		}
+	}
+	if len(pluginDirs) > 0 {
+		auth["cliPluginsExtraDirs"] = pluginDirs
+	}
+
 	if r.Credentials.Password != "" || r.Credentials.Username != "" {
 		registry := strings.Split(r.ImageRepository, "/")[0]
 		if r.Credentials.Registry != registry || r.Credentials.Username == "" || r.Credentials.Password == "" {

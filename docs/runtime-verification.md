@@ -27,15 +27,15 @@ Testované scénáře: tenant/project boundary; idempotence a změna body pod st
 
 ## Co bylo simulované
 
-- Registry publikace/digest: fake Buildx executor vytváří metadata; žádný reálný registry push nebyl ověřen.
+- Výchozí unit testy registry publikace/digestu používají fake Buildx executor. V prvním průchodu nebyl reálný push ověřen; následný skutečný Docker test je doložený níže.
 - Propojené statické/Node integrační scénáře: reálné HTTP portálové API a reálný Runtime HTTP adaptér vůči lokálnímu `httptest` Runtime fixture, injektovaný build artifact. Každá mutace fixture ověřuje `X-Socen-Sandbox: true`; úspěch, idempotence, logy, neúspěšný kandidát se zachováním starého release a rollback jsou automatizované.
 - VPS health, route revision a runtime logy: odpovědi fixture, nikoli skutečný běžící kontejner.
 
-Lokální Docker klient je dostupný, ale Docker daemon nebyl dostupný. Proto nebyl možný ani lokální skutečný image build. Veřejný Runtime prototyp vyžaduje autentizaci a nebyl poskytnut scoped token; živý autorizovaný sandbox happy/failure path se neprovedl. Nejsou doložené entity response schemas mimo snapshot; adaptér při neznámém výsledku nesmí hlásit online.
+Při prvním průchodu Docker daemon nebyl dostupný. Po navazujícím požadavku byl Docker Desktop spuštěn pomocí pluginu Computer; doplňující skutečné Docker ověření popisuje následující sekce. Veřejný Runtime prototyp vyžaduje autentizaci a nebyl poskytnut scoped token; živý autorizovaný sandbox happy/failure path se neprovedl. Nejsou doložené entity response schemas mimo snapshot; adaptér při neznámém výsledku nesmí hlásit online.
 
 ## Zbývá před skutečným provozem
 
-1. Zpřístupnit izolovaný Docker/BuildKit build host a zvolit privátní registr s oddělenými push/pull účty.
+1. Zvolit produkční izolovaný build host a privátní registr s oddělenými push/pull oprávněními; lokální Docker/registry tok už je ověřený.
 2. Dodat secret soubory lokálně mimo Git, potvrdit endpoint a autorizovaně ověřit skutečný Runtime sandbox včetně response schémat.
 3. Nastavit interní TLS/mTLS přístup portálu, per-organization service tokens, zálohování store a klíče. Klientské OIDC/RBAC patří portálové službě.
 4. Teprve na samostatný pokyn provést skutečný VPS deploy. Pro sandbox a produkci použít oddělený store.
@@ -76,3 +76,22 @@ Omezení této verze: jediný proces/worker; public HTTPS Git bez GitHub App/SSH
 - `internal/runtimeengine/types.go`
 - `internal/runtimeengine/validate.go`
 - `scripts/runtime-smoke.py`
+
+## Doplňující skutečný Docker test
+
+Na navazující požadavek uživatele byl přes plugin Computer otevřen Docker Desktop. UI potvrdilo Engine running, CLI ověřilo Docker Engine 28.3.3. Test odhalil a opravil nalezení Buildx pluginu při izolovaném `HOME`/`DOCKER_CONFIG` na macOS. Testovací Docker příkazy také používají izolovanou konfiguraci, aby nevolaly uživatelův keychain helper.
+
+`OCI_DOCKER_INTEGRATION=1 go test -v ./internal/ocibuild -run TestDockerRegistryIntegration -count=1 -timeout=10m` **PASS**; navíc `OCI_DOCKER_INTEGRATION=1 go test -race ./internal/ocibuild -count=1 -timeout=10m` **PASS**. Test ověřil skutečný build, autentizovaný push/digest, pull přes druhou identitu, kontejnery obou aplikací a health. Registry běží pouze na loopbacku Docker hostitele (VM na macOS). Docker inspect kontroluje UID 10001, read-only filesystem, tmpfs, zahození capabilities, no-new-privileges, 0,5 CPU, 128 MiB RAM a 64 PID. Obě aplikace vrací `/healthz = 200`, neexistující cesta vrací 404. Neautorizovaný registry request vrací 401. Standardní registry Basic Auth nerozlišuje read/write ACL; pull-only oprávnění produkčního účtu nebylo ověřeno.
+
+Dočasné kontejnery, registry volume, přihlašovací soubory a odkazy na testovací image se uklízejí. Sdílené base images a build cache zůstávají; původní kontejnery ani nastavení daemonu se nemění. Docker Desktop zůstává spuštěný.
+
+Vzdálený veřejný `/healthz` na `scr.socen.eu` vrací 200. Autorizovaný sandbox test dosud **neproběhl**: Runtime token není v konfiguraci ani nebyla dodaná cesta k souboru. Připravený opt-in test má nezávislý guard přesného HTTPS hostu, sandbox hlavičky a vlastních testovacích projektů. Test guardu prošel lokálně; existence vzdáleného testu není důkaz ověřené upstream kompatibility.
+
+Nové/dodatečně změněné soubory: `internal/ocibuild/docker_integration_test.go`, `internal/ocibuild/builder.go`, `internal/ocibuild/builder_test.go`, `internal/runtimeengine/live_integration_test.go`, `examples/README.md`, `README.md` a oba hlavní provozní/ověřovací dokumenty.
+
+Ověřené digesty jednoho úspěšného reálného běhu:
+
+- Static: `sha256:535ac97b7dda38e8927b07e1916f91c42f82101faa4394c6fbf8b7b49b162fe3`
+- Node: `sha256:3fccf9c75fb83b4734ffbeef8ee31418c530625a00971ff91efa73d3812d4138`
+
+Kontrola po testu našla nula kontejnerů s labelem `deployer.integration` a nula testovacích image referencí `127.0.0.1:*/runtime-*`.

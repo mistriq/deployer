@@ -472,5 +472,6 @@ tooling are tracked separately in `TODO.md`.
 This branch adds a separate private `runtime-deployer` executable for portal → OCI
 registry → Runtime Engine deployments. See [the setup and internal API guide](docs/runtime-deployer.md)
 and [adapter assumptions](docs/runtime-engine-adapter.md). The original executable
-and runner workflow remain unchanged. Real registry/VPS integration is not yet
-verified; automated tests use a registry fake and a local sandbox HTTP fixture.
+and runner workflow remain unchanged. An opt-in real Docker test verifies authenticated local registry publication and
+container health. Production registry/VPS integration remains unverified; default
+automated tests use a registry fake and a local sandbox HTTP fixture.

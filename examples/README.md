@@ -31,5 +31,35 @@ object download are not configured. Source build commands run inside BuildKit.
 Explicit build arguments are public build inputs, never a channel for secrets.
 Base-image tags are currently mutable, so rebuilding the same source commit can
 produce a new digest. Deployments always consume the returned digest. Buildx
-must be installed system-wide because the builder intentionally isolates HOME
-and DOCKER_CONFIG, and the Docker daemon must be available on its default socket.
+must be available through system plugin paths or the trusted plugin directory
+configuration described below. The Docker daemon must be available on its default socket.
+
+## Real Docker integration test
+
+With Docker running and `/usr/sbin/htpasswd` installed:
+
+```sh
+OCI_DOCKER_INTEGRATION=1 go test -v ./internal/ocibuild -run TestDockerRegistryIntegration -count=1 -timeout=10m
+```
+
+The test creates a temporary authenticated registry bound to a random loopback
+port inside the Docker host (the Linux VM on Docker Desktop). It commits fresh
+copies of both examples, builds and pushes them for `linux/amd64`, pulls each
+returned immutable digest, and starts each application with the runtime's
+read-only/nonroot/resource restrictions. Docker inspect confirms those settings;
+`/healthz` must return 200 and an unknown path must return 404. Registry access
+without authentication must return 401.
+
+Push and pull use different disposable identities and isolated Docker configs.
+The fixture's standard registry htpasswd authentication gives both identities
+read/write access; this verifies credential separation, not pull-only ACLs.
+Production registries must enforce pull-only permissions for the runtime identity.
+Temporary containers, their anonymous registry volume, credentials, and fixture
+image references are cleaned. Shared downloaded base images and BuildKit cache
+are retained; no existing containers or Docker daemon settings are changed.
+
+On macOS the builder discovers Docker Desktop's standard trusted CLI plugin
+folder for Buildx without importing the user's Docker auth/config. Other custom
+installations can supply `Builder.CLIPluginDirs`; Linux installations should make
+Buildx available system-wide. All fixture Docker commands also use isolated
+configs, avoiding user credential helpers or keychain prompts.

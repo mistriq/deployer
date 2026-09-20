@@ -4,7 +4,7 @@ Nový samostatný příkaz `cmd/runtime-deployer` obsluhuje portál → Git → 
 
 ## Stav ověření
 
-Automatické testy používají skutečný Git a šifrovaný diskový store, fake command executor pro registry push a lokální HTTP Runtime fixture. Skutečný push do soukromého registru, image pull na VPS a autorizovaný vzdálený sandbox zatím **nejsou ověřené**. Nejsou dodané přístupové údaje ani definitivní produkční URL. Live Runtime response schéma není součástí dodaného snapshotu; očekávání a konzervativní kontrola jsou v [runtime-engine-adapter.md](runtime-engine-adapter.md). Před produkčním zapojením je nutné ověřit adaptér vůči autorizovanému sandboxu. Nikdy nepovažujte samotný HTTP 202 za aktivní release.
+Automatické testy používají skutečný Git a šifrovaný diskový store, fake command executor pro registry push a lokální HTTP Runtime fixture. Doplňující skutečný Docker test ověřil build obou ukázkových aplikací, autentizovaný push do dočasného lokálního registru, pull podle digestu a spuštění s omezeními Runtime. Image pull na VPS, produkční registr a autorizovaný vzdálený sandbox zatím **nejsou ověřené**. Nejsou dodané přístupové údaje ani definitivní produkční URL. Live Runtime response schéma není součástí dodaného snapshotu; očekávání a konzervativní kontrola jsou v [runtime-engine-adapter.md](runtime-engine-adapter.md). Před produkčním zapojením je nutné ověřit adaptér vůči autorizovanému sandboxu. Nikdy nepovažujte samotný HTTP 202 za aktivní release.
 
 ## Spuštění
 
@@ -149,3 +149,20 @@ Store se zapisuje přes dočasný soubor, fsync a atomický rename; obsah včetn
 3. Proveďte obě ukázkové aplikace přes šest portálových endpointů, ověřte odpovědi Runtime podle dokumentace adaptéru a kontrolu healthy release + route revision. Zopakujte stejný request, zastavte/restartujte worker při čekání a ověřte stejné ID.
 4. Ověřte kandidáta s chybným health endpointem a rollback. Starší release má dál obsluhovat route; nový nesmí být označen online.
 5. Teprve po samostatné autorizaci skutečného nasazení nastavte definitivní produkční endpoint, nový store a `RUNTIME_SANDBOX=false`. Tato implementace ani její testy tento krok neprovádějí.
+
+## Opakovatelné skutečné integrační testy
+
+Lokální Docker test spustí jen vlastní dočasný registry na loopbacku, vygeneruje oddělené testovací identity pro push/pull, sestaví oba ukázkové projekty, publikuje a načte je podle digestu a ověří HTTP health v kontejnerech s omezenými právy. Existující kontejnery ani konfiguraci daemonu neupravuje. Vanilla registry používá Basic Auth bez oddělených read/write ACL; produkční pull-only oprávnění tím nejsou otestovaná.
+
+```sh
+OCI_DOCKER_INTEGRATION=1 go test -v ./internal/ocibuild -run TestDockerRegistryIntegration -count=1
+```
+
+Pro vzdálený sandbox lze explicitně zapnout následující test (jinak je přeskočený). Token se čte ze souboru, jeho hodnota není argument příkazu ani výstup testu. Před prvním mutujícím testem proveďte autorizovanou read-only kontrolu schémat a vyberte známý sandbox artifact; jeho image/digest nastavte v `RUNTIME_SANDBOX_ARTIFACT_IMAGE` a `RUNTIME_SANDBOX_ARTIFACT_DIGEST`. Test nepoužívá vymyšlený digest. Nezávislá transportní pojistka před každým requestem kontroluje přesný HTTPS host `scr.socen.eu`, API cestu a sandboxovou hlavičku; mutace omezí na přesná ID vlastních testovacích projektů v upsert/env/deployments. Test neresetuje sdílený sandbox ani nemanipuluje s produkčním node. Zanechá vlastní projekty s prefixem `prj_codex_` pro kontrolu výsledků. Sandbox používá simulované artifacty; tento test neslibuje skutečný pull z lokálního registru na VPS.
+
+```sh
+RUNTIME_TOKEN_FILE=/private/path/runtime-token RUN_RUNTIME_SANDBOX_TESTS=1 \
+  go test -v ./internal/runtimeengine -run '^TestLiveSandbox$' -count=1
+```
+
+Test ověřuje upsert, úplnou náhradu env, idempotenci deploymentu, aktivní release/routu, oba Runtime log endpointy a serverové odmítnutí neplatného digestu se zachováním předchozího aktivního release. Provedení vůči živé službě musí být doložené protokolem; samotná existence testu není důkaz kompatibility schématu.
