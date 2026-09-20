@@ -1,0 +1,9 @@
+{
+  "kind": "static",
+  "context_dir": "examples/runtime-static",
+  "install_command": "true",
+  "build_command": "mkdir -p dist && cp -R public/. dist/",
+  "output_dir": "dist",
+  "platform": "linux/amd64",
+  "port": 8080
+}

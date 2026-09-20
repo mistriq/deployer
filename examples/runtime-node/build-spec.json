@@ -1,0 +1,9 @@
+{
+  "kind": "node-http",
+  "context_dir": "examples/runtime-node",
+  "install_command": "true",
+  "build_command": "node --check server.mjs",
+  "start_command": "exec node server.mjs",
+  "platform": "linux/amd64",
+  "port": 3000
+}

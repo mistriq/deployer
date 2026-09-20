@@ -1,0 +1,28 @@
+[Unit]
+Description=Private Runtime Engine Deployer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=runtime-deployer
+Group=runtime-deployer
+EnvironmentFile=/etc/runtime-deployer/runtime.env
+ExecStart=/usr/local/bin/runtime-deployer
+WorkingDirectory=/var/lib/runtime-deployer
+StateDirectory=runtime-deployer
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=50
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/runtime-deployer
+# The build host needs a dedicated Docker/BuildKit daemon. Give this service
+# access only after isolating that host; do not share a production runtime socket.
+
+[Install]
+WantedBy=multi-user.target

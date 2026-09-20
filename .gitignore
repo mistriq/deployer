@@ -45,3 +45,10 @@ image*.png
 .idea/
 .vscode/
 *.swp
+
+# Runtime Engine branch output and encrypted local state
+/bin/
+/runtime-deployer
+/runtime-state/
+*.enc
+*.enc.lock

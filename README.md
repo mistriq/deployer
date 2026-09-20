@@ -466,3 +466,11 @@ The immediate roadmap is public-release hardening: token rotation, signed
 updates, artifact retention, broader test coverage, and clearer operations docs.
 Longer-term product ideas such as webhooks, rollback, project templates, and AI
 tooling are tracked separately in `TODO.md`.
+
+## Runtime Engine integration branch
+
+This branch adds a separate private `runtime-deployer` executable for portal → OCI
+registry → Runtime Engine deployments. See [the setup and internal API guide](docs/runtime-deployer.md)
+and [adapter assumptions](docs/runtime-engine-adapter.md). The original executable
+and runner workflow remain unchanged. Real registry/VPS integration is not yet
+verified; automated tests use a registry fake and a local sandbox HTTP fixture.
