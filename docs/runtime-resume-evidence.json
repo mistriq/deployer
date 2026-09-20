@@ -1,0 +1,86 @@
+{
+  "checked_at": "2026-09-20T10:51:05.972Z",
+  "scope": {
+    "origin": "https://scr.socen.eu",
+    "header": "X-Socen-Sandbox: true"
+  },
+  "project_id": "prj_ec24c947789e0d0f3e341f6ddbce2443",
+  "deployment_history": {
+    "count": 1,
+    "items": [
+      {
+        "id": "dep_06gbwvypqbpnq7qq4ww8q4fd4g",
+        "external_id": "dep_ecf8156baba32e8bdb8c89cb2b0afbd6",
+        "idempotency_key": "dep_ecf8156baba32e8bdb8c89cb2b0afbd6",
+        "phase": "active",
+        "artifact": {
+          "image": "127.0.0.1:5500/molo/prj_ec24c947789e0d0f3e341f6ddbce2443",
+          "digest": "sha256:a8d1f9bb91443da3b3986c7af2c491d3bbc1cae7f9317f6748e6a24d006194da"
+        },
+        "release_id": "rel_06gbwvypqh635249h8swswe2x8",
+        "events": [
+          {
+            "phase": "queued",
+            "at": "2026-09-20T10:49:55.642530896Z"
+          },
+          {
+            "phase": "pulling",
+            "at": "2026-09-20T10:49:55.643121369Z"
+          },
+          {
+            "phase": "deploying",
+            "at": "2026-09-20T10:49:55.643832708Z"
+          },
+          {
+            "phase": "health_check",
+            "at": "2026-09-20T10:49:55.644317164Z"
+          },
+          {
+            "phase": "health_check",
+            "at": "2026-09-20T10:49:56.646028191Z"
+          },
+          {
+            "phase": "activating",
+            "at": "2026-09-20T10:49:56.646205983Z"
+          },
+          {
+            "phase": "active",
+            "at": "2026-09-20T10:49:56.647416535Z"
+          }
+        ]
+      }
+    ]
+  },
+  "route": {
+    "route_id": "rte_06gbwvytmtn3y611zmydemd3c8",
+    "status": "active",
+    "release_id": "rel_06gbwvypqh635249h8swswe2x8",
+    "desired_revision": 2,
+    "applied_revision": 2
+  },
+  "deployer": {
+    "deployment_id": "dep_ecf8156baba32e8bdb8c89cb2b0afbd6",
+    "state": "online",
+    "stage": "active",
+    "build_id": "dep_ecf8156baba32e8bdb8c89cb2b0afbd6",
+    "commit": "6c7a360ddb4a0d75be06044bf8a914f260ff10c7",
+    "logs": {
+      "build": {
+        "count": 69,
+        "next_cursor": "69",
+        "replay_new_count": 0
+      },
+      "runtime": {
+        "count": 1,
+        "next_cursor": "1",
+        "replay_new_count": 0
+      }
+    }
+  },
+  "node_after_qa": {
+    "total_cpu": 16000,
+    "allocated_cpu": 4500,
+    "reserve_cpu": 500
+  },
+  "hosting": "mock sandbox lifecycle; not remote Docker hosting"
+}

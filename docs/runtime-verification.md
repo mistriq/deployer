@@ -1,5 +1,17 @@
 # Předání a protokol ověření — 20. září 2026
 
+## Obnova po restartu — PASS, 10:49–10:51 UTC
+
+Blokace popsaná níže je vyřešená. Sandbox po restartu měl 16000 CPU, 2000 alokovaných a 500 rezervovaných (13500 dostupných). Guardovaný recovery skript obnovil původní projekt a prázdné env, potom byl spuštěn existující portál a jeho sandboxový worker bez úpravy zdrojových souborů portálu.
+
+Původní `dep_ecf8156baba32e8bdb8c89cb2b0afbd6` přešel do `online/active` v 10:49:56 UTC. Runtime historie obsahuje právě jednu položku `dep_06gbwvypqbpnq7qq4ww8q4fd4g`, external ID i idempotency key jsou původní Deployer ID, digest zůstává `sha256:a8d1f9bb91443da3b3986c7af2c491d3bbc1cae7f9317f6748e6a24d006194da`. Build ID a commit zůstaly stejné; nový build neproběhl. Release `rel_06gbwvypqh635249h8swswe2x8` odpovídá aktivnímu projektu i routě, desired/applied/release revision jsou 2. Timeline obsahuje health_check → activating → active.
+
+Oba Deployer zdroje logů prošly: build 69 řádků, runtime 1 řádek, opakované čtení od koncového kurzoru vrací nula dalších řádků. [Sdílitelný výpis důkazů bez credentials](runtime-resume-evidence.json) obsahuje zúženou odpověď historie a routy.
+
+Čerstvý `TestLiveSandbox` prošel za 10,19 s pro static i Node HTTP: upsert/env, idempotence, health/routing, deployment/release logy, odmítnutí neplatného artifactu, vyvolaná health chyba při zachování předchozího release a idempotentní obnovení historického artifactu. Vyhrazené projekty jsou `prj_codex_static_89dbca1bb2baa5e3` a `prj_codex_node_http_89dbca1bb2baa5e3`; úspěšné deploymenty `dep_06gbww48xpqmwstt743qxhatwr` a `dep_06gbww4tf7zta9gza9syfq1z3r`, failed candidates `dep_06gbww4f4tqcqg4n0sp8hkhtbw` a `dep_06gbww50kxdrbq8cwm4e61p5sg`, restoration `dep_06gbww4mawx52wm80wkqseryer` a `dep_06gbww561q055gapmcpjjrt21w`. Po QA sandbox alokuje 4500 z 16000 CPU; žádné sdílené projekty nebyly měněny.
+
+Rozsah: původní portálová operace byla obnovena přes skutečný Deployer worker. Nové static/Node scénáře testují Runtime adaptér přímo, nikoli nové kompletní browser/build průchody portálem. Sandbox má mock driver/proxy, takže toto ověřuje lifecycle, nikoli vzdálený pull z lokálního registru nebo veřejný hosting. Předchozí skutečné lokální Docker testy jsou doložené odděleně níže. Historické Runtime ID před restartem nejsou v novém sandboxu platné; jejich inventář zůstává v privátní záloze.
+
 ## Aktuální blokace portálového workflow
 
 Navazující ověření v 02:04–02:06 UTC zjistilo vyčerpanou CPU kapacitu vzdáleného sandboxu. Portálová operace `dep_ecf8156baba32e8bdb8c89cb2b0afbd6` stále čeká v `deploying/submitting`; její image, commit i build ID zůstaly stejné a Runtime zatím nepřijal žádný deployment tohoto projektu. Níže uvedené dřívější PASS výsledky neznamenají, že tato operace už pokračovala.
