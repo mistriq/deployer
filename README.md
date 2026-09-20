@@ -473,5 +473,6 @@ This branch adds a separate private `runtime-deployer` executable for portal →
 registry → Runtime Engine deployments. See [the setup and internal API guide](docs/runtime-deployer.md)
 and [adapter assumptions](docs/runtime-engine-adapter.md). The original executable
 and runner workflow remain unchanged. An opt-in real Docker test verifies authenticated local registry publication and
-container health. Production registry/VPS integration remains unverified; default
-automated tests use a registry fake and a local sandbox HTTP fixture.
+container health. Authenticated remote Runtime sandbox tests also pass, including
+health failure and historical-artifact restoration. Production registry/VPS
+integration remains unverified; default tests use local fixtures.

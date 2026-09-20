@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -168,5 +169,73 @@ func TestLogsRedactServiceToken(t *testing.T) {
 	logs, e := c.ReleaseLogs(context.Background(), "rel_1", 200)
 	if e != nil || strings.Contains(logs, "secret-token") {
 		t.Fatal(logs, e)
+	}
+}
+
+func TestLiveSchemaActivationEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, releaseExtra, events string
+		revision                   int
+		want                       bool
+	}{
+		{"complete", "", `[{"phase":"health_check","at":"2026-09-20T10:00:00Z"},{"phase":"activating","at":"2026-09-20T10:00:01Z"},{"phase":"active","at":"2026-09-20T10:00:02Z"}]`, 17, true},
+		{"explicit-unhealthy", `,"healthy":false`, `[{"phase":"health_check","at":"2026-09-20T10:00:00Z"},{"phase":"activating","at":"2026-09-20T10:00:01Z"},{"phase":"active","at":"2026-09-20T10:00:02Z"}]`, 17, false},
+		{"unhealthy-status", `,"health_status":"unhealthy"`, `[{"phase":"health_check","at":"2026-09-20T10:00:00Z"},{"phase":"activating","at":"2026-09-20T10:00:01Z"},{"phase":"active","at":"2026-09-20T10:00:02Z"}]`, 17, false},
+		{"no-events", "", `[]`, 17, false},
+		{"out-of-order", "", `[{"phase":"activating","at":"2026-09-20T10:00:00Z"},{"phase":"health_check","at":"2026-09-20T10:00:01Z"},{"phase":"active","at":"2026-09-20T10:00:02Z"}]`, 17, false},
+		{"revision-mismatch", "", `[{"phase":"health_check","at":"2026-09-20T10:00:00Z"},{"phase":"activating","at":"2026-09-20T10:00:01Z"},{"phase":"active","at":"2026-09-20T10:00:02Z"}]`, 18, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := client(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/internal/v1/deployments/dep_1":
+					w.Write([]byte(`{"id":"dep_1","project_id":"prj_1","release_id":"rel_1","phase":"active","events":` + tc.events + `}`))
+				case "/api/internal/v1/releases/rel_1":
+					w.Write([]byte(`{"id":"rel_1","project_id":"prj_1","deployment_id":"dep_1","status":"active","route_revision":17,"activated_at":"2026-09-20T10:00:02Z"` + tc.releaseExtra + `}`))
+				case "/api/internal/v1/projects/prj_1":
+					w.Write([]byte(`{"id":"prj_1","active_release_id":"rel_1"}`))
+				case "/api/internal/v1/routes":
+					fmt.Fprintf(w, `{"items":[{"route_id":"route_1","project_id":"prj_1","release_id":"rel_1","status":"active","desired_revision":%d,"applied_revision":%d}]}`, tc.revision, tc.revision)
+				default:
+					t.Fatal(r.URL.Path)
+				}
+			})
+			v, e := c.VerifyActive(context.Background(), "prj_1", "dep_1")
+			if e != nil || v.Active != tc.want {
+				t.Fatal(v, e)
+			}
+			if v.Active && v.Route.ID != "route_1" {
+				t.Fatal("route_id not normalized")
+			}
+		})
+	}
+}
+func TestPhaseOnlyFailure(t *testing.T) {
+	c := client(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id":"dep_1","project_id":"prj_1","phase":"failed","failure_code":"HEALTH_CHECK_FAILED"}`))
+	})
+	_, e := c.VerifyActive(context.Background(), "prj_1", "dep_1")
+	var re *Error
+	if !errors.As(e, &re) || re.Code != "HEALTH_CHECK_FAILED" {
+		t.Fatal(e)
+	}
+}
+func TestStructuredLogs(t *testing.T) {
+	c := client(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"items":[{"at":"2026-09-20T10:00:02Z","stream":"stderr","text":"secret-token failed"}],"count":1}`))
+	})
+	entries, e := c.LogEntries(context.Background(), "dep_1", 20)
+	if e != nil || len(entries) != 1 || entries[0].Stream != "stderr" || entries[0].At.IsZero() || entries[0].Text != "[REDACTED] failed" {
+		t.Fatal(entries, e)
+	}
+}
+func TestMalformedLogsFailClosed(t *testing.T) {
+	for _, body := range []string{`{}`, `{"logs":null}`, `{"logs":[]}`, `{"items":null}`, `{"items":[{"text":"x"}]}`, `{"items":[{"at":"2026-09-20T10:00:02Z","stream":"stdout"}]}`} {
+		t.Run(body, func(t *testing.T) {
+			c := client(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) })
+			if _, e := c.LogEntries(context.Background(), "dep_1", 20); e == nil {
+				t.Fatal("malformed logs accepted")
+			}
+		})
 	}
 }

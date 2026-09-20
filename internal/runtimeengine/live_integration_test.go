@@ -131,9 +131,30 @@ func TestLiveSandbox(t *testing.T) {
 			if err != nil || first.ID != second.ID {
 				t.Fatal("sandbox project upsert was not stable")
 			}
-			if err := c.ReplaceEnvironment(ctx, projectID, map[string]string{}); err != nil {
-				t.Fatalf("sandbox env replacement: %v", err)
+			envSecret := "fixture-" + suffix
+			if err := c.ReplaceEnvironment(ctx, projectID, map[string]string{"SMOKE_A": envSecret, "SMOKE_B": envSecret + "-second"}); err != nil {
+				t.Fatalf("sandbox env write: %v", err)
 			}
+			if err := c.ReplaceEnvironment(ctx, projectID, map[string]string{"SMOKE_B": envSecret}); err != nil {
+				t.Fatalf("sandbox full env replacement: %v", err)
+			}
+			meta, err := c.call(ctx, "GET", "/projects/"+projectID+"/env", nil, "")
+			var names struct {
+				Variables []struct {
+					Name string `json:"name"`
+				} `json:"variables"`
+			}
+			if err != nil || json.Unmarshal(meta, &names) != nil || len(names.Variables) != 1 || names.Variables[0].Name != "SMOKE_B" || bytes.Contains(meta, []byte(envSecret)) {
+				t.Fatal("sandbox env metadata violated replacement or write-only contract")
+			}
+			if err := c.ReplaceEnvironment(ctx, projectID, map[string]string{}); err != nil {
+				t.Fatalf("sandbox env clear: %v", err)
+			}
+			meta, err = c.call(ctx, "GET", "/projects/"+projectID+"/env", nil, "")
+			if err != nil || json.Unmarshal(meta, &names) != nil || len(names.Variables) != 0 {
+				t.Fatal("sandbox empty replacement did not clear environment")
+			}
+
 			depReq := DeploymentRequest{ProjectID: projectID, ExternalDeploymentID: "dep_codex_" + strings.ReplaceAll(kind, "-", "_") + "_" + suffix, Artifact: artifact}
 			dep, err := c.Deploy(ctx, depReq, depReq.ExternalDeploymentID)
 			if err != nil {
@@ -175,7 +196,88 @@ func TestLiveSandbox(t *testing.T) {
 			if err != nil || !still.Active || still.ReleaseID != verified.ReleaseID {
 				t.Fatal("failed admission displaced previous active sandbox release")
 			}
-			t.Logf("sandbox=%s project=%s deployment=%s release=%s: upsert/env/idempotency/active route/logs/admission failure PASS", (&url.URL{Scheme: "https", Host: "scr.socen.eu"}).String(), projectID, dep.ID, verified.ReleaseID)
+			// A real sandbox candidate must fail its own health check without
+			// borrowing success from the previously active release.
+			badManifest := m
+			badManifest.Health.ExpectStatusMin = 201
+			badManifest.Health.ExpectStatusMax = 201
+			badManifest.Health.Retries = 2
+			badManifest.Health.GracePeriodMS = 0
+			badProject := request
+			badProject.Manifest = badManifest
+			if _, err = c.UpsertProject(ctx, badProject); err != nil {
+				t.Fatalf("sandbox failing candidate configuration: %v", err)
+			}
+			failedReq := depReq
+			failedReq.ExternalDeploymentID = "fail_" + depReq.ExternalDeploymentID
+			candidate, err := c.Deploy(ctx, failedReq, failedReq.ExternalDeploymentID)
+			if err != nil {
+				t.Fatalf("sandbox failing candidate admission: %v", err)
+			}
+			for {
+				candidate, err = c.Deployment(ctx, candidate.ID)
+				if err != nil {
+					t.Fatalf("sandbox failed candidate status: %v", err)
+				}
+				if candidate.Status == "failed" {
+					break
+				}
+				if candidate.Status == "active" {
+					t.Fatal("candidate with mismatched expected health status became active")
+				}
+				select {
+				case <-ctx.Done():
+					t.Fatal("sandbox health failure did not complete")
+				case <-time.After(time.Second):
+				}
+			}
+			if candidate.FailureCode != "HEALTH_CHECK_FAILED" && candidate.FailureCode != "HEALTH_CHECK_TIMEOUT" {
+				t.Fatalf("unexpected candidate failure code: %s", candidate.FailureCode)
+			}
+			if _, err = c.VerifyActive(ctx, projectID, candidate.ID); !errors.As(err, &remote) || remote.Retryable {
+				t.Fatal("failed candidate was not terminal")
+			}
+			still, err = c.VerifyActive(ctx, projectID, dep.ID)
+			if err != nil || !still.Active || still.ReleaseID != verified.ReleaseID {
+				t.Fatal("health failure displaced previous active release")
+			}
+			if _, err = c.LogEntries(ctx, candidate.ID, 20); err != nil {
+				t.Fatalf("failed candidate logs: %v", err)
+			}
+			// Portal rollback is a new idempotent deployment of a verified
+			// historical artifact and manifest, never ambiguous native rollback.
+			if _, err = c.UpsertProject(ctx, request); err != nil {
+				t.Fatalf("restore manifest: %v", err)
+			}
+			restoredReq := depReq
+			restoredReq.ExternalDeploymentID = "restore_" + depReq.ExternalDeploymentID
+			restored, err := c.Deploy(ctx, restoredReq, restoredReq.ExternalDeploymentID)
+			if err != nil {
+				t.Fatalf("restore historical artifact: %v", err)
+			}
+			duplicate, err := c.Deploy(ctx, restoredReq, restoredReq.ExternalDeploymentID)
+			if err != nil || duplicate.ID != restored.ID {
+				t.Fatal("restore retry duplicated deployment")
+			}
+			var restoration Verification
+			for {
+				restoration, err = c.VerifyActive(ctx, projectID, restored.ID)
+				if err != nil {
+					t.Fatalf("restore verification: %v", err)
+				}
+				if restoration.Active {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					t.Fatal("restore did not activate")
+				case <-time.After(time.Second):
+				}
+			}
+			if restoration.ReleaseID == verified.ReleaseID {
+				t.Fatal("restore did not create distinct release")
+			}
+			t.Logf("sandbox=%s project=%s deployment=%s release=%s failed_candidate=%s restored=%s: upsert/env/idempotency/active route/logs/admission failure/health failure/historical restore PASS", (&url.URL{Scheme: "https", Host: "scr.socen.eu"}).String(), projectID, dep.ID, verified.ReleaseID, candidate.ID, restored.ID)
 		})
 	}
 }

@@ -3,7 +3,9 @@ package runtimeengine
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"time"
 )
 
 type Config struct {
@@ -90,19 +92,34 @@ type DeploymentRequest struct {
 	Artifact             Artifact `json:"artifact"`
 }
 type Deployment struct {
-	ID          string `json:"id"`
-	ProjectID   string `json:"project_id"`
-	ReleaseID   string `json:"release_id"`
-	Status      string `json:"status"`
-	Phase       string `json:"phase"`
-	FailureCode string `json:"failure_code,omitempty"`
+	ID          string       `json:"id"`
+	ProjectID   string       `json:"project_id"`
+	ReleaseID   string       `json:"release_id"`
+	Status      string       `json:"status"`
+	Phase       string       `json:"phase"`
+	FailureCode string       `json:"failure_code,omitempty"`
+	Events      []PhaseEvent `json:"events,omitempty"`
+}
+type PhaseEvent struct {
+	Phase string    `json:"phase"`
+	At    time.Time `json:"at"`
+}
+type LogEntry struct {
+	ID     string    `json:"id,omitempty"`
+	At     time.Time `json:"at"`
+	Stream string    `json:"stream"`
+	Text   string    `json:"text"`
 }
 type Release struct {
-	ID           string `json:"id"`
-	ProjectID    string `json:"project_id"`
-	Status       string `json:"status"`
-	Healthy      bool   `json:"healthy"`
-	HealthStatus string `json:"health_status"`
+	DeploymentID                        string    `json:"deployment_id,omitempty"`
+	RouteRevision                       int64     `json:"route_revision,omitempty"`
+	ActivatedAt                         time.Time `json:"activated_at,omitempty"`
+	healthyPresent, healthStatusPresent bool
+	ID                                  string `json:"id"`
+	ProjectID                           string `json:"project_id"`
+	Status                              string `json:"status"`
+	Healthy                             bool   `json:"healthy"`
+	HealthStatus                        string `json:"health_status"`
 }
 type Route struct {
 	ID              string `json:"id"`
@@ -118,4 +135,47 @@ type Verification struct {
 	Active    bool
 	ReleaseID string
 	Route     Route
+}
+
+func (d *Deployment) UnmarshalJSON(b []byte) error {
+	type plain Deployment
+	var v plain
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	*d = Deployment(v)
+	if d.Status == "" {
+		d.Status = d.Phase
+	}
+	return nil
+}
+func (r *Release) UnmarshalJSON(b []byte) error {
+	type plain Release
+	var v plain
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return err
+	}
+	*r = Release(v)
+	_, r.healthyPresent = fields["healthy"]
+	_, r.healthStatusPresent = fields["health_status"]
+	return nil
+}
+func (r *Route) UnmarshalJSON(b []byte) error {
+	type plain Route
+	var v struct {
+		plain
+		RouteID string `json:"route_id"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	*r = Route(v.plain)
+	if r.ID == "" {
+		r.ID = v.RouteID
+	}
+	return nil
 }

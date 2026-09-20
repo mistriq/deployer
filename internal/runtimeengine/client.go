@@ -266,7 +266,12 @@ func (c *Client) VerifyActive(ctx context.Context, projectID, deploymentID strin
 	if r.ProjectID != projectID {
 		return v, &Error{Code: "IDENTITY_MISMATCH"}
 	}
-	if !r.Healthy && r.HealthStatus != "healthy" {
+	if (r.healthyPresent && !r.Healthy) || (r.healthStatusPresent && r.HealthStatus != "" && r.HealthStatus != "healthy") {
+		return v, nil
+	}
+	explicitHealth := r.Healthy || r.HealthStatus == "healthy"
+	fallbackHealth := r.Status == "active" && r.DeploymentID == d.ID && !r.ActivatedAt.IsZero() && r.RouteRevision > 0 && d.Phase == "active" && healthPhasesComplete(d.Events)
+	if !explicitHealth && !fallbackHealth {
 		return v, nil
 	}
 	b, e := c.call(ctx, "GET", "/projects/"+projectID, nil, "")
@@ -301,7 +306,7 @@ func (c *Client) VerifyActive(ctx context.Context, projectID, deploymentID strin
 		if releaseID == "" {
 			releaseID = route.ActiveReleaseID
 		}
-		if route.ProjectID == projectID && releaseID == d.ReleaseID && route.Status == "active" && route.DesiredRevision > 0 && route.AppliedRevision == route.DesiredRevision {
+		if route.ProjectID == projectID && releaseID == d.ReleaseID && route.Status == "active" && route.DesiredRevision > 0 && route.AppliedRevision == route.DesiredRevision && (explicitHealth || r.RouteRevision == route.DesiredRevision) {
 			return Verification{Active: true, ReleaseID: d.ReleaseID, Route: route}, nil
 		}
 	}
@@ -337,21 +342,92 @@ func (c *Client) Logs(ctx context.Context, id string, tail int) (string, error) 
 func (c *Client) ReleaseLogs(ctx context.Context, id string, tail int) (string, error) {
 	return c.logs(ctx, "releases", id, tail)
 }
-func (c *Client) logs(ctx context.Context, kind, id string, tail int) (string, error) {
-	if !validID(id) || tail < 1 || tail > 1000 {
-		return "", invalid()
+
+func healthPhasesComplete(events []PhaseEvent) bool {
+	wanted := []string{"health_check", "activating", "active"}
+	next := 0
+	var previous time.Time
+	for _, event := range events {
+		if event.Phase == "failed" || event.Phase == "cancelled" || event.Phase == "superseded" {
+			return false
+		}
+		if next < len(wanted) && event.Phase == wanted[next] {
+			if event.At.IsZero() || (!previous.IsZero() && event.At.Before(previous)) {
+				return false
+			}
+			previous = event.At
+			next++
+		}
 	}
-	b, e := c.call(ctx, "GET", "/"+kind+"/"+id+"/logs?tail="+strconv.Itoa(tail), nil, "")
+	return next == len(wanted)
+}
+func (c *Client) LogEntries(ctx context.Context, id string, tail int) ([]LogEntry, error) {
+	return c.logEntries(ctx, "deployments", id, tail)
+}
+func (c *Client) ReleaseLogEntries(ctx context.Context, id string, tail int) ([]LogEntry, error) {
+	return c.logEntries(ctx, "releases", id, tail)
+}
+func (c *Client) logs(ctx context.Context, kind, id string, tail int) (string, error) {
+	entries, e := c.logEntries(ctx, kind, id, tail)
 	if e != nil {
 		return "", e
 	}
-	var v struct {
-		Logs string `json:"logs"`
+	lines := make([]string, len(entries))
+	for i, v := range entries {
+		lines[i] = v.Text
 	}
-	if e = json.Unmarshal(b, &v); e != nil {
-		return "", &Error{Code: "INVALID_RESPONSE"}
+	return strings.Join(lines, "\n"), nil
+}
+func (c *Client) logEntries(ctx context.Context, kind, id string, tail int) ([]LogEntry, error) {
+	if !validID(id) || tail < 1 || tail > 1000 {
+		return nil, invalid()
 	}
-	return strings.ReplaceAll(v.Logs, c.token, "[REDACTED]"), nil
+	b, e := c.call(ctx, "GET", "/"+kind+"/"+id+"/logs?tail="+strconv.Itoa(tail), nil, "")
+	if e != nil {
+		return nil, e
+	}
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(b, &raw) != nil {
+		return nil, &Error{Code: "INVALID_RESPONSE"}
+	}
+	entries := []LogEntry{}
+	if items, ok := raw["items"]; ok {
+		if string(items) == "null" || json.Unmarshal(items, &entries) != nil {
+			return nil, &Error{Code: "INVALID_RESPONSE"}
+		}
+		var fields []map[string]json.RawMessage
+		if json.Unmarshal(items, &fields) != nil {
+			return nil, &Error{Code: "INVALID_RESPONSE"}
+		}
+		for _, field := range fields {
+			var text string
+			value, ok := field["text"]
+			if !ok || string(value) == "null" || json.Unmarshal(value, &text) != nil {
+				return nil, &Error{Code: "INVALID_RESPONSE"}
+			}
+		}
+		for _, entry := range entries {
+			if entry.At.IsZero() || (entry.Stream != "stdout" && entry.Stream != "stderr" && entry.Stream != "system") {
+				return nil, &Error{Code: "INVALID_RESPONSE"}
+			}
+		}
+	} else if logs, ok := raw["logs"]; ok {
+		var text string
+		if string(logs) == "null" || json.Unmarshal(logs, &text) != nil {
+			return nil, &Error{Code: "INVALID_RESPONSE"}
+		}
+		if text != "" {
+			for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+				entries = append(entries, LogEntry{Stream: "stdout", Text: line})
+			}
+		}
+	} else {
+		return nil, &Error{Code: "INVALID_RESPONSE"}
+	}
+	for i := range entries {
+		entries[i].Text = strings.ReplaceAll(entries[i].Text, c.token, "[REDACTED]")
+	}
+	return entries, nil
 }
 func ValidateCapabilities(m Manifest, c Capabilities) error { return m.ValidateCapabilities(c) }
 

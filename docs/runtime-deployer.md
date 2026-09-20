@@ -4,7 +4,9 @@ Nový samostatný příkaz `cmd/runtime-deployer` obsluhuje portál → Git → 
 
 ## Stav ověření
 
-Automatické testy používají skutečný Git a šifrovaný diskový store, fake command executor pro registry push a lokální HTTP Runtime fixture. Doplňující skutečný Docker test ověřil build obou ukázkových aplikací, autentizovaný push do dočasného lokálního registru, pull podle digestu a spuštění s omezeními Runtime. Image pull na VPS, produkční registr a autorizovaný vzdálený sandbox zatím **nejsou ověřené**. Nejsou dodané přístupové údaje ani definitivní produkční URL. Live Runtime response schéma není součástí dodaného snapshotu; očekávání a konzervativní kontrola jsou v [runtime-engine-adapter.md](runtime-engine-adapter.md). Před produkčním zapojením je nutné ověřit adaptér vůči autorizovanému sandboxu. Nikdy nepovažujte samotný HTTP 202 za aktivní release.
+Výchozí automatické testy používají skutečný Git a šifrovaný diskový store, fake command executor pro registry push a lokální HTTP Runtime fixture. Doplňující skutečný Docker test ověřil build obou ukázkových aplikací, autentizovaný push do dočasného lokálního registru, pull podle digestu a spuštění s omezeními Runtime. Následně prošel i autorizovaný vzdálený sandbox na `scr.socen.eu`: obě varianty, idempotence, env, health/routing/logy, odmítnutí digestu, selhání nové verze a obnovení historického artifactu. Skutečné formáty odpovědí jsou v [runtime-engine-adapter.md](runtime-engine-adapter.md).
+
+Sandbox používá mock driver a známý sandbox image digest. Lokální Docker test a vzdálený sandbox jsou dvě samostatně ověřené části; **produkční registr, skutečný image pull na VPS a definitivní produkční URL ještě ověřené nejsou**. Samotný HTTP 202 nikdy neznamená aktivní release.
 
 ## Spuštění
 
@@ -124,9 +126,9 @@ Odpověď:
 {"items":[{"cursor":1,"time":"2026-09-20T00:00:00Z","source":"build","stream":"stdout","text":"building"}],"next_cursor":"1","truncated":false,"source":"build"}
 ```
 
-Pollujte například každé 2 sekundy zvlášť pro každý zdroj, po reconnectu obnovte poslední cursor. Prázdná stránka není konec streamu. `source` je povinný, bez cursoru se čte od začátku dostupného bufferu. Max. 200 řádků na stránku, posledních 2000 řádků každého zdroje se uchovává napříč restartem. Starší kurzor vrátí `truncated:true`. Každý řádek má timestamp zachycení Deployerem; upstream neposkytuje smluvní zdrojový timestamp/stream, proto se kombinovaný výstup značí `stdout`.
+Pollujte například každé 2 sekundy zvlášť pro každý zdroj, po reconnectu obnovte poslední cursor. Prázdná stránka není konec streamu. `source` je povinný, bez cursoru se čte od začátku dostupného bufferu. Max. 200 řádků na stránku, posledních 2000 řádků každého zdroje se uchovává napříč restartem. Starší kurzor vrátí `truncated:true`. Runtime řádky zachovávají skutečný upstream `at` jako `time` a původní `stream`. Build/legacy textové logy bez metadat používají čas zachycení a `stdout`.
 
-Build výstup se průběžně čte z procesu a rediguje před zápisem. Runtime logy se načítají přes deployment endpoint, po aktivaci přes release endpoint; čtou se při ověřování i při portálovém pollingu. U upstream tail-only API se ztrátu mezi pollingy nelze pokusit skrýt: při chybějícím překryvu se vloží systémový řádek o nedostupném okně. Identické opakované řádky bez upstream ID nelze rozlišit dokonale. Portálový cursor zajišťuje replay zachycených řádků, nikoli neomezený archiv VPS. Runtime logy jsou redigovány znovu v Deployeru, včetně historických env hodnot, servisních tokenů a běžných token patternů. Libovolná úmyslná transformace secretu v aplikaci není obecně detekovatelná; aplikace nemají secrety logovat.
+Build výstup se průběžně čte z procesu a rediguje před zápisem. Runtime logy se načítají přes deployment endpoint, po aktivaci přes release endpoint; čtou se při ověřování i při portálovém pollingu. U upstream tail-only API se ztrátu mezi pollingy nelze pokusit skrýt: při chybějícím překryvu se vloží systémový řádek o nedostupném okně. Překryv strukturovaných logů se určuje podle ID nebo timestampu + streamu + redigovaného textu; stejné texty s odlišnými timestampy se neztrácejí. Záznamy shodné ve všech těchto údajích bez upstream ID nelze rozlišit dokonale. Portálový cursor zajišťuje replay zachycených řádků, nikoli neomezený archiv VPS. Runtime logy jsou redigovány znovu v Deployeru, včetně historických env hodnot, servisních tokenů a běžných token patternů. Libovolná úmyslná transformace secretu v aplikaci není obecně detekovatelná; aplikace nemají secrety logovat.
 
 ### POST /internal/v1/projects/{project_id}/rollback
 
@@ -165,4 +167,4 @@ RUNTIME_TOKEN_FILE=/private/path/runtime-token RUN_RUNTIME_SANDBOX_TESTS=1 \
   go test -v ./internal/runtimeengine -run '^TestLiveSandbox$' -count=1
 ```
 
-Test ověřuje upsert, úplnou náhradu env, idempotenci deploymentu, aktivní release/routu, oba Runtime log endpointy a serverové odmítnutí neplatného digestu se zachováním předchozího aktivního release. Provedení vůči živé službě musí být doložené protokolem; samotná existence testu není důkaz kompatibility schématu.
+Test ověřuje upsert, úplnou náhradu a vymazání env bez vracení hodnot, idempotenci deploymentu, aktivní release/routu, oba Runtime log endpointy, serverové odmítnutí neplatného digestu, aktivně vyvolané selhání health checku se zachováním starého release a obnovení historického artifactu. Živý běh prošel 20. září 2026; výsledky a ID jsou v protokolu ověření.
