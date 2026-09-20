@@ -2,7 +2,7 @@
 
 ## Výsledek
 
-Implementace je v izolovaném worktree `/Users/jakubillich/Documents/Codex/2026-09-14/ca/work/deployer-runtime`, lokální větev `codex/runtime-engine`, založená na `f97dc3627984e5b5c49741d740612fe85fdd5dac`. Původní checkout `deployer-public` zůstal na `main` čistý. Portálové soubory nebyly upravené. Git změny nebyly pushnuté. Produkční node/VPS nebyl změněn; vzdálené mutace proběhly výhradně v odděleném sandboxu.
+Implementace je v izolovaném worktree `/Users/jakubillich/Documents/ChatGPT/Deployer & customer center/deployer`, lokální větev `codex/runtime-engine`, založená na `f97dc3627984e5b5c49741d740612fe85fdd5dac`. Původní checkout `deployer-public` zůstal na `main` čistý. Portálové soubory nebyly upravené. Git změny nebyly pushnuté. Produkční node/VPS nebyl změněn; vzdálené mutace proběhly výhradně v odděleném sandboxu.
 
 Spustitelná interní služba obsahuje šest dohodnutých endpointů, autentizaci organizace pomocí servisního tokenu, šifrovaný durable store, FIFO operace v projektu s férovým střídáním projektů, obnovu rozpracovaných operací, OCI build/push adaptér, Runtime capability/manifest validaci, health + route ověření, idempotentní obnovení historického digestu a oba zdroje redigovaných logů.
 
