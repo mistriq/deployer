@@ -1,5 +1,13 @@
 # Předání a protokol ověření — 20. září 2026
 
+## Aktuální blokace portálového workflow
+
+Navazující ověření v 02:04–02:06 UTC zjistilo vyčerpanou CPU kapacitu vzdáleného sandboxu. Portálová operace `dep_ecf8156baba32e8bdb8c89cb2b0afbd6` stále čeká v `deploying/submitting`; její image, commit i build ID zůstaly stejné a Runtime zatím nepřijal žádný deployment tohoto projektu. Níže uvedené dřívější PASS výsledky neznamenají, že tato operace už pokračovala.
+
+[Přesná diagnóza a zpráva pro správce Runtime](runtime-capacity-handoff.md) obsahuje rozpis historických releasů, konkrétní vlastní kandidáty pro případný úklid a akceptační postup. Tentokrát proběhly pouze sandboxové GET požadavky; žádný úklid, reset ani změna portálu. Správce Runtime musí obnovit kapacitní rezervu před ověřením pokračování původní operace a nového kompletního workflow.
+
+Deployer má doplněný regresní test opakovaného `NODE_CAPACITY_EXHAUSTED` přes restart: stejný artifact a ID, žádný rebuild, přesně jedna přijatá simulovaná operace a následná aktivace. Vzdálený test nyní před první mutací ověřuje kapacitu pro všech šest kandidátů; snapshot není rezervace a souběh dalších agentů může stále změnit admission výsledek. `go test -race ./internal/controlplane ./internal/runtimeengine` prošel. Čerstvé read-only kontroly dřívějších static/Node testů potvrdily aktivní release, lifecycle health, shodné revize rout a oba Runtime log endpointy. Nejde o nové nasazení ani důkaz skutečného vzdáleného hostingu.
+
 ## Výsledek
 
 Implementace je v izolovaném worktree `/Users/jakubillich/Documents/ChatGPT/Deployer & customer center/deployer`, lokální větev `codex/runtime-engine`, založená na `f97dc3627984e5b5c49741d740612fe85fdd5dac`. Původní checkout `deployer-public` zůstal na `main` čistý. Portálové soubory nebyly upravené. Git změny nebyly pushnuté. Produkční node/VPS nebyl změněn; vzdálené mutace proběhly výhradně v odděleném sandboxu.

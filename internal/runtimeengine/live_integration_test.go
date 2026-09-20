@@ -109,7 +109,7 @@ func TestLiveSandbox(t *testing.T) {
 		t.Fatalf("sandbox capabilities: %v", err)
 	}
 
-	// Reserve the complete run up front: two project kinds, each with an initial
+	// Budget the complete run up front: two project kinds, each with an initial
 	// candidate, a failed-health candidate, and a historical-artifact restoration.
 	// Historical releases can retain capacity, so do not assume reclamation.
 	node, err := c.call(ctx, "GET", "/node", nil, "")
