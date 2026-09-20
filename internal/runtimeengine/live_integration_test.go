@@ -109,6 +109,19 @@ func TestLiveSandbox(t *testing.T) {
 		t.Fatalf("sandbox capabilities: %v", err)
 	}
 
+	// Reserve the complete run up front: two project kinds, each with an initial
+	// candidate, a failed-health candidate, and a historical-artifact restoration.
+	// Historical releases can retain capacity, so do not assume reclamation.
+	node, err := c.call(ctx, "GET", "/node", nil, "")
+	if err != nil {
+		t.Fatalf("sandbox read-only capacity preflight: %v", err)
+	}
+	report, err := sandboxCapacityPreflight(node, manifest().Resources, 6)
+	if err != nil {
+		t.Fatalf("sandbox capacity preflight refused run before provisioning: %v; no cleanup was attempted", err)
+	}
+	t.Logf("sandbox capacity preflight: %s; driver/proxy mock results do not verify a production Docker pull or real edge routing", report)
+
 	for _, kind := range []string{"static", "node-http"} {
 		t.Run(kind, func(t *testing.T) {
 			projectID := "prj_codex_" + strings.ReplaceAll(kind, "-", "_") + "_" + suffix
