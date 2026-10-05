@@ -1033,7 +1033,88 @@ async function rotateRunner(id, name, button) {
     } finally { restoreButton(); }
 }
 
+function initAIFailurePrompt() {
+    const panel = document.getElementById('ai-failure-panel');
+    if (!panel) return;
+    const prompt = document.getElementById('ai-failure-prompt');
+    const status = document.getElementById('ai-prompt-status');
+    const copy = document.getElementById('copy-ai-prompt');
+    let loading = false;
+    let loaded = false;
+    panel.addEventListener('toggle', async () => {
+        if (!panel.open || loaded || loading) return;
+        loading = true;
+        status.textContent = 'Preparing prompt…';
+        prompt.setAttribute('aria-busy', 'true');
+        try {
+            const response = await apiFetch(`/api/builds/${panel.dataset.buildId}/ai-prompt`);
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Could not load prompt');
+            prompt.value = data.prompt;
+            loaded = true;
+            copy.disabled = false;
+            status.textContent = 'Ready to copy. Review the context before sharing.';
+        } catch (error) {
+            status.textContent = `Could not load prompt: ${error.message}. Close and reopen this panel to retry.`;
+        } finally {
+            loading = false;
+            prompt.removeAttribute('aria-busy');
+        }
+    });
+    copy.addEventListener('click', async () => {
+        try {
+            await navigator.clipboard.writeText(prompt.value);
+            status.textContent = 'Prompt copied.';
+        } catch (error) {
+            prompt.focus();
+            prompt.select();
+            status.textContent = 'Clipboard access is unavailable. The prompt is selected for manual copying.';
+        }
+    });
+}
+
+function browserNotificationDevice() {
+    try {
+        let id = localStorage.getItem('deployer-notification-device');
+        if (!id) {
+            id = crypto.randomUUID();
+            localStorage.setItem('deployer-notification-device', id);
+        }
+        return id;
+    } catch (error) { return ''; }
+}
+
+async function pollBrowserNotifications() {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const browserId = browserNotificationDevice();
+    if (!browserId) return;
+    const poll = async () => {
+        try {
+            const response = await apiFetch(`/api/notifications/inbox?browser_id=${encodeURIComponent(browserId)}`);
+            if (!response.ok) return;
+            for (const item of await response.json()) {
+                const notification = new Notification(item.payload.title, { body: item.payload.commit_sha ? `Revision ${item.payload.commit_sha.slice(0, 12)}` : 'Open Deployer to view details.', tag: `deployer-${item.id}` });
+                const buildId = Number(item.payload.build_id);
+                notification.onclick = () => {
+                    window.focus();
+                    window.location.href = Number.isSafeInteger(buildId) && buildId > 0 ? `/builds/${buildId}` : '/notifications';
+                    notification.close();
+                };
+                await apiFetch('/api/notifications/ack', { method: 'POST', body: JSON.stringify({ id: item.id, browser_id: browserId }), headers: { 'Content-Type': 'application/json' } });
+            }
+        } catch (error) { /* A transient failure is retried on the next poll. */ }
+    };
+    if (navigator.locks) {
+        await navigator.locks.request(`deployer-notification-${browserId}`, { ifAvailable: true }, async lock => { if (lock) await poll(); });
+    } else {
+        await poll();
+    }
+}
+
 function initPage() {
+    pollBrowserNotifications();
+    window.setInterval(pollBrowserNotifications, 15000);
+    initAIFailurePrompt();
     document.querySelectorAll('[data-deploy-project-id]').forEach(button => {
         button.addEventListener('click', () => deploy(parseInt(button.dataset.deployProjectId), button.dataset.projectName, button));
     });

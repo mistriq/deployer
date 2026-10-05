@@ -99,7 +99,7 @@ func (s *mcpServer) handle(ctx context.Context, req mcpRequest) mcpResponse {
 	r := mcpResponse{JSONRPC: "2.0", ID: req.ID}
 	switch req.Method {
 	case "initialize":
-		r.Result = map[string]interface{}{"protocolVersion": mcpProtocolVersion, "capabilities": map[string]interface{}{"tools": map[string]interface{}{"listChanged": false}}, "serverInfo": map[string]string{"name": "deployer", "version": buildVersion}}
+		r.Result = map[string]interface{}{"protocolVersion": mcpProtocolVersion, "capabilities": map[string]interface{}{"tools": map[string]interface{}{"listChanged": false}}, "serverInfo": map[string]string{"name": "deployer", "version": buildVersion}, "instructions": aiOperatingInstructions}
 	case "ping":
 		r.Result = map[string]interface{}{}
 	case "tools/list":
@@ -135,6 +135,7 @@ func (s *mcpServer) tools() []mcpTool {
 	runnerID := objectSchema([]string{"runner_id"}, map[string]interface{}{"runner_id": intProp("Runner ID")})
 	operationID := objectSchema([]string{"operation_id"}, map[string]interface{}{"operation_id": intProp("Operation ID")})
 	tools := []mcpTool{
+		{Name: "deployer_context", Description: "Start here: read operating instructions, capabilities, and available projects before taking action.", InputSchema: noArgs},
 		{Name: "projects_list", Description: "List deployment projects and their latest builds.", InputSchema: noArgs},
 		{Name: "runners_list", Description: "List deployment runners.", InputSchema: noArgs},
 		{Name: "runner_detail", Description: "Read runner telemetry, active task, deployment queue, and recent operations.", InputSchema: runnerID},
@@ -145,6 +146,7 @@ func (s *mcpServer) tools() []mcpTool {
 		{Name: "build_get", Description: "Read build status and bounded recent log output; call again to follow progress.", InputSchema: objectSchema([]string{"build_id"}, map[string]interface{}{"build_id": intProp("Build ID"), "log_bytes": map[string]interface{}{"type": "integer", "minimum": 0, "maximum": 65536, "default": 16384}})},
 		{Name: "build_events", Description: "Read structured events for a build.", InputSchema: buildID},
 		{Name: "build_failure_summary", Description: "Diagnose a failed build.", InputSchema: buildID},
+		{Name: "build_failure_prompt", Description: "Read a bounded, redacted diagnostic prompt for a failed build.", InputSchema: buildID},
 		{Name: "project_runbook", Description: "Generate the operational runbook for a project.", InputSchema: projectID},
 		{Name: "deployment_preview", Description: "Preview source version, target, preserve paths, hooks, and health checks without deploying.", InputSchema: projectID},
 	}
@@ -172,6 +174,8 @@ func (s *mcpServer) call(ctx context.Context, p mcpCallParams) (mcpCallResult, e
 	var method, path, token, requestBody string
 	method, token = http.MethodGet, s.readToken
 	switch p.Name {
+	case "deployer_context":
+		path = "/api/ai/context"
 	case "projects_list":
 		path = "/api/projects"
 	case "runners_list":
@@ -198,12 +202,12 @@ func (s *mcpServer) call(ctx context.Context, p mcpCallParams) (mcpCallResult, e
 		if suffix != "" {
 			path += "/" + suffix
 		}
-	case "build_get", "build_events", "build_failure_summary":
+	case "build_get", "build_events", "build_failure_summary", "build_failure_prompt":
 		v, e := id("build_id")
 		if e != nil {
 			return mcpCallResult{}, e
 		}
-		suffix := map[string]string{"build_get": "", "build_events": "events", "build_failure_summary": "failure-summary"}[p.Name]
+		suffix := map[string]string{"build_get": "", "build_events": "events", "build_failure_summary": "failure-summary", "build_failure_prompt": "ai-prompt"}[p.Name]
 		path = "/api/builds/" + strconv.FormatInt(v, 10)
 		if suffix != "" {
 			path += "/" + suffix

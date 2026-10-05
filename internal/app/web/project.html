@@ -40,9 +40,12 @@
             {{end}}
         </div>
         {{end}}
+        <a href="/notifications" class="nav-item">Notifications</a>
+        {{if logoutURL}}<a href="{{logoutURL}}" class="nav-item">Sign out</a>{{end}}
     </nav>
 
     <div class="main-content">
+        {{template "mobile_navigation" .}}
         <div class="page-header">
             <div>
                 <h1>

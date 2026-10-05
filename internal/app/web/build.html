@@ -27,9 +27,12 @@
         <div class="sidebar-steps" id="sidebar-steps">
             <div class="sidebar-steps-title">Build Steps</div>
         </div>
+        <a href="/notifications" class="nav-item">Notifications</a>
+        {{if logoutURL}}<a href="{{logoutURL}}" class="nav-item">Sign out</a>{{end}}
     </nav>
 
     <div class="main-content">
+        {{template "mobile_navigation" .}}
         <div class="page-header">
             <div>
                 <h1>
@@ -56,6 +59,16 @@
             </div>
         </div>
 
+        {{if eq .Status "failed"}}
+        <details class="ai-failure-panel" id="ai-failure-panel" data-build-id="{{.ID}}">
+            <summary>Get an AI repair prompt</summary>
+            <p>Copy project context and redacted failure details into your AI assistant.</p>
+            <p id="ai-prompt-status" role="status" aria-live="polite"></p>
+            <label for="ai-failure-prompt">Diagnostic prompt</label>
+            <textarea id="ai-failure-prompt" rows="14" readonly></textarea>
+            <button type="button" class="btn" id="copy-ai-prompt" disabled>Copy prompt</button>
+        </details>
+        {{end}}
 	        <div id="steps-container"></div>
 	        <div id="build-data"
 	            data-build-id="{{.ID}}"

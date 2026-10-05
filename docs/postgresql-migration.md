@@ -4,6 +4,12 @@ PostgreSQL is the supported production database. SQLite remains available only
 for automated tests and as the read-only source of the migration command. New
 production features do not need to maintain a second SQLite implementation.
 
+`ops/postgresql.compose.yml` provides a local PostgreSQL instance with a named
+volume, a loopback-only port, a health check, and restart policy. Copy it to
+stable operations storage and supply `POSTGRES_PASSWORD` through a protected
+environment file; never commit that file. The example uses port 55436 so it
+does not reuse a rehearsal instance on another port.
+
 ## Rehearse first
 
 1. Stop Deployer so the SQLite file has no writers. Confirm the service is
@@ -39,8 +45,25 @@ and running it again. It never changes the SQLite source.
 
 ## Recover
 
+The SQLite recovery procedure below applies during the cutover validation
+window, before new PostgreSQL writes have been accepted. Once normal traffic
+has resumed, keep PostgreSQL data and recover using a PostgreSQL backup;
+switching to the old SQLite snapshot would discard subsequent writes.
+
 If import or validation fails, stop the PostgreSQL-backed service. Restore the
 unchanged SQLite backup and the previous service configuration, then start the
 previous application version. Keep the failed PostgreSQL database for diagnosis;
 do not retry into that partially used database. No source data needs to be
 restored because the importer only opens it in read-only mode.
+
+## Ongoing backups
+
+`ops/backup-postgresql.sh` creates a custom-format dump, validates its archive
+index, and saves the matching protected Deployer environment, including the
+notification encryption key. The optional user service and timer run it daily.
+Install the script at `~/.local/bin/deployer-postgresql-backup` and the units in
+`~/.config/systemd/user/`, then enable `deployer-postgresql-backup.timer`.
+Backups are kept in `~/.local/share/deployer/postgresql-backups` with restricted
+permissions. No backup is automatically deleted; arrange off-host copies and
+retention according to your existing operations policy. Rehearse a full restore
+to an isolated database before relying on recovery.

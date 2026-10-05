@@ -286,7 +286,7 @@ quality gaps found during the audit.
   settings.
 - [ ] Add rollback support for files and Docker deploys, backed by previous
   release artifacts or automatic pre-deploy snapshots.
-- [ ] Add build queue visibility with pending/running jobs, runner assignment,
+- [x] Add build queue visibility with pending/running jobs, runner assignment,
   queue position, and cancel-pending actions.
 - [ ] Use runner labels for job routing instead of requiring each project to
   point at exactly one runner.
@@ -296,17 +296,20 @@ quality gaps found during the audit.
 
 ## P2 - Remote Server Operations
 
-- [ ] Add runner detail pages showing hostname, OS, agent version, uptime, disk
+- [x] Add runner detail pages showing hostname, OS, agent version, uptime, disk
   space, Docker availability, current job, and last heartbeat.
-- [ ] Add remote project actions through the agent: `docker compose ps`, recent
+- [x] Add remote project actions through the agent: `docker compose ps`, recent
   compose logs, restart service, stop service, and run health check now.
 - [ ] Add configurable deploy hooks for both Docker and files mode: pre-build,
   post-build, pre-deploy, post-deploy, and failure hook.
 - [ ] Add files deploy preview/dry-run showing included/excluded files, archive
   size, preserve paths, and remote changes before extraction.
 - [ ] Add snapshot browser with download, compare, and restore actions.
-- [ ] Add deploy notifications for success/failure via Discord, Slack, email, or
-  generic webhook.
+- [x] Add unlimited personal browser, Discord, Slack, and generic webhook
+  channels with project/outcome filters, encrypted endpoints, tests, and delivery history.
+- [ ] Add email notification delivery.
+
+- [x] Add persistent gateway sessions and an explicit sign-out link.
 
 ## P2 - AI And Automation Features
 
@@ -330,9 +333,11 @@ quality gaps found during the audit.
   failures through persisted build/job error codes instead of parsing messages.
 - [ ] Add a CLI with JSON output, e.g. `deployer projects list --json`,
   `deployer deploy PROJECT --json`, and `deployer builds watch BUILD --json`.
-- [ ] Add an MCP server for Deployer so AI agents can list projects, inspect
+- [x] Add an MCP server for Deployer so AI agents can list projects, inspect
   runners, trigger deploys, watch logs, fetch artifacts, and summarize failures
   through typed tools.
+- [x] Supply AI operating instructions and project discovery on MCP initialization.
+- [x] Add a collapsed, copyable AI diagnostic prompt for failed builds.
 - [x] Add generated AI runbooks per project: how to deploy it, what files matter,
   what runner it uses, how rollback should work, and common failure recovery.
 - [x] Add build failure summarization that extracts the failing step, likely
@@ -351,5 +356,5 @@ quality gaps found during the audit.
   current deploy.
 - [ ] Add project grouping/tags/favorites for dashboards with many projects.
 - [x] Add project import/export with secrets omitted.
-- [ ] Add health-check status detail and configurable success criteria.
+- [x] Add health-check status detail and configurable success criteria.
 - [x] Add demo mode or seeded demo database for screenshots.

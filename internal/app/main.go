@@ -37,6 +37,11 @@ func Run() {
 	}
 
 	appConfig = loadConfig()
+	if appConfig.NotificationKey != "" {
+		if _, err := notificationCipher(); err != nil {
+			logFatal("config_error", "DEPLOYER_NOTIFICATION_KEY must be base64 encoding of 32 bytes", nil, nil)
+		}
+	}
 	configureArtifactStorage(appConfig)
 	if err := ensureRuntimeDirs(appConfig); err != nil {
 		logFatal("startup_error", "failed to prepare runtime directories", err, nil)
@@ -64,6 +69,10 @@ func Run() {
 	// Init SSE broker and builder
 	broker = NewSSEBroker()
 	builder = NewBuilder(broker)
+	notificationCtx, stopNotifications := context.WithCancel(context.Background())
+	notificationsDone := make(chan struct{})
+	defer func() { stopNotifications(); <-notificationsDone }()
+	go func() { defer close(notificationsDone); runNotificationWorker(notificationCtx) }()
 
 	// Background: mark stale runners as offline
 	go func() {
@@ -139,6 +148,7 @@ func Run() {
 		"securityStatus": func() SecurityStatus {
 			return securityStatus()
 		},
+		"logoutURL":   func() string { return appConfig.LogoutURL },
 		"compactPath": compactPath,
 		"formatBytes": func(value int64) string {
 			units := []string{"B", "KB", "MB", "GB", "TB"}
@@ -169,6 +179,7 @@ func Run() {
 	// Download endpoint — serve the deployer binary itself
 	mux.HandleFunc("/download/deployer", handleDownloadBinary)
 	mux.HandleFunc("/api/capabilities", handleAPICapabilities)
+	mux.HandleFunc("/api/ai/context", handleAIContext)
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		response := map[string]string{"version": buildVersion}
 		if checksum, err := currentBinaryChecksum(); err == nil {
@@ -185,6 +196,13 @@ func Run() {
 	mux.HandleFunc("/builds/", handleBuildPage)
 	mux.HandleFunc("/runners", handleRunnersPage)
 	mux.HandleFunc("/runners/", handleRunnersPage)
+	mux.HandleFunc("/notifications", handleNotificationsPage)
+	mux.HandleFunc("/signed-out", func(w http.ResponseWriter, r *http.Request) {
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		tmpl.ExecuteTemplate(w, "signed_out.html", nil)
+	})
 
 	// API routes
 	mux.HandleFunc("/api/projects", handleAPIProjects)
@@ -193,6 +211,10 @@ func Run() {
 	mux.HandleFunc("/api/runners", handleAPIRunners)
 	mux.HandleFunc("/api/runners/", handleAPIRunner)
 	mux.HandleFunc("/api/runner-operations/", handleAPIRunnerOperation)
+	mux.HandleFunc("/api/notifications/channels", handleNotificationChannels)
+	mux.HandleFunc("/api/notifications/channels/", handleNotificationChannels)
+	mux.HandleFunc("/api/notifications/inbox", handleBrowserNotificationInbox)
+	mux.HandleFunc("/api/notifications/ack", handleBrowserNotificationAck)
 
 	// Agent API routes
 	mux.HandleFunc("/api/agent/poll", handleAgentPoll)
@@ -657,6 +679,15 @@ func handleAPIBuild(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		handleAPIBuildEvents(w, r, id)
+		return
+	}
+
+	// /api/builds/:id/ai-prompt
+	if suffix == "ai-prompt" {
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		handleBuildAIPrompt(w, r, id)
 		return
 	}
 

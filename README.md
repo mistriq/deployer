@@ -83,6 +83,8 @@ URL through your authorization gateway.
 | `DEPLOYER_DATABASE_URL` | required | PostgreSQL connection URL. |
 | `DEPLOYER_DB_PATH` | `deployer.db` | Legacy SQLite path used by tests and the migration source. |
 | `DEPLOYER_PUBLIC_URL` | empty | Public URL used in generated runner setup commands. |
+| `DEPLOYER_NOTIFICATION_KEY` | empty | Base64 encoding of 32 random bytes, used to encrypt saved webhook URLs. Keep the same key across restarts and restores. |
+| `DEPLOYER_LOGOUT_URL` | empty | Gateway logout link, displayed in the navigation when configured. |
 | `DEPLOYER_ARTIFACT_DIR` | `/tmp/deployer-artifacts` | Managed server-side build artifact directory. |
 | `DEPLOYER_SNAPSHOT_DIR` | `/tmp/deployer-snapshots` | Managed server-side snapshot artifact directory. |
 | `DEPLOYER_ARTIFACT_RETENTION_HOURS` | `24` | Age after which stale artifact files are removed. |
@@ -100,6 +102,12 @@ URL through your authorization gateway.
 | `DEPLOYER_AGENT_ARTIFACT_TIMEOUT` | `30m` | Agent artifact download/upload/update HTTP timeout. Agent-side setting. |
 
 See `.env.example` for a starter environment file.
+
+Personal browser, Discord, Slack, and generic webhook notification channels can
+be configured at `/notifications`. See [notification and gateway setup](docs/notifications.md).
+AI clients receive operating guidance on MCP initialization and can discover
+projects through `deployer_context`. Failed builds offer a collapsed copyable
+diagnostic prompt. See [MCP setup](docs/mcp.md).
 
 ## Running As A Service
 

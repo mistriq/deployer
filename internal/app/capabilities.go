@@ -95,6 +95,10 @@ func newCapabilitiesResponse(cfg AppConfig) capabilitiesResponse {
 			CSRFHeader:        csrfHeader,
 		},
 		Features: map[string]bool{
+			"ai_operating_context":    true,
+			"build_failure_prompts":   true,
+			"personal_notifications":  true,
+			"browser_notifications":   true,
 			"artifact_downloads":      true,
 			"artifact_retention":      cfg.ArtifactRetentionHours > 0,
 			"build_annotations":       true,

@@ -23,6 +23,171 @@ tags:
   - name: release
 
 paths:
+  /api/ai/context:
+    get:
+      tags: [capabilities]
+      operationId: getAIOperatingContext
+      summary: Read AI operating instructions, capabilities, and compact project discovery
+      responses:
+        "200":
+          description: Instructions and up to 100 projects, with project_count and projects_truncated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instructions: {type: string}
+                  projects: {type: array, items: {type: object}}
+                  project_count: {type: integer}
+                  projects_truncated: {type: boolean}
+                  projects_url: {type: string}
+                  capabilities: {$ref: "#/components/schemas/Capabilities"}
+        default: {$ref: "#/components/responses/Error"}
+
+  /api/builds/{buildId}/ai-prompt:
+    parameters:
+      - name: buildId
+        in: path
+        required: true
+        schema: {type: integer, minimum: 1}
+    get:
+      tags: [builds]
+      operationId: getBuildAIFailurePrompt
+      summary: Get a bounded, redacted diagnostic prompt for a failed build
+      responses:
+        "200":
+          description: Current project context and failure evidence, suitable for copying to an AI assistant.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [build_id, prompt]
+                properties:
+                  build_id: {type: integer}
+                  prompt: {type: string}
+        "409":
+          description: Build is not failed.
+        default: {$ref: "#/components/responses/Error"}
+
+  /api/notifications/channels:
+    description: Personal settings require a signed-in gateway user. Machine bearer credentials cannot access them.
+    get:
+      operationId: listPersonalNotificationChannels
+      summary: List every channel owned by the signed-in user
+      responses:
+        "200":
+          description: Channels with webhook URLs omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  encryption_configured: {type: boolean}
+                  channels:
+                    type: array
+                    items: {$ref: "#/components/schemas/NotificationChannel"}
+        default: {$ref: "#/components/responses/Error"}
+    post:
+      operationId: createPersonalNotificationChannel
+      summary: Add a notification channel; no fixed channel limit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/NotificationChannel"}
+      responses:
+        "200": {description: Created channel ID.}
+        default: {$ref: "#/components/responses/Error"}
+
+  /api/notifications/channels/{channelId}:
+    parameters:
+      - name: channelId
+        in: path
+        required: true
+        schema: {type: integer, minimum: 1}
+    put:
+      operationId: updatePersonalNotificationChannel
+      summary: Update an owned channel; an empty endpoint preserves its saved URL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/NotificationChannel"}
+      responses:
+        "200": {description: Saved channel ID.}
+        default: {$ref: "#/components/responses/Error"}
+    delete:
+      operationId: deletePersonalNotificationChannel
+      summary: Delete an owned channel and its delivery history
+      responses:
+        "200": {description: Channel deleted.}
+        default: {$ref: "#/components/responses/Error"}
+
+  /api/notifications/channels/{channelId}/test:
+    parameters:
+      - name: channelId
+        in: path
+        required: true
+        schema: {type: integer, minimum: 1}
+    post:
+      operationId: testPersonalNotificationChannel
+      summary: Queue a test message to an owned, enabled channel
+      responses:
+        "200": {description: Queued delivery ID and status.}
+        default: {$ref: "#/components/responses/Error"}
+
+  /api/notifications/channels/{channelId}/deliveries:
+    parameters:
+      - name: channelId
+        in: path
+        required: true
+        schema: {type: integer, minimum: 1}
+    get:
+      operationId: getPersonalNotificationDeliveryHistory
+      summary: Read the last 50 deliveries for an owned channel
+      responses:
+        "200":
+          description: Delivery IDs, build IDs, status, attempts, safe errors, and timestamps.
+          content:
+            application/json:
+              schema: {type: array, items: {type: object}}
+        default: {$ref: "#/components/responses/Error"}
+
+  /api/notifications/inbox:
+    get:
+      operationId: getPersonalBrowserNotificationInbox
+      summary: Read up to 50 pending browser notifications for the signed-in user and device
+      parameters:
+        - name: browser_id
+          in: query
+          required: true
+          schema: {type: string, minLength: 16, maxLength: 100}
+      responses:
+        "200":
+          description: Pending delivery IDs and notification payloads.
+          content:
+            application/json:
+              schema: {type: array, items: {type: object}}
+        default: {$ref: "#/components/responses/Error"}
+
+  /api/notifications/ack:
+    post:
+      operationId: acknowledgePersonalBrowserNotification
+      summary: Acknowledge an owned notification on its configured browser device
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, browser_id]
+              properties:
+                id: {type: integer, minimum: 1}
+                browser_id: {type: string, minLength: 16, maxLength: 100}
+      responses:
+        "200": {description: Acknowledged; another user's notification is never changed.}
+        default: {$ref: "#/components/responses/Error"}
+
   /api/capabilities:
     get:
       tags: [capabilities]
@@ -1085,6 +1250,25 @@ components:
             $ref: "#/components/schemas/Error"
 
   schemas:
+    NotificationChannel:
+      type: object
+      required: [name, kind, events, enabled]
+      properties:
+        id: {type: integer, readOnly: true}
+        name: {type: string, minLength: 1, maxLength: 160}
+        kind: {type: string, enum: [browser, discord, slack, webhook]}
+        browser_id: {type: string, description: Required for browser channels.}
+        endpoint: {type: string, writeOnly: true, description: HTTPS webhook URL; empty on update keeps the saved endpoint.}
+        endpoint_configured: {type: boolean, readOnly: true}
+        project_ids:
+          type: array
+          description: Empty means every project, including future projects.
+          items: {type: integer, minimum: 1}
+        events:
+          type: array
+          minItems: 1
+          items: {type: string, enum: [success, failed, cancelled]}
+        enabled: {type: boolean}
     Error:
       type: object
       required: [error, code]

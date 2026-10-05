@@ -1,0 +1,8 @@
+{{define "mobile_navigation"}}
+<nav class="mobile-navigation" aria-label="Main navigation">
+    <a href="/">Projects</a>
+    <a href="/runners">Runners</a>
+    <a href="/notifications">Notifications</a>
+    {{if logoutURL}}<a href="{{logoutURL}}">Sign out</a>{{end}}
+</nav>
+{{end}}

@@ -277,6 +277,10 @@ func initPostgres(databaseURL string) error {
 	if err != nil {
 		return fmt.Errorf("open PostgreSQL: %w", err)
 	}
+	sqlDB.SetMaxOpenConns(20)
+	sqlDB.SetMaxIdleConns(5)
+	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
 	db = &database{DB: sqlDB, dialect: "postgres"}
 	if err := db.Ping(); err != nil {
 		db.Close()
@@ -801,7 +805,11 @@ func createBuild(projectID int64, triggeredBy string) (*Build, error) {
 		TriggeredBy: triggeredBy,
 	}
 	var err error
-	b.ID, err = insertID(`INSERT INTO builds (project_id, status, started_at, triggered_by) VALUES (?, ?, ?, ?)`, b.ProjectID, b.Status, formatSQLiteTime(b.StartedAt), b.TriggeredBy)
+	query := `INSERT INTO builds (project_id, status, started_at, triggered_by) VALUES (?, ?, ?, ?)`
+	if db.dialect == "postgres" {
+		query = `INSERT INTO builds (project_id, status, started_at, triggered_by, notifications_recorded) VALUES (?, ?, ?, ?, FALSE)`
+	}
+	b.ID, err = insertID(query, b.ProjectID, b.Status, formatSQLiteTime(b.StartedAt), b.TriggeredBy)
 	if err != nil {
 		return nil, err
 	}
