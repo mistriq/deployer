@@ -1,11 +1,115 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{{.Detail.Runner.Name}} — Runner</title><link rel="stylesheet" href="/static/style.css"></head><body>
-<nav class="sidebar"><div class="sidebar-logo">Deployer</div><a href="/" class="nav-item">Dashboard</a><a href="/runners" class="nav-item active">Runners</a></nav>
-<main class="main-content"><div class="page-header"><div><a href="/runners">← Runners</a><h1>{{.Detail.Runner.Name}}</h1><p>{{.Detail.Runner.Status}} · {{.Detail.Runner.Labels}}</p></div></div>
-<section class="card"><h2>Host</h2><p>Last heartbeat: {{if .Detail.Runner.LastSeen}}{{.Detail.Runner.LastSeen}}{{else}}never{{end}} · Current task: {{if .Detail.ActiveTaskKind}}{{.Detail.ActiveTaskKind}} #{{.Detail.ActiveTaskID}}{{else}}idle{{end}}</p>{{with .Detail.Telemetry}}<div class="form-grid"><div>Hostname<br><strong>{{.Hostname}}</strong></div><div>System<br><strong>{{.OSName}} · agent {{.AgentVersion}}</strong></div><div>Uptime<br><strong>{{.UptimeSeconds}} seconds</strong></div><div>Docker<br><strong>{{if .DockerAvailable}}{{.DockerVersion}}{{else}}Unavailable{{end}}</strong></div><div>Disk<br><strong>{{formatBytes .DiskFreeBytes}} free of {{formatBytes .DiskTotalBytes}}</strong></div></div>{{else}}<p>No telemetry received yet.</p>{{end}}</section>
-<section class="card"><h2>Deployment queue</h2>{{if .Detail.DeploymentQueue}}<div style="overflow-x:auto"><table><tr><th>Build</th><th>Status</th><th>Target</th><th>Action</th></tr>{{range .Detail.DeploymentQueue}}<tr><td><a href="/builds/{{.BuildID}}">#{{.BuildID}}</a></td><td>{{.Status}}</td><td>{{.DeployDir}}</td><td>{{if eq .Status "pending"}}<button class="btn" data-build-cancel="{{.BuildID}}">Cancel</button>{{end}}</td></tr>{{end}}</table></div>{{else}}<p>No pending deployments.</p>{{end}}</section>
-<section class="card"><h2>Remote operation</h2>{{if eq .Detail.Runner.Status "online"}}<form id="runner-operation-form" data-runner-id="{{.Detail.Runner.ID}}"><div class="form-grid"><label class="form-group">Project <select name="project_id" required><option value="">Choose a project</option>{{range .Projects}}{{if eq .RunnerID $.Detail.Runner.ID}}<option value="{{.ID}}">{{.Name}}</option>{{end}}{{end}}</select></label><label class="form-group">Action <select name="kind"><option value="health_check">Health check</option><option value="compose_status">Compose status</option><option value="compose_restart">Restart services</option><option value="compose_stop">Stop services</option><option value="compose_logs">Recent Compose logs</option></select></label></div><div class="form-actions"><button class="btn btn-primary" type="submit" disabled>Queue operation</button><span id="runner-operation-status" role="status"></span></div></form>{{else}}<p>This runner is offline. Remote operations are unavailable until it sends a fresh heartbeat.</p>{{end}}</section>
-<section class="card"><h2>Operations</h2>{{if .Detail.Operations}}<div style="overflow-x:auto"><table><tr><th>Action</th><th>Status</th><th>Result and bounded output</th><th></th></tr>{{range .Detail.Operations}}<tr><td>{{.Kind}}</td><td>{{.Status}}</td><td>{{.ResultSummary}}{{if .Log}}<details><summary>View output</summary><pre>{{.Log}}</pre></details>{{end}}</td><td>{{if eq .Status "pending"}}<button class="btn" data-operation-cancel="{{.ID}}">Cancel</button>{{end}}</td></tr>{{end}}</table></div>{{else}}<p>No operations yet.</p>{{end}}</section></main>
-<script src="/static/app.js"></script><script>
-const form=document.querySelector('#runner-operation-form');if(form){const button=form.querySelector('button[type="submit"]'),status=document.querySelector('#runner-operation-status'),project=form.project_id;const sync=()=>button.disabled=!project.value;project.addEventListener('change',sync);sync();form.addEventListener('submit',async e=>{e.preventDefault();button.disabled=true;status.textContent='Queuing operation…';try{const r=await fetch('/api/runners/'+form.dataset.runnerId+'/operations',{method:'POST',headers:{'Content-Type':'application/json','X-Deployer-CSRF':'1'},body:JSON.stringify({project_id:Number(project.value),kind:form.kind.value})});if(!r.ok){const body=await r.json();throw Error(body.error||'Operation could not be queued')}location.reload()}catch(error){status.textContent=error.message;sync()}})}
-async function cancelItem(button,url){button.disabled=true;try{const r=await fetch(url,{method:'POST',headers:{'X-Deployer-CSRF':'1'}});if(!r.ok)throw Error('Cancellation could not be completed');location.reload()}catch(error){button.disabled=false;button.after(document.createTextNode(' '+error.message))}}document.querySelectorAll('[data-operation-cancel]').forEach(b=>b.onclick=()=>cancelItem(b,'/api/runner-operations/'+b.dataset.operationCancel+'/cancel'));document.querySelectorAll('[data-build-cancel]').forEach(b=>b.onclick=()=>cancelItem(b,'/api/builds/'+b.dataset.buildCancel+'/cancel'));
-</script></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    {{template "head" .Detail.Runner.Name}}
+</head>
+<body>
+    {{template "topbar" "runners"}}
+
+    <main class="page">
+        <nav class="crumbs" aria-label="Breadcrumb"><a href="/runners">Runners</a><span aria-hidden="true">/</span></nav>
+        {{$online := eq .Detail.Runner.Status "online"}}
+        <header class="project-head">
+            <div class="project-title">
+                <h1>{{.Detail.Runner.Name}}</h1>
+                <dl class="specs">
+                    <div><dt>Status</dt><dd><span class="presence{{if $online}} is-online{{end}}"></span>{{if $online}}Online{{else}}Offline{{end}}</dd></div>
+                    <div><dt>Heartbeat</dt><dd>{{if .Detail.Runner.LastSeen}}<time datetime="{{.Detail.Runner.LastSeen.Format "2006-01-02T15:04:05Z07:00"}}" title="{{.Detail.Runner.LastSeen.Format "Jan 2, 2006 15:04:05"}}">{{.Detail.Runner.LastSeen.Format "Jan 2, 15:04"}}</time>{{else}}never{{end}}</dd></div>
+                    <div><dt>Working on</dt><dd>{{if .Detail.ActiveTaskKind}}{{.Detail.ActiveTaskKind}} #{{.Detail.ActiveTaskID}}{{else}}nothing{{end}}</dd></div>
+                    {{with splitLabels .Detail.Runner.Labels}}<div><dt>Labels</dt><dd><ul class="labels">{{range .}}<li>{{.}}</li>{{end}}</ul></dd></div>{{end}}
+                </dl>
+            </div>
+        </header>
+
+        <section class="panel" aria-labelledby="host-title">
+            <header class="panel-head"><h2 id="host-title">Host</h2></header>
+            {{with .Detail.Telemetry}}
+            <dl class="readouts readouts-grid">
+                <div><dt>Hostname</dt><dd>{{.Hostname}}</dd></div>
+                <div><dt>System</dt><dd>{{.OSName}}</dd></div>
+                <div><dt>Agent</dt><dd>{{.AgentVersion}}</dd></div>
+                <div><dt>Uptime</dt><dd>{{humanSeconds .UptimeSeconds}}</dd></div>
+                <div><dt>Docker</dt><dd>{{if .DockerAvailable}}{{.DockerVersion}}{{else}}<span class="alarm-text">unavailable</span>{{end}}</dd></div>
+                <div class="readout-disk">
+                    <dt>Disk</dt>
+                    {{$used := usedPercent .DiskFreeBytes .DiskTotalBytes}}
+                    <dd>{{formatBytes .DiskFreeBytes}} free <span class="dim">of {{formatBytes .DiskTotalBytes}}</span></dd>
+                    <div class="meter{{if ge $used 90}} is-alarm{{end}}" role="meter" aria-valuenow="{{$used}}" aria-valuemin="0" aria-valuemax="100" aria-label="Disk used"><span style="width: {{$used}}%"></span></div>
+                </div>
+            </dl>
+            {{else}}
+            <p class="quiet-note">No telemetry yet. It arrives with the next heartbeat from an up-to-date agent.</p>
+            {{end}}
+        </section>
+
+        <div class="overview-grid">
+            <section class="panel" aria-labelledby="ops-title">
+                <header class="panel-head"><h2 id="ops-title">Run an operation</h2></header>
+                {{if $online}}
+                <form id="runner-operation-form" data-runner-id="{{.Detail.Runner.ID}}">
+                    <div class="fields">
+                        <div class="form-group">
+                            <label for="op-project">Project</label>
+                            <select id="op-project" name="project_id" required><option value="">Choose a project</option>{{range .Projects}}{{if eq .RunnerID $.Detail.Runner.ID}}<option value="{{.ID}}">{{.Name}}</option>{{end}}{{end}}</select>
+                        </div>
+                        <div class="form-group">
+                            <label for="op-kind">Operation</label>
+                            <select id="op-kind" name="kind"><option value="health_check">Health check</option><option value="compose_status">Service status</option><option value="compose_restart">Restart services</option><option value="compose_stop">Stop services</option><option value="compose_logs">Recent logs</option></select>
+                        </div>
+                    </div>
+                    <div class="sheet-actions sheet-actions-start">
+                        <button class="btn btn-primary" type="submit" disabled>Queue operation</button>
+                        <span id="runner-operation-status" class="quiet-note" role="status"></span>
+                    </div>
+                </form>
+                {{else}}
+                <p class="quiet-note">This runner is offline. Operations become available with its next heartbeat.</p>
+                {{end}}
+            </section>
+
+            <section class="panel" aria-labelledby="queue-title">
+                <header class="panel-head"><h2 id="queue-title">Deploy queue</h2></header>
+                {{if .Detail.DeploymentQueue}}
+                <ul class="plain-list">
+                    {{range .Detail.DeploymentQueue}}
+                    <li>
+                        {{template "mark" .Status}}
+                        <a href="/builds/{{.BuildID}}">Deploy #{{.BuildID}}</a>
+                        <span class="dim mono-sm">{{.DeployDir}}</span>
+                        {{if eq .Status "pending"}}<button type="button" class="btn btn-sm btn-quiet btn-quiet-danger" data-build-cancel="{{.BuildID}}">Cancel</button>{{end}}
+                    </li>
+                    {{end}}
+                </ul>
+                {{else}}
+                <p class="quiet-note">Nothing waiting.</p>
+                {{end}}
+            </section>
+        </div>
+
+        <section class="panel" aria-labelledby="history-title">
+            <header class="panel-head"><h2 id="history-title">Operation history</h2></header>
+            {{if .Detail.Operations}}
+            <ol class="timeline">
+                {{range .Detail.Operations}}
+                <li class="timeline-row" data-status="{{.Status}}">
+                    {{if eq .Status "succeeded"}}{{template "mark" "success"}}{{else}}{{template "mark" .Status}}{{end}}
+                    <div class="timeline-main">
+                        <span class="timeline-title">{{template "opkind" .Kind}}</span>
+                        <span class="timeline-sub">{{.Status}}{{if .ResultSummary}} · {{.ResultSummary}}{{end}}</span>
+                        {{if .Log}}<details class="op-log"><summary>Output</summary><pre>{{.Log}}</pre></details>{{end}}
+                    </div>
+                    {{if eq .Status "pending"}}<button type="button" class="btn btn-sm btn-quiet btn-quiet-danger" data-operation-cancel="{{.ID}}">Cancel</button>{{end}}
+                    <time class="timeline-time" datetime="{{.RequestedAt.Format "2006-01-02T15:04:05Z07:00"}}" title="{{.RequestedAt.Format "Jan 2, 2006 15:04"}}">{{.RequestedAt.Format "Jan 2, 15:04"}}</time>
+                </li>
+                {{end}}
+            </ol>
+            {{else}}
+            <p class="quiet-note">No operations yet.</p>
+            {{end}}
+        </section>
+    </main>
+
+    {{template "scripts"}}
+    <script src="/static/runner_detail.js"></script>
+</body>
+</html>

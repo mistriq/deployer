@@ -78,6 +78,15 @@ func ImportSQLite(ctx context.Context, sqlitePath, postgresURL string, out io.Wr
 		return fmt.Errorf("begin import: %w", err)
 	}
 	defer tx.Rollback()
+	for _, table := range []string{"notification_channels", "notification_deliveries"} {
+		var count int64
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil {
+			return fmt.Errorf("count target %s: %w", table, err)
+		}
+		if count != 0 {
+			return fmt.Errorf("PostgreSQL target table %s is not empty", table)
+		}
+	}
 	for _, table := range importTableOrder {
 		var targetCount int64
 		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&targetCount); err != nil {

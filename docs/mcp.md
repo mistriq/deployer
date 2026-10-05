@@ -1,5 +1,19 @@
 # MCP integration
 
+On initialization, Deployer supplies operating instructions covering authorization,
+data preservation, deployment previews, retry keys, diagnosis, and verification.
+Start with `deployer_context` (`GET /api/ai/context`) to read those instructions,
+current capabilities, and up to 100 compact project entries. `project_count` and
+`projects_truncated` indicate when to read the complete `/api/projects` list.
+Instructions guide an AI client; server credentials and authorization still
+enforce access.
+
+`build_failure_prompt` (`GET /api/builds/:id/ai-prompt`) returns a bounded,
+redacted diagnostic prompt for a failed build. It includes current project
+configuration, relevant evidence, and investigation guidance. The build page
+offers the same prompt in a panel collapsed by default, with a copy button and
+a manual-copy fallback. It neither calls an AI provider nor executes a repair.
+
 Deployer includes a focused MCP server that uses the existing authenticated HTTP API. It does not open the database or run deployment logic directly.
 
 Configure a read credential and start the stdio server:

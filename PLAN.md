@@ -4,7 +4,7 @@ Build a reliable foundation, then deliver features that improve everyday deploym
 
 ## 1. Migrate to PostgreSQL
 
-**Status: complete (2026-09-08).** PostgreSQL-backed tests verify import contents, concurrent claims/logs/heartbeats, a disposable files deployment preserving uploads, and restart/authentication recovery. Preservation safety was committed in `5f4f246`. Production cutover has not been performed; the rehearsal and recovery procedure is in `docs/postgresql-migration.md`.
+**Status: complete (2026-09-08).** PostgreSQL-backed tests verify import contents, concurrent claims/logs/heartbeats, a disposable files deployment preserving uploads, and restart/authentication recovery. Preservation safety was committed in `5f4f246`. Production cutover was performed on 2026-10-05 after a real-data rehearsal. All 16 projects, 3 runners, 270 builds, and 253 jobs were verified, and disposable success/failure deployments preserved their data fixture. Daily protected dumps and an isolated restore were verified. The original SQLite file and executable/configuration backups were retained; see `docs/postgresql-migration.md`.
 
 - Add PostgreSQL storage and versioned schema migrations.
 - Provide a repeatable SQLite import preserving project and runner IDs, token hashes, settings, build/job history, annotations, and other persisted records.
@@ -72,10 +72,16 @@ This step can be developed independently of the database migration if earlier fe
 
 ## 6. Add webhooks and notifications
 
+**Status: partially implemented (2026-10-05).** Unlimited personal browser,
+Discord, Slack, and generic webhook channels are implemented with project and
+outcome filters, encrypted endpoints, durable routing/retries, and delivery
+history. GitHub/GitLab deployment triggers remain pending.
+
 - Add authenticated GitHub/GitLab webhook deployment triggers with branch filters and explicit environment mapping.
 - Validate webhook signatures, deduplicate deliveries, and define queue behavior for repeated pushes.
 - Reuse the same version resolution, deployment permissions, and lifecycle as manual/API deployments.
 - Add configurable success/failure notifications, beginning with a generic webhook and extending to selected channels as needed.
+- Support any number of personal channels, including browser alerts while the app is open, Discord, Slack, and generic HTTPS webhooks.
 - Include project, environment, revision, outcome, duration, and a build link while excluding secrets.
 - Ensure notification delivery failures do not change deployment outcomes; use bounded retries and expose delivery status.
 

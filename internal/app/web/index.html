@@ -1,98 +1,107 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Deployer</title>
-    <link rel="stylesheet" href="/static/style.css">
+    {{template "head" "Projects"}}
 </head>
 <body>
-    <nav class="sidebar">
-        <div class="sidebar-logo">Deployer</div>
-        {{with securityStatus}}
-        <div class="server-status {{.Class}}" title="{{.Title}}">
-            <span class="server-status-dot"></span>
-            <span>{{.Label}}</span>
-        </div>
-        {{end}}
-        <a href="/" class="nav-item active">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75V13.5h13.05a.75.75 0 010 1.5H.75a.75.75 0 01-.75-.75V1.75a.75.75 0 011.5 0zm14.28 2.53l-5.25 5.25a.75.75 0 01-1.06 0L7 7.06 4.28 9.78a.75.75 0 01-1.06-1.06l3.25-3.25a.75.75 0 011.06 0L10 8.06l4.72-4.72a.75.75 0 011.06 1.06z"/></svg>
-            Dashboard
-        </a>
-        <a href="/runners" class="nav-item">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.78 6.03l-4.25 4.5a.75.75 0 01-1.06.02L4.22 8.34a.75.75 0 011.06-1.06l1.7 1.64 3.72-3.92a.75.75 0 111.08 1.04z"/></svg>
-            Runners
-        </a>
-        <div class="nav-divider"></div>
-        <a href="/projects/new" class="nav-item nav-item-add">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M7.75 2a.75.75 0 01.75.75V7h4.25a.75.75 0 010 1.5H8.5v4.25a.75.75 0 01-1.5 0V8.5H2.75a.75.75 0 010-1.5H7V2.75A.75.75 0 017.75 2z"/></svg>
-            New Project
-        </a>
-    </nav>
+    {{template "topbar" "projects"}}
 
-    <div class="main-content">
-        <div class="page-header">
-            <h1>Workflow runs</h1>
-        </div>
+    <main class="page">
+        <header class="page-head">
+            <div>
+                <h1>Projects</h1>
+                {{if .Rows}}
+                <p class="readout">
+                    <span><b>{{len .Rows}}</b> {{if eq (len .Rows) 1}}project{{else}}projects{{end}}</span>
+                    {{if .Deploying}}<span class="readout-live"><b>{{.Deploying}}</b> deploying</span>{{end}}
+                    {{if .Failing}}<span class="readout-alarm"><b>{{.Failing}}</b> failing</span>{{else}}<span>all healthy</span>{{end}}
+                </p>
+                {{end}}
+            </div>
+            <div class="page-actions">
+                {{if .Rows}}
+                <label class="filter">
+                    <span class="sr-only">Filter projects</span>
+                    <input type="search" data-filter-target="#project-list" data-filter-empty="#project-filter-empty" placeholder="Filter" aria-keyshortcuts="/">
+                    <kbd>/</kbd>
+                </label>
+                {{end}}
+                <a href="/projects/new" class="btn btn-primary">New project</a>
+            </div>
+        </header>
 
-        {{if not .}}
-        <div class="empty-state">
-            <h2>No projects yet</h2>
-            <p>Add your first project to start deploying.</p>
-            <a href="/projects/new" class="btn btn-primary">+ New Project</a>
-        </div>
+        {{if not .Rows}}
+        <section class="onboarding" aria-labelledby="onboarding-title">
+            <h2 id="onboarding-title">Ship your first app</h2>
+            <p>Deployer builds from a local Git repository and ships to your own servers.</p>
+            <ol class="onboarding-steps">
+                <li>
+                    <h3>Connect a server</h3>
+                    <p>Install a runner on the machine that will host the app, or deploy over SSH.</p>
+                    <a href="/runners" class="btn">Add a runner</a>
+                </li>
+                <li>
+                    <h3>Describe the app</h3>
+                    <p>Point Deployer at the repository and choose Docker Compose or plain files.</p>
+                    <a href="/projects/new" class="btn btn-primary">Create a project</a>
+                </li>
+                <li>
+                    <h3>Deploy</h3>
+                    <p>Review the pre-flight check, then ship. Every deploy is recorded with its log.</p>
+                </li>
+            </ol>
+        </section>
         {{else}}
-        <div class="list-toolbar">
-            <input type="search" class="filter-input" data-filter-target="#project-list" data-filter-empty="#project-filter-empty" placeholder="Search projects" aria-label="Search projects">
-        </div>
-        <div class="workflow-list" id="project-list" data-page-size="20" data-page-empty="#project-filter-empty">
-            {{range .}}
-            <div class="workflow-run {{if .LastBuild}}status-{{.LastBuild.Status}}{{end}}" data-filter-text="{{.Name}} {{.ImageName}} {{if .LastBuild}}{{.LastBuild.Status}} {{.LastBuild.TriggeredBy}} {{.LastBuild.CommitSHA}}{{end}}">
-                <div class="workflow-icon">
-                    {{if .LastBuild}}
-                    {{if eq .LastBuild.Status "success"}}<span class="icon-check">✓</span>{{end}}
-                    {{if eq .LastBuild.Status "failed"}}<span class="icon-x">✕</span>{{end}}
-                    {{if eq .LastBuild.Status "running"}}<span class="icon-running">⟳</span>{{end}}
-                    {{if eq .LastBuild.Status "cancelled"}}<span class="icon-cancelled">⊘</span>{{end}}
-                    {{else}}
-                    <span class="icon-pending">○</span>
-                    {{end}}
-                </div>
-                <div class="workflow-info">
-                    <div class="workflow-title">
-                        <a href="/projects/{{.ID}}">{{.Name}}</a>
-                        {{if .LastBuild}}<span class="workflow-event">{{.LastBuild.TriggeredBy}}</span>{{end}}
+        <section class="board" aria-label="Projects">
+            <div class="board-head" aria-hidden="true">
+                <span>Project</span>
+                <span>Target</span>
+                <span>Recent deploys</span>
+                <span>Latest</span>
+                <span></span>
+            </div>
+            <div id="project-list" data-page-size="25" data-page-empty="#project-filter-empty">
+                {{range .Rows}}
+                <article class="board-row workflow-run" data-href="/projects/{{.ID}}" data-status="{{if .LastBuild}}{{.LastBuild.Status}}{{else}}none{{end}}" data-filter-text="{{.Name}} {{.ImageName}} {{.RunnerName}} {{.SSHHost}} {{if .LastBuild}}{{.LastBuild.Status}} {{.LastBuild.CommitSHA}}{{end}}">
+                    <div class="cell-project">
+                        {{if .LastBuild}}{{template "mark" .LastBuild.Status}}{{else}}{{template "mark" ""}}{{end}}
+                        <div>
+                            <a href="/projects/{{.ID}}" class="row-title">{{.Name}}</a>
+                            <div class="row-sub">{{if .ImageName}}{{.ImageName}}{{else}}{{compactPath .RepoPath}}{{end}}</div>
+                        </div>
                     </div>
-                    <div class="workflow-meta">
-                        <span class="mono">{{.ImageName}}</span>
-                        {{if .LastBuild}}
-                        · <a href="/builds/{{.LastBuild.ID}}" class="workflow-link">Build #{{.LastBuild.ID}}</a>
-                        · <code>{{shortSHA .LastBuild.CommitSHA}}</code>
+                    <div class="cell-target">
+                        {{if .RunnerName}}
+                        <span class="target"><span class="presence{{if .RunnerOnline}} is-online{{end}}" title="{{if .RunnerOnline}}Runner online{{else}}Runner offline{{end}}"></span>{{.RunnerName}}</span>
+                        {{else if .SSHHost}}
+                        <span class="target"><span class="via">ssh</span>{{.SSHHost}}</span>
+                        {{else}}
+                        <span class="target target-local">this server</span>
+                        {{end}}
+                        <div class="row-sub">{{.DeployDir}}</div>
+                    </div>
+                    <div class="cell-track">{{template "track" .History}}</div>
+                    <div class="cell-latest">
+                        {{with .LastBuild}}
+                        <a href="/builds/{{.ID}}" class="latest-link">
+                            <span class="latest-state state-{{.Status}}">{{template "statusword" .Status}}</span>
+                            <span class="latest-meta"><time datetime="{{.StartedAt.Format "2006-01-02T15:04:05Z07:00"}}" title="{{.StartedAt.Format "Jan 2, 2006 15:04"}}">{{.StartedAt.Format "Jan 2, 15:04"}}</time>{{if .CommitSHA}} · <code>{{shortSHA .CommitSHA}}</code>{{end}}</span>
+                        </a>
+                        {{else}}
+                        <span class="latest-state state-none">Never deployed</span>
                         {{end}}
                     </div>
-                </div>
-                <div class="workflow-timing">
-                    {{if .LastBuild}}
-                    <div class="workflow-date" title="{{.LastBuild.StartedAt.Format "2006-01-02 15:04:05"}}">{{.LastBuild.StartedAt.Format "Jan 2, 15:04"}}</div>
-                    <div class="workflow-duration">{{formatDuration .LastBuild.DurationSeconds}}</div>
-                    {{else}}
-                    <div class="workflow-date text-muted">never deployed</div>
-                    {{end}}
-                </div>
-                <div class="workflow-actions">
-	                    <button class="btn btn-deploy-sm" data-deploy-project-id="{{.ID}}" data-project-name="{{.Name}}"
-	                        {{if .LastBuild}}{{if eq .LastBuild.Status "running"}}disabled{{end}}{{end}}
-	                        title="Deploy now">
-                        ▶
-                    </button>
-                </div>
+                    <div class="cell-action">
+                        <button type="button" class="btn btn-deploy btn-sm" data-deploy-project-id="{{.ID}}" data-project-name="{{.Name}}" {{if .LastBuild}}{{if eq .LastBuild.Status "running"}}disabled title="A deploy is already running"{{end}}{{end}}>Deploy</button>
+                    </div>
+                </article>
+                {{end}}
             </div>
-            {{end}}
-        </div>
-        <div class="filter-empty" id="project-filter-empty" hidden>No matching projects.</div>
+        </section>
+        <p class="filter-empty" id="project-filter-empty" hidden>No projects match that filter.</p>
         {{end}}
-    </div>
+    </main>
 
-    <script src="/static/app.js"></script>
+    {{template "scripts"}}
 </body>
 </html>
