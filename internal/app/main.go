@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
-	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
@@ -91,6 +90,7 @@ func Run() {
 	// Parse templates
 	var err error
 	tmpl, err = template.New("").Funcs(template.FuncMap{
+		"publicAssetURL": publicAssetURL,
 		"json": func(v interface{}) template.JS {
 			b, _ := json.Marshal(v)
 			return template.JS(b)
@@ -191,16 +191,8 @@ func Run() {
 		logFatal("startup_error", "failed to parse templates", err, nil)
 	}
 
-	// Static files — no-cache headers for development
-	staticFS, _ := fs.Sub(webFS, "web/static")
-	staticHandler := http.StripPrefix("/static/", http.FileServer(http.FS(staticFS)))
 	mux := http.NewServeMux()
-	mux.Handle("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		w.Header().Set("Pragma", "no-cache")
-		w.Header().Set("Expires", "0")
-		staticHandler.ServeHTTP(w, r)
-	}))
+	registerWebAssets(mux)
 
 	// Download endpoint — serve the deployer binary itself
 	mux.HandleFunc("/download/deployer", handleDownloadBinary)
@@ -335,12 +327,17 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	projects, err := listProjectsWithLastBuild()
+	projects, err := listProjects()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	tmpl.ExecuteTemplate(w, "index.html", newDashboardView(projects))
+	view, err := newDashboardView(projects)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	tmpl.ExecuteTemplate(w, "index.html", view)
 }
 
 type dashboardRow struct {
@@ -359,20 +356,35 @@ type dashboardView struct {
 
 // newDashboardView adds the per-project deploy track and the target runner
 // so the dashboard can answer "what is live and where" without a click.
-func newDashboardView(projects []Project) dashboardView {
-	runners, _ := listRunners()
+func newDashboardView(projects []Project) (dashboardView, error) {
+	runners, err := listRunners()
+	if err != nil {
+		return dashboardView{}, err
+	}
+	history, err := listRecentProjectBuilds(24)
+	if err != nil {
+		return dashboardView{}, err
+	}
 	byID := make(map[int64]Runner, len(runners))
 	for _, runner := range runners {
 		byID[runner.ID] = runner
 	}
 	view := dashboardView{Rows: make([]dashboardRow, 0, len(projects))}
 	for _, project := range projects {
+		builds := history[project.ID]
+		if len(builds) > 0 {
+			project.LastBuild = &builds[0]
+		}
 		row := dashboardRow{Project: project}
 		if runner, ok := byID[project.RunnerID]; ok {
 			row.RunnerName = runner.Name
 			row.RunnerOnline = runner.Status == "online"
 		}
-		row.History, _ = newProjectBuildHistory(project.ID, 24)
+		points := make([]buildHistoryPoint, 0, len(builds))
+		for _, build := range builds {
+			points = append(points, buildHistoryPointFromBuild(build, project.Name))
+		}
+		row.History = newBuildHistorySummary("project", project.ID, project.Name, points)
 		switch {
 		case project.LastBuild == nil:
 			view.Idle++
@@ -383,7 +395,7 @@ func newDashboardView(projects []Project) dashboardView {
 		}
 		view.Rows = append(view.Rows, row)
 	}
-	return view
+	return view, nil
 }
 
 func handleProjectPage(w http.ResponseWriter, r *http.Request) {
