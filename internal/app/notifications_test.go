@@ -254,7 +254,7 @@ type notificationRoundTrip func(*http.Request) (*http.Response, error)
 
 func (f notificationRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func TestNotificationProvidersPreventMentionsAndBoundRetries(t *testing.T) {
+func TestNotificationProvidersPreventMentions(t *testing.T) {
 	raw := json.RawMessage(`{"title":"@everyone deploy failed","build_url":"https://example.com/builds/1"}`)
 	discord, err := notificationPayload("discord", raw)
 	if err != nil {

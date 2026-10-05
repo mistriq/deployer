@@ -15,11 +15,15 @@ by the browser, which does not guarantee the operating system displayed a banner
 
 For Discord and Slack, paste an existing incoming webhook URL. URLs are encrypted
 at rest and never returned by list or history endpoints. On edit, leaving the URL
-blank preserves it. Discord mentions are disabled; Slack uses plain-text blocks.
+blank preserves it. Discord uses status-colored embeds with project, build,
+revision, duration, trigger, completion time, and a clickable title. Success is
+green, failure red, cancellation amber, and connection tests blue. Slack uses a
+heading, compact detail fields, and a build link. Discord mentions are disabled;
+Slack project values are plain text so they cannot trigger mentions or formatting.
 See the official [Discord webhook documentation](https://docs.discord.com/developers/resources/webhook)
 and [Slack webhook setup](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/).
 Generic webhooks receive JSON with project/build IDs, name, revision, outcome,
-trigger, duration, and a build URL. Logs, build arguments, and hook contents are
+trigger, duration, completion time, and a build URL. Logs, build arguments, and hook contents are
 excluded. Internal/private destinations and redirects are rejected.
 
 The PostgreSQL queue survives server restarts. Terminal build routing is marked

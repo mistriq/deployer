@@ -180,10 +180,14 @@ func handleNotificationChannels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var deliveryID int64
+		testPayload, _ := json.Marshal(map[string]interface{}{
+			"title": "Deployer test notification", "status": "test", "project_name": "Notification test",
+			"build_url": strings.TrimRight(appConfig.PublicURL, "/") + "/notifications",
+		})
 		err := db.QueryRow(`INSERT INTO notification_deliveries(channel_id,payload,status)
 		 SELECT id,?, CASE WHEN kind='browser' THEN 'browser_pending' ELSE 'queued' END
 		 FROM notification_channels WHERE id=? AND owner_id=? AND enabled=TRUE RETURNING id`,
-			`{"title":"Deployer test notification","status":"test","project_name":"Notification test","build_url":"/notifications"}`, id, owner).Scan(&deliveryID)
+			string(testPayload), id, owner).Scan(&deliveryID)
 		if errors.Is(err, sql.ErrNoRows) {
 			jsonErrorCode(w, errCodeNotFound, "enabled channel not found", http.StatusNotFound)
 			return
@@ -438,11 +442,11 @@ func queueBuildNotifications(ctx context.Context) error {
 		return err
 	}
 	baseURL := strings.TrimRight(appConfig.PublicURL, "/")
-	payload, _ := json.Marshal(map[string]interface{}{"title": boundedAIText(name, 160) + ": " + status, "project_id": projectID, "project_name": boundedAIText(name, 160), "build_id": id, "status": status, "commit_sha": commit, "triggered_by": trigger, "duration_seconds": seconds.Int64, "build_url": baseURL + "/builds/" + strconv.FormatInt(id, 10)})
 	when := time.Now().UTC()
 	if finished.Valid {
 		when = finished.Time
 	}
+	payload, _ := json.Marshal(map[string]interface{}{"title": boundedAIText(name, 160) + ": " + status, "project_id": projectID, "project_name": boundedAIText(name, 160), "build_id": id, "status": status, "commit_sha": commit, "triggered_by": trigger, "duration_seconds": seconds.Int64, "finished_at": when.UTC().Format(time.RFC3339), "build_url": baseURL + "/builds/" + strconv.FormatInt(id, 10)})
 	_, err = tx.ExecContext(ctx, `INSERT INTO notification_deliveries(channel_id,build_id,payload,status)
 	 SELECT id,?,?,CASE WHEN kind='browser' THEN 'browser_pending' ELSE 'queued' END FROM notification_channels
 	 WHERE enabled=TRUE AND created_at<=? AND jsonb_exists(events,?) AND (jsonb_array_length(project_ids)=0 OR project_ids @> jsonb_build_array(?::bigint))
@@ -530,33 +534,6 @@ func notificationHTTPClient() *http.Client {
 		return nil, errors.New("could not connect to webhook host")
 	}
 	return &http.Client{Transport: transport, Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("webhook redirects are disabled") }}
-}
-
-func notificationPayload(kind string, raw json.RawMessage) ([]byte, error) {
-	if kind == "webhook" {
-		return raw, nil
-	}
-	var p struct {
-		Title     string `json:"title"`
-		BuildURL  string `json:"build_url"`
-		CommitSHA string `json:"commit_sha"`
-		Duration  int64  `json:"duration_seconds"`
-	}
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return nil, err
-	}
-	text := p.Title
-	if p.CommitSHA != "" {
-		text += "\nRevision: " + boundedAIText(p.CommitSHA, 128)
-	}
-	if p.Duration > 0 {
-		text += fmt.Sprintf("\nDuration: %ds", p.Duration)
-	}
-	if kind == "discord" {
-		return json.Marshal(map[string]interface{}{"content": text + "\n" + p.BuildURL, "allowed_mentions": map[string]interface{}{"parse": []string{}}})
-	}
-	text += "\n" + p.BuildURL
-	return json.Marshal(map[string]interface{}{"text": "Deployer notification", "unfurl_links": false, "unfurl_media": false, "blocks": []interface{}{map[string]interface{}{"type": "section", "text": map[string]interface{}{"type": "plain_text", "text": text}}}})
 }
 
 func deliverNotification(ctx context.Context, client *http.Client, d *notificationDelivery) (int, error) {
