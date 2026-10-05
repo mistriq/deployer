@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notifications — Deployer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav class="sidebar" aria-label="Main navigation">
+        <div class="sidebar-logo">Deployer</div>
+        <a href="/" class="nav-item">Dashboard</a>
+        <a href="/runners" class="nav-item">Runners</a>
+        <a href="/notifications" class="nav-item active" aria-current="page">Notifications</a>
+        {{if logoutURL}}<a href="{{logoutURL}}" class="nav-item">Sign out</a>{{end}}
+    </nav>
+    <main class="main-content notifications-page">
+        {{template "mobile_navigation" .}}
+        <div class="page-header">
+            <div>
+                <h1>Notifications</h1>
+                <p class="page-subtitle">Your channels and delivery history. Add as many channels as you need.</p>
+            </div>
+            <button type="button" class="btn btn-primary" id="add-notification-channel">Add channel</button>
+        </div>
+        <p id="notification-settings-status" role="status" aria-live="polite">Loading your channels…</p>
+        <section class="notification-editor" id="notification-editor" hidden aria-labelledby="channel-editor-title">
+            <h2 id="channel-editor-title">Add notification channel</h2>
+            <form id="notification-channel-form">
+                <input type="hidden" name="id">
+                <div class="notification-fields">
+                    <div class="form-group"><label for="channel-name">Name</label><input type="text" id="channel-name" name="name" required maxlength="160" placeholder="e.g. Team deploy alerts"></div>
+                    <div class="form-group"><label for="channel-kind">Channel</label><select id="channel-kind" name="kind"><option value="browser">This browser</option><option value="discord">Discord webhook</option><option value="slack">Slack webhook</option><option value="webhook">Generic webhook</option></select></div>
+                </div>
+                <div class="form-group" id="channel-endpoint-field" hidden>
+                    <label for="channel-endpoint">Webhook URL</label>
+                    <input id="channel-endpoint" name="endpoint" type="url" autocomplete="off" placeholder="https://…">
+                    <p class="field-help" id="channel-endpoint-help">The URL is stored encrypted and never shown again.</p>
+                </div>
+                <p id="browser-channel-help" class="field-help">Alerts appear while Deployer is open in this browser. Saving a browser channel requests notification permission.</p>
+                <fieldset class="notification-options">
+                    <legend>Notify me when a build…</legend>
+                    <label><input type="checkbox" name="events" value="failed" checked> Fails</label>
+                    <label><input type="checkbox" name="events" value="success"> Succeeds</label>
+                    <label><input type="checkbox" name="events" value="cancelled"> Is cancelled</label>
+                </fieldset>
+                <fieldset class="notification-options notification-projects">
+                    <legend>Projects</legend>
+                    <p class="field-help">Leave all unchecked to receive alerts for every project, including new projects.</p>
+                    {{range .Projects}}<label><input type="checkbox" name="project_ids" value="{{.ID}}"> {{.Name}}</label>{{end}}
+                </fieldset>
+                <label class="notification-checkbox"><input type="checkbox" name="enabled" checked> Channel enabled</label>
+                <p id="notification-save-status" role="status" aria-live="polite"></p>
+                <div class="header-actions">
+                    <button type="submit" class="btn btn-primary">Save channel</button>
+                    <button type="button" class="btn" id="cancel-channel-editor">Cancel</button>
+                </div>
+            </form>
+        </section>
+        <div id="notification-channels" class="notification-channels"></div>
+    </main>
+    <script src="/static/app.js"></script>
+    <script src="/static/notifications.js"></script>
+</body>
+</html>

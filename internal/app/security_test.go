@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -44,6 +45,51 @@ func TestCSRFMiddlewareRequiresHeaderForBrowserWrites(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("expected CSRF header to allow request, got %d", rec.Code)
+	}
+}
+
+func TestMCPBearerScopesAndCSRFBYPASS(t *testing.T) {
+	t.Setenv("DEPLOYER_MCP_READ_TOKEN", "read-only-secret")
+	t.Setenv("DEPLOYER_MCP_WRITE_TOKEN", "write-secret")
+	handler := wrapHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	request := func(method, token string) int {
+		req := httptest.NewRequest(method, "/api/projects/1/deploy", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if got := request(http.MethodGet, "read-only-secret"); got != http.StatusNoContent {
+		t.Fatalf("read status=%d", got)
+	}
+	if got := request(http.MethodPost, "read-only-secret"); got != http.StatusForbidden {
+		t.Fatalf("read credential write status=%d", got)
+	}
+	if got := request(http.MethodPost, "write-secret"); got != http.StatusNoContent {
+		t.Fatalf("write credential status=%d", got)
+	}
+	if got := request(http.MethodGet, "wrong-secret"); got != http.StatusUnauthorized {
+		t.Fatalf("invalid credential status=%d", got)
+	}
+	if got := request(http.MethodPost, ""); got != http.StatusForbidden {
+		t.Fatalf("browser request without CSRF status=%d", got)
+	}
+}
+
+func TestMCPBearerReadResponseRedactsProjectSecrets(t *testing.T) {
+	t.Setenv("DEPLOYER_MCP_READ_TOKEN", "read-only-secret")
+	handler := wrapHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"build_args":{"TOKEN":"plain-secret"},"post_deploy":"TOKEN=plain-secret ./run"}`))
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/projects/1", nil)
+	req.Header.Set("Authorization", "Bearer read-only-secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "plain-secret") || !strings.Contains(rec.Body.String(), "[REDACTED]") {
+		t.Fatalf("unsafe machine response: %s", rec.Body.String())
 	}
 }
 

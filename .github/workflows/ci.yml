@@ -7,8 +7,23 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: deployer
+          POSTGRES_PASSWORD: deployer_test
+          POSTGRES_DB: deployer_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deployer -d deployer_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       GOVULNCHECK_VERSION: v1.3.0
+      DEPLOYER_TEST_POSTGRES_URL: postgres://deployer:deployer_test@127.0.0.1:5432/deployer_test?sslmode=disable
 
     steps:
       - name: Check out repository
@@ -17,7 +32,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.4'
+          go-version: '1.26.6'
           cache: true
 
       - name: Format check

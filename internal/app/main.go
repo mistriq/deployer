@@ -37,18 +37,30 @@ func Run() {
 	}
 
 	appConfig = loadConfig()
+	if appConfig.NotificationKey != "" {
+		if _, err := notificationCipher(); err != nil {
+			logFatal("config_error", "DEPLOYER_NOTIFICATION_KEY must be base64 encoding of 32 bytes", nil, nil)
+		}
+	}
 	configureArtifactStorage(appConfig)
 	if err := ensureRuntimeDirs(appConfig); err != nil {
 		logFatal("startup_error", "failed to prepare runtime directories", err, nil)
 	}
 
-	// Init database
-	if err := initDB(appConfig.DBPath); err != nil {
+	if appConfig.DatabaseURL == "" {
+		logFatal("config_error", "DEPLOYER_DATABASE_URL is required; see docs/postgresql-migration.md for SQLite migration", nil, nil)
+	}
+	// PostgreSQL is the supported runtime database. SQLite is retained only for
+	// tests and as a read-only migration source.
+	if err := initPostgres(appConfig.DatabaseURL); err != nil {
 		logFatal("startup_error", "failed to init database", err, map[string]interface{}{
-			"db_path": appConfig.DBPath,
+			"database": "postgres",
 		})
 	}
 	defer db.Close()
+	if err := ensureRunnerOperationsSchema(); err != nil {
+		logFatal("startup_error", "failed to prepare runner operations", err, nil)
+	}
 	cleanupRuntimeState(appConfig)
 	if err := seedDemoDataIfEnabled(appConfig); err != nil {
 		logFatal("startup_error", "failed to seed demo data", err, nil)
@@ -57,6 +69,10 @@ func Run() {
 	// Init SSE broker and builder
 	broker = NewSSEBroker()
 	builder = NewBuilder(broker)
+	notificationCtx, stopNotifications := context.WithCancel(context.Background())
+	notificationsDone := make(chan struct{})
+	defer func() { stopNotifications(); <-notificationsDone }()
+	go func() { defer close(notificationsDone); runNotificationWorker(notificationCtx) }()
 
 	// Background: mark stale runners as offline
 	go func() {
@@ -132,7 +148,18 @@ func Run() {
 		"securityStatus": func() SecurityStatus {
 			return securityStatus()
 		},
+		"logoutURL":   func() string { return appConfig.LogoutURL },
 		"compactPath": compactPath,
+		"formatBytes": func(value int64) string {
+			units := []string{"B", "KB", "MB", "GB", "TB"}
+			n := float64(value)
+			i := 0
+			for n >= 1024 && i < len(units)-1 {
+				n /= 1024
+				i++
+			}
+			return fmt.Sprintf("%.1f %s", n, units[i])
+		},
 	}).ParseFS(webFS, "web/*.html")
 	if err != nil {
 		logFatal("startup_error", "failed to parse templates", err, nil)
@@ -152,6 +179,7 @@ func Run() {
 	// Download endpoint — serve the deployer binary itself
 	mux.HandleFunc("/download/deployer", handleDownloadBinary)
 	mux.HandleFunc("/api/capabilities", handleAPICapabilities)
+	mux.HandleFunc("/api/ai/context", handleAIContext)
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		response := map[string]string{"version": buildVersion}
 		if checksum, err := currentBinaryChecksum(); err == nil {
@@ -168,6 +196,13 @@ func Run() {
 	mux.HandleFunc("/builds/", handleBuildPage)
 	mux.HandleFunc("/runners", handleRunnersPage)
 	mux.HandleFunc("/runners/", handleRunnersPage)
+	mux.HandleFunc("/notifications", handleNotificationsPage)
+	mux.HandleFunc("/signed-out", func(w http.ResponseWriter, r *http.Request) {
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		tmpl.ExecuteTemplate(w, "signed_out.html", nil)
+	})
 
 	// API routes
 	mux.HandleFunc("/api/projects", handleAPIProjects)
@@ -175,9 +210,16 @@ func Run() {
 	mux.HandleFunc("/api/builds/", handleAPIBuild)
 	mux.HandleFunc("/api/runners", handleAPIRunners)
 	mux.HandleFunc("/api/runners/", handleAPIRunner)
+	mux.HandleFunc("/api/runner-operations/", handleAPIRunnerOperation)
+	mux.HandleFunc("/api/notifications/channels", handleNotificationChannels)
+	mux.HandleFunc("/api/notifications/channels/", handleNotificationChannels)
+	mux.HandleFunc("/api/notifications/inbox", handleBrowserNotificationInbox)
+	mux.HandleFunc("/api/notifications/ack", handleBrowserNotificationAck)
 
 	// Agent API routes
 	mux.HandleFunc("/api/agent/poll", handleAgentPoll)
+	mux.HandleFunc("/api/agent/operations/poll", handleAgentOperationPoll)
+	mux.HandleFunc("/api/agent/operations/complete/", handleAgentOperationComplete)
 	mux.HandleFunc("/api/agent/artifact/", handleAgentArtifact)
 	mux.HandleFunc("/api/agent/snapshot/", handleAgentSnapshotUpload)
 	mux.HandleFunc("/api/agent/log/", handleAgentLog)
@@ -539,7 +581,9 @@ func handleAPIProject(w http.ResponseWriter, r *http.Request) {
 			jsonErrorCode(w, errCodeProjectNotFound, "project not found", http.StatusNotFound)
 			return
 		}
-		buildID, err := builder.Deploy(project, "manual")
+		buildID, err := mcpIdempotentBuild("deploy", project, r.Header.Get("Idempotency-Key"), func(triggeredBy string) (int64, error) {
+			return builder.Deploy(project, triggeredBy)
+		})
 		if err != nil {
 			jsonErrorCode(w, deployConflictErrorCode(err), err.Error(), http.StatusConflict)
 			return
@@ -558,7 +602,9 @@ func handleAPIProject(w http.ResponseWriter, r *http.Request) {
 			jsonErrorCode(w, errCodeProjectNotFound, "project not found", http.StatusNotFound)
 			return
 		}
-		buildID, err := builder.FetchRemoteSnapshot(project, "snapshot")
+		buildID, err := mcpIdempotentBuild("snapshot", project, r.Header.Get("Idempotency-Key"), func(triggeredBy string) (int64, error) {
+			return builder.FetchRemoteSnapshot(project, triggeredBy)
+		})
 		if err != nil {
 			jsonErrorCode(w, deployConflictErrorCode(err), err.Error(), http.StatusConflict)
 			return
@@ -633,6 +679,15 @@ func handleAPIBuild(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		handleAPIBuildEvents(w, r, id)
+		return
+	}
+
+	// /api/builds/:id/ai-prompt
+	if suffix == "ai-prompt" {
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		handleBuildAIPrompt(w, r, id)
 		return
 	}
 

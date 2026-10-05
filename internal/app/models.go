@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
@@ -95,7 +96,7 @@ type BuildAnnotation struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-var db *sql.DB
+var db *database
 
 const sqliteLegacyTimeFormat = "2006-01-02 15:04:05"
 const maxPersistedBuildLogBytes = 4 << 20
@@ -161,10 +162,11 @@ func formatSQLiteTime(t time.Time) string {
 
 func initDB(path string) error {
 	var err error
-	db, err = sql.Open("sqlite", path)
+	sqlDB, err := sql.Open("sqlite", path)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
+	db = &database{DB: sqlDB, dialect: "sqlite"}
 
 	// Enable WAL mode for better concurrent access
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
@@ -259,6 +261,43 @@ func initDB(path string) error {
 
 	// Cleanup: local server-side builds cannot be resumed after restart, but
 	// agent-backed jobs keep enough persisted state for agents to reconnect.
+	if err := cleanupDatabaseRuntimeState(); err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_running_per_project ON builds(project_id) WHERE status='running'`); err != nil {
+		return fmt.Errorf("create running build guard: %w", err)
+	}
+
+	return nil
+}
+
+func initPostgres(databaseURL string) error {
+	sqlDB, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return fmt.Errorf("open PostgreSQL: %w", err)
+	}
+	sqlDB.SetMaxOpenConns(20)
+	sqlDB.SetMaxIdleConns(5)
+	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
+	db = &database{DB: sqlDB, dialect: "postgres"}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return fmt.Errorf("connect PostgreSQL: %w", err)
+	}
+	if err := applyPostgresMigrations(); err != nil {
+		db.Close()
+		return err
+	}
+	if err := migratePlaintextRunnerTokens(); err != nil {
+		db.Close()
+		return err
+	}
+	return cleanupDatabaseRuntimeState()
+}
+
+func cleanupDatabaseRuntimeState() error {
 	res, err := db.Exec(`UPDATE builds
 		SET status='cancelled', error_message='server restarted', error_code=?
 		WHERE status='running'
@@ -266,22 +305,14 @@ func initDB(path string) error {
 	if err != nil {
 		return fmt.Errorf("cleanup running builds: %w", err)
 	}
-	if res != nil {
-		if n, _ := res.RowsAffected(); n > 0 {
-			logStructured("info", "orphaned_builds_cleaned", map[string]interface{}{"count": n})
-		}
+	if n, _ := res.RowsAffected(); n > 0 {
+		logStructured("info", "orphaned_builds_cleaned", map[string]interface{}{"count": n})
 	}
-	if _, err := db.Exec(`UPDATE jobs
-		SET status='failed', error_code=?, completed_at=?
+	if _, err := db.Exec(`UPDATE jobs SET status='failed', error_code=?, completed_at=?
 		WHERE status IN ('pending', 'running')
 		  AND build_id NOT IN (SELECT id FROM builds WHERE status='running')`, runtimeErrServerRestarted, formatSQLiteTime(time.Now())); err != nil {
 		return fmt.Errorf("cleanup unfinished jobs: %w", err)
 	}
-
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_running_per_project ON builds(project_id) WHERE status='running'`); err != nil {
-		return fmt.Errorf("create running build guard: %w", err)
-	}
-
 	return nil
 }
 
@@ -665,13 +696,12 @@ func createProject(p *Project) error {
 	argsJSON, _ := json.Marshal(p.BuildArgs)
 
 	now := time.Now()
-	res, err := db.Exec(`INSERT INTO projects (name, repo_path, dockerfile_path, compose_file, image_name, ssh_host, deploy_dir, health_url, health_container, build_args, compose_services, git_pull_before_build, runner_id, deploy_mode, post_deploy, permissions, preserve, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	query := `INSERT INTO projects (name, repo_path, dockerfile_path, compose_file, image_name, ssh_host, deploy_dir, health_url, health_container, build_args, compose_services, git_pull_before_build, runner_id, deploy_mode, post_deploy, permissions, preserve, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	args := []any{
 		p.Name, p.RepoPath, p.DockerfilePath, p.ComposeFile, p.ImageName, p.SSHHost, p.DeployDir, p.HealthURL, p.HealthContainer, string(argsJSON), p.ComposeServices, p.GitPullBeforeBuild, p.RunnerID, p.DeployMode, p.PostDeploy, p.Permissions, p.Preserve, formatSQLiteTime(now),
-	)
-	if err != nil {
-		return err
 	}
-	p.ID, err = res.LastInsertId()
+	var err error
+	p.ID, err = insertID(query, args...)
 	if err != nil {
 		return err
 	}
@@ -774,13 +804,12 @@ func createBuild(projectID int64, triggeredBy string) (*Build, error) {
 		StartedAt:   time.Now(),
 		TriggeredBy: triggeredBy,
 	}
-	res, err := db.Exec(`INSERT INTO builds (project_id, status, started_at, triggered_by) VALUES (?, ?, ?, ?)`,
-		b.ProjectID, b.Status, formatSQLiteTime(b.StartedAt), b.TriggeredBy,
-	)
-	if err != nil {
-		return nil, err
+	var err error
+	query := `INSERT INTO builds (project_id, status, started_at, triggered_by) VALUES (?, ?, ?, ?)`
+	if db.dialect == "postgres" {
+		query = `INSERT INTO builds (project_id, status, started_at, triggered_by, notifications_recorded) VALUES (?, ?, ?, ?, FALSE)`
 	}
-	b.ID, err = res.LastInsertId()
+	b.ID, err = insertID(query, b.ProjectID, b.Status, formatSQLiteTime(b.StartedAt), b.TriggeredBy)
 	if err != nil {
 		return nil, err
 	}
@@ -806,6 +835,18 @@ func trimBuildLog(logText string) string {
 		return logText
 	}
 	return logText[len(logText)-maxPersistedBuildLogBytes:]
+}
+
+func appendBuildLog(buildID int64, text string) error {
+	if text == "" {
+		return nil
+	}
+	if db.dialect == "postgres" {
+		_, err := db.Exec(`UPDATE builds SET log=RIGHT(log || ?, ?) WHERE id=?`, text, maxPersistedBuildLogBytes, buildID)
+		return err
+	}
+	_, err := db.Exec(`UPDATE builds SET log=substr(log || ?, -?) WHERE id=?`, text, maxPersistedBuildLogBytes, buildID)
+	return err
 }
 
 func normalizedBuildErrorCode(status, message, existing string) string {
@@ -865,8 +906,14 @@ func cleanupOldBuildLogs(retentionDays int) (int64, error) {
 	if retentionDays <= 0 {
 		return 0, nil
 	}
-	cutoffModifier := fmt.Sprintf("-%d days", retentionDays)
-	res, err := db.Exec(`UPDATE builds SET log='' WHERE log <> '' AND finished_at IS NOT NULL AND datetime(finished_at) < datetime('now', ?)`, cutoffModifier)
+	var res sql.Result
+	var err error
+	if db.dialect == "postgres" {
+		res, err = db.Exec(`UPDATE builds SET log='' WHERE log <> '' AND finished_at IS NOT NULL AND finished_at < ?`, time.Now().UTC().AddDate(0, 0, -retentionDays))
+	} else {
+		cutoffModifier := fmt.Sprintf("-%d days", retentionDays)
+		res, err = db.Exec(`UPDATE builds SET log='' WHERE log <> '' AND finished_at IS NOT NULL AND datetime(finished_at) < datetime('now', ?)`, cutoffModifier)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -875,11 +922,15 @@ func cleanupOldBuildLogs(retentionDays int) (int64, error) {
 
 func cancelRunningBuild(buildID int64, message string) (bool, error) {
 	now := formatSQLiteTime(time.Now())
+	durationExpr := "CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER)"
+	if db.dialect == "postgres" {
+		durationExpr = "CAST(EXTRACT(EPOCH FROM (?::timestamptz - started_at)) AS INTEGER)"
+	}
 	res, err := db.Exec(`
 		UPDATE builds
 		SET status='cancelled',
 			finished_at=?,
-			duration_seconds=CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER),
+			duration_seconds=`+durationExpr+`,
 			error_message=?,
 			error_code=?
 		WHERE id=? AND status='running'`,
@@ -998,11 +1049,7 @@ func createBuildAnnotation(buildID int64, note string) (*BuildAnnotation, error)
 		return nil, fmt.Errorf("note is too large")
 	}
 	now := time.Now().UTC()
-	res, err := db.Exec(`INSERT INTO build_annotations (build_id, note, created_at) VALUES (?, ?, ?)`, buildID, note, formatSQLiteTime(now))
-	if err != nil {
-		return nil, err
-	}
-	id, err := res.LastInsertId()
+	id, err := insertID(`INSERT INTO build_annotations (build_id, note, created_at) VALUES (?, ?, ?)`, buildID, note, formatSQLiteTime(now))
 	if err != nil {
 		return nil, err
 	}
@@ -1079,13 +1126,8 @@ func createRunner(r *Runner) error {
 	}
 	tokenHash := hashToken(r.Token)
 	now := time.Now()
-	res, err := db.Exec(`INSERT INTO runners (name, token, labels, created_at) VALUES (?, ?, ?, ?)`,
-		r.Name, tokenHash, r.Labels, formatSQLiteTime(now),
-	)
-	if err != nil {
-		return err
-	}
-	r.ID, err = res.LastInsertId()
+	var err error
+	r.ID, err = insertID(`INSERT INTO runners (name, token, labels, created_at) VALUES (?, ?, ?, ?)`, r.Name, tokenHash, r.Labels, formatSQLiteTime(now))
 	if err != nil {
 		return err
 	}
@@ -1204,7 +1246,11 @@ func updateRunnerHeartbeatContext(ctx context.Context, id int64) error {
 }
 
 func markStaleRunners() error {
-	_, err := db.Exec(`UPDATE runners SET status='offline' WHERE datetime(last_seen) < datetime('now', '-60 seconds') AND status='online'`)
+	query := `UPDATE runners SET status='offline' WHERE datetime(last_seen) < datetime('now', '-60 seconds') AND status='online'`
+	if db.dialect == "postgres" {
+		query = `UPDATE runners SET status='offline' WHERE last_seen < CURRENT_TIMESTAMP - INTERVAL '60 seconds' AND status='online'`
+	}
+	_, err := db.Exec(query)
 	return err
 }
 
@@ -1232,13 +1278,10 @@ func createJob(buildID, runnerID int64, project *Project, artifactPath string) (
 		Preserve:        project.Preserve,
 	}
 	now := time.Now()
-	res, err := db.Exec(`INSERT INTO jobs (build_id, runner_id, status, artifact_path, deploy_dir, compose_file, compose_services, image_name, health_url, health_container, mode, post_deploy, permissions, preserve, error_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	var err error
+	j.ID, err = insertID(`INSERT INTO jobs (build_id, runner_id, status, artifact_path, deploy_dir, compose_file, compose_services, image_name, health_url, health_container, mode, post_deploy, permissions, preserve, error_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		j.BuildID, j.RunnerID, j.Status, j.ArtifactPath, j.DeployDir, j.ComposeFile, j.ComposeServices, j.ImageName, j.HealthURL, j.HealthContainer, j.Mode, j.PostDeploy, j.Permissions, j.Preserve, j.ErrorCode, formatSQLiteTime(now),
 	)
-	if err != nil {
-		return nil, err
-	}
-	j.ID, err = res.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
@@ -1257,13 +1300,10 @@ func createSnapshotJob(buildID, runnerID int64, project *Project, artifactPath s
 		Mode:         "snapshot",
 	}
 	now := time.Now()
-	res, err := db.Exec(`INSERT INTO jobs (build_id, runner_id, status, artifact_path, deploy_dir, image_name, mode, error_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	var err error
+	j.ID, err = insertID(`INSERT INTO jobs (build_id, runner_id, status, artifact_path, deploy_dir, image_name, mode, error_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		j.BuildID, j.RunnerID, j.Status, j.ArtifactPath, j.DeployDir, j.ImageName, j.Mode, j.ErrorCode, formatSQLiteTime(now),
 	)
-	if err != nil {
-		return nil, err
-	}
-	j.ID, err = res.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
@@ -1294,7 +1334,11 @@ func claimPendingJobContext(ctx context.Context, runnerID int64) (*Job, error) {
 	defer tx.Rollback()
 
 	var jobID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM jobs WHERE runner_id=? AND status='pending' ORDER BY id ASC LIMIT 1`, runnerID).Scan(&jobID); err != nil {
+	claimQuery := `SELECT id FROM jobs WHERE runner_id=? AND status='pending' ORDER BY id ASC LIMIT 1`
+	if db.dialect == "postgres" {
+		claimQuery += ` FOR UPDATE SKIP LOCKED`
+	}
+	if err := tx.QueryRowContext(ctx, claimQuery, runnerID).Scan(&jobID); err != nil {
 		return nil, err
 	}
 

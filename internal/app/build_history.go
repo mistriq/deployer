@@ -103,6 +103,10 @@ func listRunnerBuildHistoryPoints(runnerID int64, limit int) ([]buildHistoryPoin
 	if limit <= 0 {
 		limit = buildHistoryLimit
 	}
+	orderExpr := "datetime(b.started_at)"
+	if db.dialect == "postgres" {
+		orderExpr = "b.started_at"
+	}
 	rows, err := db.Query(`
 		SELECT b.id, b.project_id, p.name, b.status, b.commit_sha, b.started_at,
 		       b.finished_at, b.duration_seconds, b.triggered_by
@@ -110,7 +114,7 @@ func listRunnerBuildHistoryPoints(runnerID int64, limit int) ([]buildHistoryPoin
 		JOIN builds b ON b.id = j.build_id
 		JOIN projects p ON p.id = b.project_id
 		WHERE j.runner_id=?
-		ORDER BY datetime(b.started_at) DESC, b.id DESC
+		ORDER BY `+orderExpr+` DESC, b.id DESC
 		LIMIT ?`, runnerID, limit)
 	if err != nil {
 		return nil, err

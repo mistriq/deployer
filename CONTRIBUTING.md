@@ -11,10 +11,10 @@ go test -race ./...
 go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
 ```
 
-Use a temporary database while developing:
+Use a disposable PostgreSQL database while developing:
 
 ```bash
-DEPLOYER_DB_PATH=/tmp/deployer-dev.db go run ./cmd/deployer
+DEPLOYER_DATABASE_URL='postgres://deployer:password@127.0.0.1:5432/deployer_dev?sslmode=disable' go run ./cmd/deployer
 ```
 
 ## Pull Requests

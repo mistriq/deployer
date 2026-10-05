@@ -10,6 +10,7 @@ import (
 
 type AppConfig struct {
 	Addr                   string
+	DatabaseURL            string
 	DBPath                 string
 	PublicURL              string
 	ArtifactDir            string
@@ -24,6 +25,8 @@ type AppConfig struct {
 	SSHTimeout             time.Duration
 	HealthCheckTimeout     time.Duration
 	DemoMode               bool
+	NotificationKey        string
+	LogoutURL              string
 }
 
 type SecurityStatus struct {
@@ -43,6 +46,7 @@ func securityStatus() SecurityStatus {
 func loadConfig() AppConfig {
 	cfg := AppConfig{
 		Addr:                   getenvDefault("DEPLOYER_ADDR", "127.0.0.1:9090"),
+		DatabaseURL:            strings.TrimSpace(os.Getenv("DEPLOYER_DATABASE_URL")),
 		DBPath:                 getenvDefault("DEPLOYER_DB_PATH", "deployer.db"),
 		PublicURL:              strings.TrimRight(os.Getenv("DEPLOYER_PUBLIC_URL"), "/"),
 		ArtifactDir:            getenvDefault("DEPLOYER_ARTIFACT_DIR", filepath.Join(os.TempDir(), "deployer-artifacts")),
@@ -57,6 +61,8 @@ func loadConfig() AppConfig {
 		SSHTimeout:             getenvDurationDefault("DEPLOYER_SSH_TIMEOUT", 5*time.Minute),
 		HealthCheckTimeout:     getenvDurationDefault("DEPLOYER_HEALTH_CHECK_TIMEOUT", 60*time.Second),
 		DemoMode:               getenvBoolDefault("DEPLOYER_DEMO_MODE", false),
+		NotificationKey:        strings.TrimSpace(os.Getenv("DEPLOYER_NOTIFICATION_KEY")),
+		LogoutURL:              strings.TrimSpace(os.Getenv("DEPLOYER_LOGOUT_URL")),
 	}
 	return cfg
 }

@@ -1,11 +1,14 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -15,12 +18,92 @@ const csrfHeader = "X-Deployer-CSRF"
 const requestIDHeader = "X-Request-ID"
 
 type requestIDContextKey struct{}
+type mcpBearerContextKey struct{}
 
 func wrapHTTPHandler(next http.Handler) http.Handler {
 	handler := securityHeaders(csrfMiddleware(next))
+	handler = mcpBearerAuthMiddleware(handler)
 	handler = panicRecoveryMiddleware(handler)
 	handler = requestLoggingMiddleware(handler)
 	return requestIDMiddleware(handler)
+}
+
+func mcpBearerAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		if auth == "" || !strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/api/agent/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !strings.HasPrefix(auth, "Bearer ") {
+			jsonErrorCode(w, "invalid_bearer", "invalid bearer credential", http.StatusUnauthorized)
+			return
+		}
+		token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		readToken, writeToken := strings.TrimSpace(os.Getenv("DEPLOYER_MCP_READ_TOKEN")), strings.TrimSpace(os.Getenv("DEPLOYER_MCP_WRITE_TOKEN"))
+		write := secureTokenEqual(token, writeToken)
+		read := write || secureTokenEqual(token, readToken)
+		if !read {
+			jsonErrorCode(w, "invalid_bearer", "invalid bearer credential", http.StatusUnauthorized)
+			return
+		}
+		if requiresCSRF(r) && !write {
+			jsonErrorCode(w, "write_scope_required", "write bearer credential required", http.StatusForbidden)
+			return
+		}
+		ctx := context.WithValue(r.Context(), mcpBearerContextKey{}, true)
+		machineRequest := r.WithContext(ctx)
+		if r.Method == http.MethodGet && !strings.HasSuffix(r.URL.Path, "/artifact") && !strings.HasSuffix(r.URL.Path, "/stream") {
+			serveRedactedMachineJSON(next, w, machineRequest)
+			return
+		}
+		next.ServeHTTP(w, machineRequest)
+	})
+}
+
+type bufferedHTTPResponse struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (w *bufferedHTTPResponse) Header() http.Header { return w.header }
+func (w *bufferedHTTPResponse) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+func (w *bufferedHTTPResponse) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(p)
+}
+func serveRedactedMachineJSON(next http.Handler, w http.ResponseWriter, r *http.Request) {
+	capture := &bufferedHTTPResponse{header: make(http.Header)}
+	next.ServeHTTP(capture, r)
+	for key, values := range capture.header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	status := capture.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	body := capture.body.Bytes()
+	if strings.Contains(capture.header.Get("Content-Type"), "application/json") {
+		body = redactJSON(body)
+	}
+	_, _ = w.Write(body)
+}
+
+func secureTokenEqual(got, want string) bool {
+	if got == "" || want == "" || len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func requestIDMiddleware(next http.Handler) http.Handler {
@@ -159,6 +242,9 @@ func requiresCSRF(r *http.Request) bool {
 		return false
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/agent/") {
+		return false
+	}
+	if machine, _ := r.Context().Value(mcpBearerContextKey{}).(bool); machine {
 		return false
 	}
 	return true

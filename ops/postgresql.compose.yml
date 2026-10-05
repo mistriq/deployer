@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:55436:5432"
+    environment:
+      POSTGRES_DB: deployer
+      POSTGRES_USER: deployer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in a protected environment file}
+    volumes:
+      - deployer-postgresql:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deployer -d deployer"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  deployer-postgresql:

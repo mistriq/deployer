@@ -28,9 +28,12 @@
             <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M7.75 2a.75.75 0 01.75.75V7h4.25a.75.75 0 010 1.5H8.5v4.25a.75.75 0 01-1.5 0V8.5H2.75a.75.75 0 010-1.5H7V2.75A.75.75 0 017.75 2z"/></svg>
             New Project
         </a>
+        <a href="/notifications" class="nav-item">Notifications</a>
+        {{if logoutURL}}<a href="{{logoutURL}}" class="nav-item">Sign out</a>{{end}}
     </nav>
 
     <div class="main-content">
+        {{template "mobile_navigation" .}}
         <div class="page-header">
             <h1>Workflow runs</h1>
         </div>
