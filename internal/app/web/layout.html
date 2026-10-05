@@ -1,0 +1,49 @@
+{{define "head"}}
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<title>{{.}} · Deployer</title>
+<script src="/static/theme.js"></script>
+<link rel="preload" href="/static/fonts/hanken-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/martian-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/style.css">
+{{end}}
+
+{{define "topbar"}}
+<header class="topbar">
+    <div class="topbar-inner">
+        <a href="/" class="brand" aria-label="Deployer home">
+            <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <span class="brand-word">deployer</span>
+        </a>
+        <nav class="topnav" aria-label="Main navigation">
+            <a href="/"{{if eq . "projects"}} aria-current="page"{{end}}>Projects</a>
+            <a href="/runners"{{if eq . "runners"}} aria-current="page"{{end}}>Runners</a>
+            <a href="/notifications"{{if eq . "notifications"}} aria-current="page"{{end}}>Notifications</a>
+        </nav>
+        <div class="topbar-tools">
+            <button type="button" class="jump" data-action="open-palette" aria-keyshortcuts="Control+K Meta+K">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.75"/><path d="m10.5 10.5 3.25 3.25"/></svg>
+                <span class="jump-label">Jump to…</span>
+                <kbd>⌘K</kbd>
+            </button>
+            {{with securityStatus}}<span class="auth-state {{.Class}}" title="{{.Title}}"><span class="auth-dot" aria-hidden="true"></span><span class="sr-only">{{.Label}}</span></span>{{end}}
+            <button type="button" class="icon-btn" data-action="toggle-theme" aria-label="Switch between light and dark appearance">
+                <svg class="icon-sun" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.25M8 13.25v1.25M1.5 8h1.25M13.25 8h1.25M3.4 3.4l.9.9M11.7 11.7l.9.9M3.4 12.6l.9-.9M11.7 4.3l.9-.9"/></svg>
+                <svg class="icon-moon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.6A5.75 5.75 0 0 1 6.4 2.5a5.75 5.75 0 1 0 7.1 7.1Z"/></svg>
+            </button>
+            {{if logoutURL}}<a href="{{logoutURL}}" class="icon-btn" aria-label="Sign out" title="Sign out"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2.5H3.5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1H6M10.5 11 13.5 8l-3-3M13.25 8H6.5"/></svg></a>{{end}}
+        </div>
+    </div>
+</header>
+{{end}}
+
+{{define "mark"}}<span class="mark mark-{{if .}}{{.}}{{else}}none{{end}}" aria-hidden="true"></span>{{end}}
+
+{{define "statusword"}}{{if eq . "success"}}Succeeded{{else if eq . "failed"}}Failed{{else if eq . "running"}}Deploying{{else if eq . "cancelled"}}Cancelled{{else}}{{.}}{{end}}{{end}}
+
+{{define "track"}}{{if and . .Points}}<div class="track" role="img" aria-label="Last {{len .Points}} deploys: {{.Counts.Success}} succeeded, {{.Counts.Failed}} failed">{{range .Points}}<a class="tick tick-{{.Status}}" href="/builds/{{.BuildID}}" style="--h: {{.HeightPercent}}%" title="#{{.BuildID}} · {{.Status}} · {{formatDuration .DurationSeconds}}{{if .ProjectName}} · {{.ProjectName}}{{end}}" tabindex="-1"></a>{{end}}</div>{{else}}<div class="track track-empty"><span>No deploys yet</span></div>{{end}}{{end}}
+
+{{define "scripts"}}<script src="/static/app.js"></script>{{end}}
+
+{{define "opkind"}}{{if eq . "health_check"}}Health check{{else if eq . "compose_status"}}Service status{{else if eq . "compose_restart"}}Restart services{{else if eq . "compose_stop"}}Stop services{{else if eq . "compose_logs"}}Recent logs{{else}}{{.}}{{end}}{{end}}
