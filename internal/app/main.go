@@ -148,7 +148,33 @@ func Run() {
 		"securityStatus": func() SecurityStatus {
 			return securityStatus()
 		},
-		"logoutURL":   func() string { return appConfig.LogoutURL },
+		"logoutURL": func() string { return appConfig.LogoutURL },
+		"splitLabels": func(labels string) []string {
+			parts := []string{}
+			for _, label := range strings.Split(labels, ",") {
+				if label = strings.TrimSpace(label); label != "" {
+					parts = append(parts, label)
+				}
+			}
+			return parts
+		},
+		"humanSeconds": func(seconds int64) string {
+			d := time.Duration(seconds) * time.Second
+			switch {
+			case d >= 48*time.Hour:
+				return fmt.Sprintf("%dd %dh", int(d.Hours())/24, int(d.Hours())%24)
+			case d >= time.Hour:
+				return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
+			default:
+				return fmt.Sprintf("%dm", int(d.Minutes()))
+			}
+		},
+		"usedPercent": func(free, total int64) int {
+			if total <= 0 {
+				return 0
+			}
+			return int((total - free) * 100 / total)
+		},
 		"compactPath": compactPath,
 		"formatBytes": func(value int64) string {
 			units := []string{"B", "KB", "MB", "GB", "TB"}
@@ -314,7 +340,50 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	tmpl.ExecuteTemplate(w, "index.html", projects)
+	tmpl.ExecuteTemplate(w, "index.html", newDashboardView(projects))
+}
+
+type dashboardRow struct {
+	Project
+	RunnerName   string
+	RunnerOnline bool
+	History      *buildHistorySummaryResponse
+}
+
+type dashboardView struct {
+	Rows      []dashboardRow
+	Deploying int
+	Failing   int
+	Idle      int
+}
+
+// newDashboardView adds the per-project deploy track and the target runner
+// so the dashboard can answer "what is live and where" without a click.
+func newDashboardView(projects []Project) dashboardView {
+	runners, _ := listRunners()
+	byID := make(map[int64]Runner, len(runners))
+	for _, runner := range runners {
+		byID[runner.ID] = runner
+	}
+	view := dashboardView{Rows: make([]dashboardRow, 0, len(projects))}
+	for _, project := range projects {
+		row := dashboardRow{Project: project}
+		if runner, ok := byID[project.RunnerID]; ok {
+			row.RunnerName = runner.Name
+			row.RunnerOnline = runner.Status == "online"
+		}
+		row.History, _ = newProjectBuildHistory(project.ID, 24)
+		switch {
+		case project.LastBuild == nil:
+			view.Idle++
+		case project.LastBuild.Status == "running":
+			view.Deploying++
+		case project.LastBuild.Status == "failed":
+			view.Failing++
+		}
+		view.Rows = append(view.Rows, row)
+	}
+	return view
 }
 
 func handleProjectPage(w http.ResponseWriter, r *http.Request) {
@@ -346,13 +415,21 @@ func handleProjectPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	builds, _ := listBuilds(id, 20)
-	history, _ := newProjectBuildHistory(id, 20)
+	builds, _ := listBuilds(id, 30)
+	history, _ := newProjectBuildHistory(id, 30)
+	var live *Build
+	for i := range builds {
+		if builds[i].Status == "success" && builds[i].TriggeredBy != "snapshot" {
+			live = &builds[i]
+			break
+		}
+	}
 
 	tmpl.ExecuteTemplate(w, "project.html", map[string]interface{}{
 		"Project": project,
 		"Builds":  builds,
 		"History": history,
+		"Live":    live,
 		"IsNew":   false,
 		"Runners": runners,
 	})

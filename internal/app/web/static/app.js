@@ -77,7 +77,7 @@ function showToast(message, type = 'error') {
     close.type = 'button';
     close.className = 'toast-close';
     close.setAttribute('aria-label', 'Dismiss message');
-    close.textContent = 'x';
+    close.textContent = '×';
     close.addEventListener('click', () => toast.remove());
     toast.appendChild(close);
 
@@ -140,13 +140,141 @@ function confirmAction({ title, message, confirmText = 'Confirm', danger = false
     });
 }
 
+function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+}
+
+// Pre-flight check: show exactly what a deploy will do before it starts.
+function preflightDialog(projectId, projectName) {
+    return new Promise(resolve => {
+        const backdrop = el('div', 'dialog-backdrop');
+        const dialog = el('div', 'dialog preflight');
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        dialog.setAttribute('aria-labelledby', 'preflight-title');
+
+        const head = el('div', 'preflight-head');
+        head.append(el('div', 'preflight-label', 'Pre-flight check'));
+        const title = el('h2', '', `Deploy ${projectName}`);
+        title.id = 'preflight-title';
+        head.append(title);
+
+        const body = el('div', 'preflight-body');
+        body.append(el('p', 'preflight-loading', 'Reading the repository and target'));
+
+        const actions = el('div', 'dialog-actions');
+        const cancel = el('button', 'btn btn-quiet', 'Cancel');
+        cancel.type = 'button';
+        const confirm = el('button', 'btn btn-deploy', 'Deploy');
+        confirm.type = 'button';
+        const enter = el('kbd', '', '↵');
+        confirm.append(enter);
+        actions.append(cancel, confirm);
+
+        dialog.append(head, body, actions);
+        backdrop.append(dialog);
+        document.body.append(backdrop);
+        confirm.focus();
+
+        const close = result => {
+            document.removeEventListener('keydown', onKeydown);
+            backdrop.remove();
+            resolve(result);
+        };
+        const onKeydown = event => {
+            if (event.key === 'Escape') close(false);
+            if (event.key === 'Enter' && document.activeElement === confirm) { event.preventDefault(); close(true); }
+        };
+        cancel.addEventListener('click', () => close(false));
+        confirm.addEventListener('click', () => close(true));
+        backdrop.addEventListener('click', event => { if (event.target === backdrop) close(false); });
+        document.addEventListener('keydown', onKeydown);
+
+        apiFetch(`/api/projects/${projectId}/preview`).then(async response => {
+            const preview = await response.json();
+            if (!response.ok) throw new Error(preview.error || 'Preview unavailable');
+            body.replaceChildren(renderPreflight(preview));
+        }).catch(error => {
+            body.replaceChildren(el('p', 'preflight-loading-failed quiet-note', `Pre-flight check unavailable: ${error.message}. You can still deploy.`));
+        });
+    });
+}
+
+const planStepLabels = {
+    git_pull: 'Pull the latest commits',
+    git_pull_skipped: 'Use the repository as it is (no pull)',
+    get_commit_sha: 'Pin the exact revision',
+    docker_build: 'Build the Docker image',
+    docker_save: 'Package the image',
+    docker_image_tar: 'Package the image',
+    package_files: 'Package the files',
+    files_archive: 'Package the files',
+    scp_artifact: 'Copy the release to the server',
+    ssh_docker_compose_deploy: 'Restart services over SSH',
+    docker_compose_down: 'Stop the running services',
+    docker_compose_up: 'Start the new services',
+    create_agent_job: 'Hand the release to the runner',
+    wait_for_agent: 'Runner installs the release',
+    health_check: 'Wait for the health check to pass',
+    post_deploy: 'Run the after-deploy command',
+};
+
+function renderPreflight(preview) {
+    const fragment = document.createDocumentFragment();
+    const rows = el('dl', 'preflight-rows');
+    const row = (label, value) => {
+        const wrapper = el('div');
+        wrapper.append(el('dt', 'preflight-label', label));
+        const dd = el('dd');
+        if (value instanceof Node) dd.append(value); else dd.textContent = value;
+        wrapper.append(dd);
+        rows.append(wrapper);
+    };
+    if (preview.commit_sha) {
+        const rev = el('span', 'preflight-rev', preview.commit_sha.slice(0, 7));
+        rev.title = preview.commit_sha;
+        row('Revision', rev);
+    } else {
+        const unknown = el('span', '', 'Resolved when the build starts');
+        if (preview.commit_error) {
+            unknown.textContent = 'Could not read the repository yet';
+            const detail = el('small', 'preflight-detail', preview.commit_error);
+            const wrap = el('span');
+            wrap.append(unknown, detail);
+            row('Revision', wrap);
+        } else {
+            row('Revision', unknown);
+        }
+    }
+    const via = preview.runner ? `runner ${preview.runner.name}${preview.runner.status === 'online' ? '' : ' (offline)'}` : (preview.transport || 'ssh');
+    row('Target', `${preview.deploy_dir || 'deploy directory not set'} via ${via}`);
+    row('Mode', preview.deploy_mode === 'files' ? 'Files' : 'Docker Compose');
+    const health = preview.health_check || {};
+    row('Health', health.enabled ? `${health.url || health.container} · ${health.timeout} timeout` : 'No health check. Success means the steps finished.');
+    fragment.append(rows);
+
+    if (preview.planned_steps && preview.planned_steps.length) {
+        const plan = el('div', 'preflight-plan');
+        plan.append(el('div', 'preflight-label', 'Plan'));
+        const list = el('ol');
+        preview.planned_steps.forEach(step => list.append(el('li', '', planStepLabels[step] || step.replaceAll('_', ' '))));
+        plan.append(list);
+        fragment.append(plan);
+    }
+    if (preview.warnings && preview.warnings.length) {
+        const warnings = el('ul', 'preflight-warnings');
+        preview.warnings.forEach(warning => warnings.append(el('li', '', warning)));
+        fragment.append(warnings);
+    }
+    return fragment;
+}
+
 // Deploy a project
 async function deploy(projectId, projectName, button) {
-    const confirmed = await confirmAction({
-        title: 'Deploy project',
-        message: `Start a new deploy for ${projectName}?`,
-        confirmText: 'Deploy',
-    });
+    const confirmed = await preflightDialog(projectId, projectName);
     if (!confirmed) return;
     const restoreButton = setButtonBusy(button, 'Deploying...');
     try {
@@ -268,7 +396,7 @@ async function saveProject(event) {
 // ========== Helpers ==========
 
 function fmtDuration(seconds) {
-    const s = Math.floor(seconds);
+    const s = Math.max(0, Math.floor(seconds));
     if (s < 60) return s + 's';
     return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
 }
@@ -393,6 +521,7 @@ function renderLogBatch(logText, finalStatus) {
 
     function endStep(duration) {
         if (currentSection && duration !== null) {
+            currentSection.el.dataset.duration = String(duration);
             const timer = currentSection.header.querySelector('.step-timer');
             if (timer) timer.textContent = fmtDuration(duration);
             // Also set sidebar duration
@@ -470,6 +599,24 @@ function renderLogBatch(logText, finalStatus) {
     container.appendChild(fragment);
     paginateLogBlocks(container);
     if (sidebar) sidebar.appendChild(sidebarFragment);
+    renderStepTimeline(container);
+}
+
+// A proportional bar of step durations: where the time went, at a glance.
+function renderStepTimeline(container) {
+    const timeline = document.getElementById('step-timeline');
+    if (!timeline) return;
+    const sections = Array.from(container.querySelectorAll('.step-section'));
+    if (sections.length < 2) return;
+    timeline.replaceChildren(...sections.map((section, index) => {
+        const segment = document.createElement('span');
+        const duration = parseInt(section.dataset.duration || '0');
+        segment.style.flexGrow = String(Math.max(duration, 1));
+        segment.style.animationDelay = `${index * 40}ms`;
+        if (section.querySelector('.step-status-icon.icon-x')) segment.className = 'is-failed';
+        segment.title = `${section.querySelector('.step-name').textContent} · ${fmtDuration(duration)}`;
+        return segment;
+    }));
 }
 
 function paginateLogBlocks(root) {
@@ -710,8 +857,8 @@ function initBuildLog(buildId, buildStatus, logB64, startedAt, duration) {
     source.addEventListener('status', function(event) {
         const status = event.data;
         if (statusEl) {
-            statusEl.className = 'build-badge ' + status;
-            statusEl.textContent = status;
+            statusEl.className = 'status-pill state-' + status;
+            statusEl.textContent = statusWord(status);
         }
         liveMarkFinished(status);
         stopBuildTimer();
@@ -917,7 +1064,7 @@ function runnerServerURL() {
 
 function showRunnerSetup(data, mode) {
     const serverURL = runnerServerURL();
-    const title = mode === 'rotate' ? `Runner Token Rotated: ${data.name}` : `Runner Created: ${data.name}`;
+    const title = mode === 'rotate' ? `New token for ${data.name}` : `Connect ${data.name}`;
     const commands = mode === 'rotate' ? `# Paste the runner token from the Deployer UI when prompted
 read -r -s -p "Runner token: " DEPLOYER_TOKEN; echo
 
@@ -1111,7 +1258,315 @@ async function pollBrowserNotifications() {
     }
 }
 
+function statusWord(status) {
+    return { success: 'Succeeded', failed: 'Failed', running: 'Deploying', cancelled: 'Cancelled' }[status] || status;
+}
+
+// ========== Relative time ==========
+
+function relativeTime(date) {
+    const seconds = Math.round((Date.now() - date.getTime()) / 1000);
+    if (seconds < 45) return 'just now';
+    const units = [['minute', 60], ['hour', 3600], ['day', 86400], ['week', 604800]];
+    let unit = units[0];
+    for (const candidate of units) if (Math.abs(seconds) >= candidate[1]) unit = candidate;
+    if (unit[0] === 'week' && seconds > 604800 * 5) return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: date.getFullYear() === new Date().getFullYear() ? undefined : 'numeric' });
+    const value = Math.round(seconds / unit[1]);
+    return new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' }).format(-value, unit[0]);
+}
+
+function updateRelativeTimes() {
+    document.querySelectorAll('time[datetime]').forEach(node => {
+        const date = new Date(node.getAttribute('datetime'));
+        if (Number.isNaN(date.getTime()) || date.getFullYear() < 2000) return;
+        node.textContent = relativeTime(date);
+    });
+}
+
+// ========== Appearance ==========
+
+function toggleTheme() {
+    const root = document.documentElement;
+    const current = root.dataset.theme || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    const next = current === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = next;
+    try { localStorage.setItem('deployer-theme', next); } catch (error) { /* Preference lasts for this page only. */ }
+}
+
+// ========== Tabs ==========
+
+function initTabs() {
+    document.querySelectorAll('[data-tabs]').forEach(list => {
+        const tabs = Array.from(list.querySelectorAll('[role="tab"]'));
+        const select = (tab, focus) => {
+            tabs.forEach(other => {
+                const selected = other === tab;
+                other.setAttribute('aria-selected', String(selected));
+                other.tabIndex = selected ? 0 : -1;
+                document.getElementById(other.getAttribute('aria-controls')).hidden = !selected;
+            });
+            if (focus) tab.focus();
+            history.replaceState(null, '', tab === tabs[0] ? location.pathname : `#${tab.id.replace('tab-', '')}`);
+        };
+        tabs.forEach((tab, index) => {
+            tab.addEventListener('click', () => select(tab, false));
+            tab.addEventListener('keydown', event => {
+                if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
+                const next = tabs[(index + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+                select(next, true);
+            });
+        });
+        const initial = tabs.find(tab => `#${tab.id.replace('tab-', '')}` === location.hash);
+        if (initial) select(initial, false);
+    });
+}
+
+// ========== Settings form ==========
+
+function initDirtyTracking() {
+    const form = document.getElementById('project-form');
+    const bar = form && form.querySelector('.settings-bar');
+    const note = bar && bar.querySelector('[data-dirty-note]');
+    if (!note || !form.querySelector('[name="id"]')) return;
+    const snapshot = () => new URLSearchParams(new FormData(form)).toString() + Array.from(form.querySelectorAll('input[type="checkbox"]')).map(input => input.checked).join();
+    const initial = snapshot();
+    const update = () => {
+        const dirty = snapshot() !== initial;
+        bar.classList.toggle('is-dirty', dirty);
+        note.textContent = dirty ? 'Unsaved changes' : 'No unsaved changes';
+    };
+    form.addEventListener('input', update);
+    form.addEventListener('change', update);
+}
+
+// ========== Build insights ==========
+
+async function initFailureSummary() {
+    const panel = document.getElementById('failure-summary');
+    if (!panel) return;
+    panel.hidden = false;
+    try {
+        const response = await apiFetch(`/api/builds/${panel.dataset.buildId}/failure-summary`);
+        if (!response.ok) return;
+        const summary = await response.json();
+        const cause = panel.querySelector('[data-field="cause"]');
+        const fix = panel.querySelector('[data-field="fix"]');
+        const lines = panel.querySelector('[data-field="lines"]');
+        const step = summary.failed_step ? `${summary.failed_step}: ` : '';
+        cause.textContent = step + (summary.likely_cause || summary.error_message || 'The deploy stopped without a recorded reason.');
+        fix.textContent = summary.suggested_fix || '';
+        if (summary.relevant_log_lines && summary.relevant_log_lines.length) {
+            lines.textContent = summary.relevant_log_lines.join('\n');
+            lines.hidden = false;
+        }
+    } catch (error) { /* The AI prompt below still works without a summary. */ }
+}
+
+async function initReleaseNotes() {
+    const panel = document.getElementById('release-notes');
+    if (!panel) return;
+    try {
+        const response = await apiFetch(`/api/builds/${panel.dataset.buildId}/release-notes`);
+        if (!response.ok) return;
+        const notes = await response.json();
+        if (!notes.commits || !notes.commits.length) return;
+        const list = panel.querySelector('[data-field="commits"]');
+        notes.commits.slice(0, 8).forEach(commit => {
+            const item = el('li');
+            item.append(el('code', '', commit.short_hash), el('span', 'commit-subject', commit.subject));
+            const meta = el('span', 'commit-meta', commit.author_name);
+            item.append(meta);
+            list.append(item);
+        });
+        if (notes.commits.length > 8) list.append(el('li', 'commit-more', `and ${notes.commits.length - 8} more commits`));
+        panel.hidden = false;
+    } catch (error) { /* Release notes are optional context. */ }
+}
+
+// ========== Command palette ==========
+
+let paletteProjects = null;
+
+async function loadPaletteProjects() {
+    if (paletteProjects) return paletteProjects;
+    try {
+        const response = await apiFetch('/api/projects');
+        const data = await response.json();
+        paletteProjects = Array.isArray(data) ? data : (data.projects || []);
+    } catch (error) { paletteProjects = []; }
+    return paletteProjects;
+}
+
+function fuzzyScore(query, text) {
+    const q = query.toLowerCase();
+    const t = text.toLowerCase();
+    if (!q) return 1;
+    const index = t.indexOf(q);
+    if (index === 0) return 3;
+    if (index > 0) return 2;
+    let position = 0;
+    for (const char of q) {
+        position = t.indexOf(char, position);
+        if (position === -1) return 0;
+        position++;
+    }
+    return 1;
+}
+
+function openPalette() {
+    if (document.querySelector('.palette-backdrop')) return;
+    const previousFocus = document.activeElement;
+    const backdrop = el('div', 'palette-backdrop');
+    const palette = el('div', 'palette');
+    palette.setAttribute('role', 'dialog');
+    palette.setAttribute('aria-modal', 'true');
+    palette.setAttribute('aria-label', 'Jump to');
+    const input = el('input');
+    input.type = 'text';
+    input.placeholder = 'Jump to a project, or type “deploy”…';
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-expanded', 'true');
+    input.setAttribute('aria-controls', 'palette-list');
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    const list = el('ul', 'palette-list');
+    list.id = 'palette-list';
+    list.setAttribute('role', 'listbox');
+    const foot = el('div', 'palette-foot');
+    foot.innerHTML = '<span><kbd>↑</kbd><kbd>↓</kbd>move</span><span><kbd>↵</kbd>open</span><span><kbd>esc</kbd>close</span>';
+    palette.append(input, list, foot);
+    backdrop.append(palette);
+    document.body.append(backdrop);
+    input.focus();
+
+    let items = [];
+    let active = 0;
+    const close = () => {
+        backdrop.remove();
+        document.removeEventListener('keydown', onKeydown, true);
+        if (previousFocus && previousFocus.focus) previousFocus.focus();
+    };
+    const commands = projects => {
+        const result = [];
+        projects.forEach(project => {
+            const status = project.last_build ? project.last_build.status : 'none';
+            result.push({ group: 'Projects', label: project.name, hint: 'open', status, run: () => { location.href = `/projects/${project.id}`; } });
+        });
+        projects.forEach(project => {
+            result.push({ group: 'Deploy', label: `Deploy ${project.name}`, hint: 'pre-flight', run: () => { close(); deploy(project.id, project.name, null); } });
+        });
+        result.push(
+            { group: 'Go to', label: 'Projects', hint: 'g p', run: () => { location.href = '/'; } },
+            { group: 'Go to', label: 'Runners', hint: 'g r', run: () => { location.href = '/runners'; } },
+            { group: 'Go to', label: 'Notifications', hint: 'g n', run: () => { location.href = '/notifications'; } },
+            { group: 'Create', label: 'New project', hint: '', run: () => { location.href = '/projects/new'; } },
+            { group: 'Appearance', label: 'Switch light / dark', hint: '', run: () => { toggleTheme(); close(); } },
+        );
+        return result;
+    };
+    const render = () => {
+        const query = input.value.trim();
+        const all = commands(paletteProjects || []);
+        items = all
+            .map(item => ({ item, score: fuzzyScore(query, item.label) }))
+            .filter(entry => entry.score > 0 && (query || entry.item.group !== 'Deploy'))
+            .sort((a, b) => (query ? b.score - a.score : 0))
+            .map(entry => entry.item)
+            .slice(0, 40);
+        active = Math.min(active, Math.max(items.length - 1, 0));
+        list.replaceChildren();
+        if (!items.length) {
+            list.append(el('li', 'palette-empty', paletteProjects ? 'Nothing matches.' : 'Loading…'));
+            return;
+        }
+        let lastGroup = '';
+        items.forEach((item, index) => {
+            if (!query && item.group !== lastGroup) {
+                list.append(el('li', 'palette-group', item.group));
+                lastGroup = item.group;
+            }
+            const option = el('li', 'palette-item');
+            option.id = `palette-option-${index}`;
+            option.setAttribute('role', 'option');
+            option.setAttribute('aria-selected', String(index === active));
+            if (item.status) option.append(el('span', `mark mark-${item.status}`));
+            option.append(el('span', '', item.label));
+            if (item.hint) option.append(el('span', 'palette-item-hint', item.hint));
+            option.addEventListener('mousemove', () => { if (active !== index) { active = index; render(); } });
+            option.addEventListener('click', () => item.run());
+            list.append(option);
+        });
+        input.setAttribute('aria-activedescendant', `palette-option-${active}`);
+        const current = list.querySelector('[aria-selected="true"]');
+        if (current) current.scrollIntoView({ block: 'nearest' });
+    };
+    const onKeydown = event => {
+        if (event.key === 'Escape') { event.preventDefault(); close(); }
+        else if (event.key === 'ArrowDown') { event.preventDefault(); active = (active + 1) % Math.max(items.length, 1); render(); }
+        else if (event.key === 'ArrowUp') { event.preventDefault(); active = (active - 1 + items.length) % Math.max(items.length, 1); render(); }
+        else if (event.key === 'Enter' && items[active]) { event.preventDefault(); items[active].run(); }
+    };
+    input.addEventListener('input', () => { active = 0; render(); });
+    backdrop.addEventListener('click', event => { if (event.target === backdrop) close(); });
+    document.addEventListener('keydown', onKeydown, true);
+    render();
+    loadPaletteProjects().then(render);
+}
+
+// ========== Keyboard ==========
+
+function isTyping(target) {
+    return target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+}
+
+function initKeyboard() {
+    let pendingG = 0;
+    document.addEventListener('keydown', event => {
+        if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+            event.preventDefault();
+            openPalette();
+            return;
+        }
+        if (event.metaKey || event.ctrlKey || event.altKey || isTyping(event.target) || document.querySelector('.dialog-backdrop, .palette-backdrop')) return;
+        if (event.key === '/') {
+            const filter = document.querySelector('[data-filter-target]');
+            if (filter && filter.offsetParent !== null) { event.preventDefault(); filter.focus(); }
+        } else if (event.key === 'd' || event.key === 'D') {
+            const button = document.querySelector('.project-head [data-deploy-project-id]');
+            if (button && !button.disabled) { event.preventDefault(); button.click(); }
+        } else if (event.key === 'g') {
+            pendingG = Date.now();
+        } else if (Date.now() - pendingG < 800) {
+            const target = { p: '/', r: '/runners', n: '/notifications' }[event.key];
+            if (target) location.href = target;
+            pendingG = 0;
+        }
+    });
+}
+
+// Whole rows are clickable, without swallowing clicks on their own links and buttons.
+function initRowLinks() {
+    document.querySelectorAll('[data-href]').forEach(row => {
+        row.addEventListener('click', event => {
+            if (event.target.closest('a, button, input, select, textarea, label, details')) return;
+            if (window.getSelection().toString()) return;
+            if (event.metaKey || event.ctrlKey) window.open(row.dataset.href, '_blank');
+            else location.href = row.dataset.href;
+        });
+    });
+}
+
 function initPage() {
+    updateRelativeTimes();
+    window.setInterval(updateRelativeTimes, 60000);
+    initTabs();
+    initKeyboard();
+    initRowLinks();
+    initDirtyTracking();
+    initFailureSummary();
+    initReleaseNotes();
+    document.querySelectorAll('[data-action="open-palette"]').forEach(button => button.addEventListener('click', openPalette));
+    document.querySelectorAll('[data-action="toggle-theme"]').forEach(button => button.addEventListener('click', toggleTheme));
     pollBrowserNotifications();
     window.setInterval(pollBrowserNotifications, 15000);
     initAIFailurePrompt();

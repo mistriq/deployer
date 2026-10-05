@@ -1,30 +1,23 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Notifications — Deployer</title>
-    <link rel="stylesheet" href="/static/style.css">
+    {{template "head" "Notifications"}}
 </head>
 <body>
-    <nav class="sidebar" aria-label="Main navigation">
-        <div class="sidebar-logo">Deployer</div>
-        <a href="/" class="nav-item">Dashboard</a>
-        <a href="/runners" class="nav-item">Runners</a>
-        <a href="/notifications" class="nav-item active" aria-current="page">Notifications</a>
-        {{if logoutURL}}<a href="{{logoutURL}}" class="nav-item">Sign out</a>{{end}}
-    </nav>
-    <main class="main-content notifications-page">
-        {{template "mobile_navigation" .}}
-        <div class="page-header">
+    {{template "topbar" "notifications"}}
+
+    <main class="page notifications-page">
+        <header class="page-head">
             <div>
                 <h1>Notifications</h1>
-                <p class="page-subtitle">Your channels and delivery history. Add as many channels as you need.</p>
+                <p class="lede">Hear about deploys where you already are: Discord, Slack, a webhook or this browser.</p>
             </div>
-            <button type="button" class="btn btn-primary" id="add-notification-channel">Add channel</button>
-        </div>
+            <div class="page-actions">
+                <button type="button" class="btn btn-primary" id="add-notification-channel">Add channel</button>
+            </div>
+        </header>
         <p id="notification-settings-status" role="status" aria-live="polite">Loading your channels…</p>
-        <section class="notification-editor" id="notification-editor" hidden aria-labelledby="channel-editor-title">
+        <section class="notification-editor panel sheet" id="notification-editor" hidden aria-labelledby="channel-editor-title">
             <h2 id="channel-editor-title">Add notification channel</h2>
             <form id="notification-channel-form">
                 <input type="hidden" name="id">
@@ -51,15 +44,15 @@
                 </fieldset>
                 <label class="notification-checkbox"><input type="checkbox" name="enabled" checked> Channel enabled</label>
                 <p id="notification-save-status" role="status" aria-live="polite"></p>
-                <div class="header-actions">
+                <div class="sheet-actions">
+                    <button type="button" class="btn btn-quiet" id="cancel-channel-editor">Cancel</button>
                     <button type="submit" class="btn btn-primary">Save channel</button>
-                    <button type="button" class="btn" id="cancel-channel-editor">Cancel</button>
                 </div>
             </form>
         </section>
         <div id="notification-channels" class="notification-channels"></div>
     </main>
-    <script src="/static/app.js"></script>
+    {{template "scripts"}}
     <script src="/static/notifications.js"></script>
 </body>
 </html>

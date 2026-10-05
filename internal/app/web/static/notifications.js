@@ -64,10 +64,12 @@
             for (const channel of data.channels) {
                 const card = document.createElement('section');
                 card.className = 'notification-card';
+                card.dataset.kind = channel.kind;
+                card.dataset.enabled = String(channel.enabled);
                 const heading = document.createElement('h2');
                 heading.textContent = channel.name;
                 const description = document.createElement('p');
-                const projects = channel.project_ids.length ? `${channel.project_ids.length} selected projects` : 'All projects';
+                const projects = channel.project_ids.length ? `${channel.project_ids.length} selected project${channel.project_ids.length === 1 ? '' : 's'}` : 'All projects';
                 description.textContent = `${names[channel.kind]} · ${channel.enabled ? 'Enabled' : 'Paused'} · ${projects} · ${channel.events.join(', ')}`;
                 if (channel.kind === 'browser' && channel.browser_id !== browserNotificationDevice()) description.textContent += ' · Another browser';
                 const actions = document.createElement('div');
