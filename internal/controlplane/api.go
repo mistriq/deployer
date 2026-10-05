@@ -141,13 +141,32 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return errInvalid
 				}
 			}
+			target := payload.RuntimeTargetID
+			if target == "" {
+				if project != nil {
+					target = stableTarget(project.Spec.RuntimeTargetID)
+				} else {
+					target = stableTarget(s.Config.DefaultRuntimeTarget)
+				}
+			}
+			if !s.knownTarget(target) {
+				return errTargetUnknown
+			}
+			if project != nil && target != stableTarget(project.Spec.RuntimeTargetID) {
+				for _, job := range d.Jobs {
+					if job.ProjectID == project.ID && job.Tenant == tenant {
+						return errTargetLocked
+					}
+				}
+			}
+			payload.RuntimeTargetID = target
 			if project == nil {
 				project = &Project{ID: p[3], Tenant: tenant, Env: map[string]string{}}
 				d.Projects[p[3]] = project
 			}
 			project.Spec = payload.ProjectSpec
 			project.Revision++
-			response = raw(map[string]any{"project_id": project.ID, "revision": project.Revision, "request_id": payload.RequestID})
+			response = raw(map[string]any{"project_id": project.ID, "revision": project.Revision, "runtime_target_id": target, "request_id": payload.RequestID})
 		case len(p) == 5 && p[4] == "env" && r.Method == "PUT":
 			if project == nil {
 				return errMissing
@@ -182,7 +201,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				var target *Job
 				for _, candidate := range d.Jobs {
-					if candidate.Tenant == tenant && candidate.ProjectID == project.ID && candidate.ReleaseID == payload.ReleaseID && candidate.State == "online" && candidate.Artifact != nil {
+					if candidate.Tenant == tenant && candidate.ProjectID == project.ID && candidate.ReleaseID == payload.ReleaseID && stableTarget(candidate.Snapshot.Spec.RuntimeTargetID) == stableTarget(project.Spec.RuntimeTargetID) && candidate.State == "online" && candidate.Artifact != nil {
 						target = candidate
 						break
 					}
@@ -197,8 +216,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				j.Stage = "runtime_sync"
 				j.Message = "Čeká na obnovení ověřeného release."
 			}
+			j.Snapshot.Spec.RuntimeTargetID = stableTarget(j.Snapshot.Spec.RuntimeTargetID)
+			if !s.knownTarget(j.Snapshot.Spec.RuntimeTargetID) {
+				return errTargetUnknown
+			}
 			d.Jobs[jobID] = j
-			response = raw(map[string]any{"deployment_id": jobID, "request_id": payload.RequestID})
+			response = raw(map[string]any{"deployment_id": jobID, "runtime_target_id": j.Snapshot.Spec.RuntimeTargetID, "request_id": payload.RequestID})
 			status = 202
 		default:
 			return errMissing
@@ -212,6 +235,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 404, "NOT_FOUND")
 		case errConflict:
 			apiError(w, 409, "REQUEST_CONFLICT")
+		case errTargetUnknown:
+			apiError(w, 400, "RUNTIME_TARGET_UNKNOWN")
+		case errTargetLocked:
+			apiError(w, 409, "RUNTIME_TARGET_LOCKED")
 		case errInvalid:
 			apiError(w, 400, "INVALID_REQUEST")
 		default:

@@ -1,0 +1,27 @@
+[Unit]
+Description=Molo portal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=molo
+Group=molo
+WorkingDirectory=/opt/molo/portal
+EnvironmentFile=/etc/molo/portal.env
+ExecStart=/usr/bin/node /opt/molo/portal/server/index.mjs
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StateDirectory=molo
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/molo
+MemoryMax=1G
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

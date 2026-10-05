@@ -7,6 +7,29 @@ import (
 	"testing"
 )
 
+func TestRegistryLocation(t *testing.T) {
+	for _, tc := range []struct {
+		name, registry, runtime string
+		sandbox, rejected       bool
+	}{
+		{"remote IPv4", "127.0.0.1:5500/molo", "https://scr.socen.eu", false, true},
+		{"remote IPv6", "[::1]:5500/molo", "https://scr.socen.eu", false, true},
+		{"remote localhost", "LOCALHOST.:5500/molo", "https://scr.socen.eu", false, true},
+		{"unspecified", "0.0.0.0:5500/molo", "https://scr.socen.eu", false, true},
+		{"sandbox", "127.0.0.1:5500/molo", "https://scr.socen.eu", true, false},
+		{"local integration", "127.0.0.1:5500/molo", "http://localhost:9510", false, false},
+		{"remote registry", "ghcr.io/example", "https://scr.socen.eu", false, false},
+		{"private network", "10.0.0.2:5000/apps", "https://scr.socen.eu", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkRegistryLocation(tc.registry, tc.runtime, tc.sandbox)
+			if (err != nil) != tc.rejected {
+				t.Fatalf("unexpected configuration result: %v", err)
+			}
+		})
+	}
+}
+
 func TestConfigCheckAndPrivateCredentialFiles(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, value string) string {

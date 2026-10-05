@@ -68,6 +68,13 @@ func (s *Service) Step(ctx context.Context) error {
 		return nil
 	}
 	j := jobs[0]
+	rt, err := s.runtimeFor(j.Snapshot.Spec.RuntimeTargetID)
+	if err != nil {
+		return s.change(j.ID, func(v *Job) {
+			v.ErrorCode = "RUNTIME_TARGET_UNAVAILABLE"
+			v.Message = "Cílový Runtime není nakonfigurován; původní cíl zůstává zachován."
+		})
+	}
 	projectID := runtimeProject(j.Tenant, j.ProjectID)
 	switch {
 	case j.Commit == "" && j.Artifact == nil:
@@ -124,23 +131,23 @@ func (s *Service) Step(ctx context.Context) error {
 			v.Message = "Zveřejňuje se."
 		})
 	case j.Stage == "queued" || j.Stage == "runtime_sync":
-		caps, err := s.Runtime.Capabilities(ctx)
+		caps, err := rt.Capabilities(ctx)
 		if err != nil {
 			return s.runtimeError(j, err)
 		}
 		if err = j.Snapshot.Spec.Manifest.ValidateCapabilities(caps); err != nil {
 			return s.fail(j.ID, "deployment_failed", "MANIFEST_INVALID")
 		}
-		_, err = s.Runtime.UpsertProject(ctx, runtimeengine.ProjectRequest{ProjectID: projectID, Slug: strings.TrimPrefix(projectID, "prj_"), Manifest: j.Snapshot.Spec.Manifest})
+		_, err = rt.UpsertProject(ctx, runtimeengine.ProjectRequest{ProjectID: projectID, Slug: strings.TrimPrefix(projectID, "prj_"), Manifest: j.Snapshot.Spec.Manifest})
 		if err != nil {
 			return s.runtimeError(j, err)
 		}
-		if err = s.Runtime.ReplaceEnvironment(ctx, projectID, j.Snapshot.Env); err != nil {
+		if err = rt.ReplaceEnvironment(ctx, projectID, j.Snapshot.Env); err != nil {
 			return s.runtimeError(j, err)
 		}
 		return s.change(j.ID, func(v *Job) { v.State = "deploying"; v.Stage = "submitting"; v.Message = "Zveřejňuje se." })
 	case j.RuntimeID == "":
-		dep, err := s.Runtime.Deploy(ctx, runtimeengine.DeploymentRequest{ProjectID: projectID, ExternalDeploymentID: j.ID, Artifact: runtimeengine.Artifact{Image: strings.Split(j.Artifact.ImageRef, "@")[0], Digest: j.Artifact.Digest}}, j.ID)
+		dep, err := rt.Deploy(ctx, runtimeengine.DeploymentRequest{ProjectID: projectID, ExternalDeploymentID: j.ID, Artifact: runtimeengine.Artifact{Image: strings.Split(j.Artifact.ImageRef, "@")[0], Digest: j.Artifact.Digest}}, j.ID)
 		if err != nil {
 			return s.runtimeError(j, err)
 		}
@@ -155,7 +162,7 @@ func (s *Service) Step(ctx context.Context) error {
 			v.ErrorCode = ""
 		})
 	default:
-		v, err := s.Runtime.VerifyActive(ctx, projectID, j.RuntimeID)
+		v, err := rt.VerifyActive(ctx, projectID, j.RuntimeID)
 		if err != nil {
 			return s.runtimeError(j, err)
 		}

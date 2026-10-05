@@ -11,10 +11,11 @@ import (
 )
 
 type ProjectSpec struct {
-	Repository string                 `json:"repository"`
-	Ref        string                 `json:"ref"`
-	Build      ocibuild.BuildSpec     `json:"build"`
-	Manifest   runtimeengine.Manifest `json:"manifest"`
+	RuntimeTargetID string                 `json:"runtime_target_id,omitempty"`
+	Repository      string                 `json:"repository"`
+	Ref             string                 `json:"ref"`
+	Build           ocibuild.BuildSpec     `json:"build"`
+	Manifest        runtimeengine.Manifest `json:"manifest"`
 }
 type Project struct {
 	ID          string            `json:"project_id"`
@@ -49,21 +50,22 @@ type Job struct {
 
 func (j Job) public() any {
 	return struct {
-		ID        string    `json:"deployment_id"`
-		ProjectID string    `json:"project_id"`
-		RequestID string    `json:"request_id"`
-		State     string    `json:"state"`
-		Stage     string    `json:"stage"`
-		ErrorCode string    `json:"error_code,omitempty"`
-		Message   string    `json:"message"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Commit    string    `json:"commit,omitempty"`
-		BuildID   string    `json:"build_id"`
-		RuntimeID string    `json:"runtime_deployment_id,omitempty"`
-		ReleaseID string    `json:"runtime_release_id,omitempty"`
-		SiteURL   string    `json:"site_url,omitempty"`
-	}{j.ID, j.ProjectID, j.RequestID, j.State, j.Stage, j.ErrorCode, j.Message, j.CreatedAt, j.UpdatedAt, j.Commit, j.BuildID, j.RuntimeID, j.ReleaseID, j.SiteURL}
+		RuntimeTargetID string    `json:"runtime_target_id"`
+		ID              string    `json:"deployment_id"`
+		ProjectID       string    `json:"project_id"`
+		RequestID       string    `json:"request_id"`
+		State           string    `json:"state"`
+		Stage           string    `json:"stage"`
+		ErrorCode       string    `json:"error_code,omitempty"`
+		Message         string    `json:"message"`
+		CreatedAt       time.Time `json:"created_at"`
+		UpdatedAt       time.Time `json:"updated_at"`
+		Commit          string    `json:"commit,omitempty"`
+		BuildID         string    `json:"build_id"`
+		RuntimeID       string    `json:"runtime_deployment_id,omitempty"`
+		ReleaseID       string    `json:"runtime_release_id,omitempty"`
+		SiteURL         string    `json:"site_url,omitempty"`
+	}{stableTarget(j.Snapshot.Spec.RuntimeTargetID), j.ID, j.ProjectID, j.RequestID, j.State, j.Stage, j.ErrorCode, j.Message, j.CreatedAt, j.UpdatedAt, j.Commit, j.BuildID, j.RuntimeID, j.ReleaseID, j.SiteURL}
 }
 
 type LogLine struct {
@@ -87,16 +89,18 @@ type Builder interface {
 	Build(context.Context, ocibuild.Request, func(string)) (ocibuild.Artifact, error)
 }
 type Config struct {
-	Tokens         map[string]string
-	ImagePrefix    string
-	Credentials    ocibuild.RegistryCredentials
-	PollInterval   time.Duration
-	ServiceSecrets []string
+	DefaultRuntimeTarget string
+	Tokens               map[string]string
+	ImagePrefix          string
+	Credentials          ocibuild.RegistryCredentials
+	PollInterval         time.Duration
+	ServiceSecrets       []string
 }
 type Service struct {
 	workerMu sync.Mutex
 	logMu    sync.Mutex
 	Store    *Store
+	Runtimes map[string]Runtime
 	Runtime  Runtime
 	Builder  Builder
 	Config   Config

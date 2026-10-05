@@ -1,0 +1,26 @@
+# Only the registry. Keep the existing Runtime stack separate and unchanged.
+services:
+  registry:
+    image: ${REGISTRY_IMAGE:?Set a reviewed registry image pinned by digest}
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:5000:5000'
+    environment:
+      REGISTRY_HTTP_ADDR: ':5000'
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Molo registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+    volumes:
+      - registry-data:/var/lib/registry
+      - ${REGISTRY_AUTH_DIR:?Set absolute auth directory}:/auth:ro
+    mem_limit: 512m
+    cpus: '0.50'
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+volumes:
+  registry-data:

@@ -115,7 +115,11 @@ func (s *Service) collectLogs(ctx context.Context, j *Job) error {
 	defer s.logMu.Unlock()
 	var entries []runtimeengine.LogEntry
 	var err error
-	structured, ok := s.Runtime.(structuredRuntimeLogs)
+	rt, targetErr := s.runtimeFor(j.Snapshot.Spec.RuntimeTargetID)
+	if targetErr != nil {
+		return targetErr
+	}
+	structured, ok := rt.(structuredRuntimeLogs)
 	if ok {
 		if j.ReleaseID != "" {
 			entries, err = structured.ReleaseLogEntries(ctx, j.ReleaseID, 1000)
@@ -125,9 +129,9 @@ func (s *Service) collectLogs(ctx context.Context, j *Job) error {
 	} else {
 		var text string
 		if j.ReleaseID != "" {
-			text, err = s.Runtime.ReleaseLogs(ctx, j.ReleaseID, 1000)
+			text, err = rt.ReleaseLogs(ctx, j.ReleaseID, 1000)
 		} else {
-			text, err = s.Runtime.Logs(ctx, j.RuntimeID, 1000)
+			text, err = rt.Logs(ctx, j.RuntimeID, 1000)
 		}
 		if text != "" {
 			for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {

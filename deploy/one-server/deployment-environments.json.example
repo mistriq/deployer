@@ -1,0 +1,7 @@
+{
+  "production": {
+    "mode": "http",
+    "deployer_url": "http://127.0.0.1:8091",
+    "deployer_tokens_file": "/etc/molo/production-organization-tokens.json"
+  }
+}

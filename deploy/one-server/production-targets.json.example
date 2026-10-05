@@ -1,0 +1,9 @@
+{
+  "default_target_id": "default",
+  "targets": {
+    "default": {
+      "base_url": "http://127.0.0.1:9510",
+      "token_file": "/etc/runtime-deployer/production-runtime-token"
+    }
+  }
+}

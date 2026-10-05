@@ -1,0 +1,30 @@
+[Unit]
+Description=Molo production Deployer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=runtime-deployer
+Group=runtime-deployer
+WorkingDirectory=/var/lib/runtime-deployer
+EnvironmentFile=/etc/runtime-deployer/runtime.env
+Environment=PATH=/opt/molo/builder-bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/runtime-deployer
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=50
+StateDirectory=runtime-deployer
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/runtime-deployer
+# Limits here bound the worker process, NOT daemon-created build containers.
+MemoryMax=1G
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

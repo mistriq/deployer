@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,7 +20,6 @@ import (
 
 	"github.com/mistriq/deployer/internal/controlplane"
 	"github.com/mistriq/deployer/internal/ocibuild"
-	"github.com/mistriq/deployer/internal/runtimeengine"
 )
 
 func main() {
@@ -49,6 +49,32 @@ func secret(k string) (string, error) {
 	}
 	return strings.TrimSpace(string(b)), nil
 }
+
+// A remote Runtime pulls images from its own network, not the builder's.
+// Keep loopback registries available for sandbox and local integration tests.
+func checkRegistryLocation(image, runtimeURL string, sandbox bool) error {
+	if sandbox {
+		return nil
+	}
+	registry, err := url.Parse("https://" + strings.Split(image, "/")[0])
+	if err != nil {
+		return errors.New("invalid registry address")
+	}
+	runtime, err := url.Parse(runtimeURL)
+	if err != nil {
+		return errors.New("invalid Runtime address")
+	}
+	local := func(host string) bool {
+		host = strings.TrimSuffix(strings.ToLower(host), ".")
+		ip := net.ParseIP(host)
+		return host == "localhost" || strings.HasSuffix(host, ".localhost") || (ip != nil && (ip.IsLoopback() || ip.IsUnspecified()))
+	}
+	if local(registry.Hostname()) && !local(runtime.Hostname()) {
+		return errors.New("remote Runtime requires a registry address reachable from its server; REGISTRY_IMAGE_PREFIX points to a loopback or unspecified address")
+	}
+	return nil
+}
+
 func run() error {
 	addr := env("DEPLOYER_LISTEN", "127.0.0.1:8091")
 	host, _, err := net.SplitHostPort(addr)
@@ -58,10 +84,6 @@ func run() error {
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
 		return errors.New("DEPLOYER_LISTEN must use a loopback IP; expose through a private TLS proxy")
-	}
-	token, err := secret("RUNTIME_TOKEN_FILE")
-	if err != nil {
-		return err
 	}
 	keyHex, err := secret("DEPLOYER_STATE_KEY_FILE")
 	if err != nil {
@@ -90,13 +112,13 @@ func run() error {
 	if sandbox != "true" && sandbox != "false" {
 		return errors.New("RUNTIME_SANDBOX must be true or false")
 	}
-	runtime, err := runtimeengine.New(runtimeengine.Config{BaseURL: os.Getenv("RUNTIME_BASE_URL"), Token: token, Sandbox: sandbox == "true"})
-	if err != nil {
-		return errors.New("invalid Runtime configuration")
-	}
 	image := os.Getenv("REGISTRY_IMAGE_PREFIX")
 	if !strings.Contains(image, "/") || strings.ContainsAny(image, " @\r\n") {
 		return errors.New("REGISTRY_IMAGE_PREFIX must be registry.example/team")
+	}
+	runtimes, defaultTarget, runtimeSecrets, err := loadRuntimeTargets(sandbox == "true", image)
+	if err != nil {
+		return err
 	}
 	creds := ocibuild.RegistryCredentials{Registry: strings.Split(image, "/")[0], Username: os.Getenv("REGISTRY_PUSH_USERNAME")}
 	if os.Getenv("REGISTRY_PUSH_PASSWORD_FILE") != "" {
@@ -120,7 +142,7 @@ func run() error {
 		return fmt.Errorf("open state: %w", err)
 	}
 	defer store.Close()
-	svc := &controlplane.Service{Store: store, Runtime: runtime, Builder: &ocibuild.Builder{}, Config: controlplane.Config{Tokens: tokens, ImagePrefix: image, Credentials: creds, ServiceSecrets: []string{token, keyHex}}}
+	svc := &controlplane.Service{Store: store, Runtimes: runtimes, Builder: &ocibuild.Builder{}, Config: controlplane.Config{DefaultRuntimeTarget: defaultTarget, Tokens: tokens, ImagePrefix: image, Credentials: creds, ServiceSecrets: append(runtimeSecrets, keyHex)}}
 	if len(os.Args) > 1 {
 		if len(os.Args) == 2 && os.Args[1] == "--check-config" {
 			fmt.Println("Configuration valid; no network calls made.")

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Install at /opt/molo/builder-bin/docker (not over the real Docker CLI).
+# This endpoint is an OPERATOR-PROVISIONED dedicated builder daemon.
+# Never point this at the Runtime daemon.
+exec /usr/bin/docker --host unix:///run/deployer-docker/docker.sock "$@"
