@@ -107,6 +107,8 @@ func (SystemRunner) Run(ctx context.Context, c Command) ([]byte, error) {
 
 type Builder struct {
 	AllowLocalRepositories bool
+	// LocalRepositoryRoot, when set, restricts local repositories to its direct children.
+	LocalRepositoryRoot string
 	// CLIPluginDirs lists trusted Docker CLI plugin directories, not credentials.
 	CLIPluginDirs []string
 	Runner        Runner
@@ -441,7 +443,7 @@ func (b *Builder) validateRepository(repository string) error {
 	if err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == "" {
 		return nil
 	}
-	if b.AllowLocalRepositories && filepath.IsAbs(repository) {
+	if b.AllowLocalRepositories && filepath.IsAbs(repository) && (b.LocalRepositoryRoot == "" || filepath.Dir(filepath.Clean(repository)) == b.LocalRepositoryRoot) {
 		return nil
 	}
 	return fmt.Errorf("repository must be an HTTPS URL without embedded credentials")

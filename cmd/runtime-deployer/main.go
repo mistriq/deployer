@@ -142,7 +142,16 @@ func run() error {
 		return fmt.Errorf("open state: %w", err)
 	}
 	defer store.Close()
-	svc := &controlplane.Service{Store: store, Runtimes: runtimes, Builder: &ocibuild.Builder{}, Config: controlplane.Config{DefaultRuntimeTarget: defaultTarget, Tokens: tokens, ImagePrefix: image, Credentials: creds, ServiceSecrets: append(runtimeSecrets, keyHex)}}
+	localSources := os.Getenv("DEPLOYER_LOCAL_SOURCE_ROOT")
+	if localSources != "" {
+		if !filepath.IsAbs(localSources) {
+			return errors.New("DEPLOYER_LOCAL_SOURCE_ROOT must be an absolute path")
+		}
+		if localSources, err = filepath.EvalSymlinks(localSources); err != nil {
+			return errors.New("DEPLOYER_LOCAL_SOURCE_ROOT must be an existing directory")
+		}
+	}
+	svc := &controlplane.Service{Store: store, Runtimes: runtimes, Builder: &ocibuild.Builder{AllowLocalRepositories: localSources != "", LocalRepositoryRoot: localSources}, Config: controlplane.Config{DefaultRuntimeTarget: defaultTarget, Tokens: tokens, ImagePrefix: image, Credentials: creds, ServiceSecrets: append(runtimeSecrets, keyHex), LocalSourceRoot: localSources}}
 	if len(os.Args) > 1 {
 		if len(os.Args) == 2 && os.Args[1] == "--check-config" {
 			fmt.Println("Configuration valid; no network calls made.")

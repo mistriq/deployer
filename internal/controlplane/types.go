@@ -95,6 +95,9 @@ type Config struct {
 	Credentials          ocibuild.RegistryCredentials
 	PollInterval         time.Duration
 	ServiceSecrets       []string
+	// LocalSourceRoot, when set, also accepts repositories that are git directories directly inside it
+	// (used by a co-located portal for uploaded sources). Empty keeps the HTTPS-only behaviour.
+	LocalSourceRoot string
 }
 type Service struct {
 	workerMu sync.Mutex

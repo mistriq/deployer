@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -124,7 +125,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case len(p) == 4 && r.Method == "PUT":
 			u, e := url.Parse(payload.Repository)
-			if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || payload.Ref == "" || strings.HasPrefix(payload.Ref, "-") {
+			remote := e == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
+			if !(remote || localSource(s.Config.LocalSourceRoot, payload.Repository)) || payload.Ref == "" || strings.HasPrefix(payload.Ref, "-") {
 				return errInvalid
 			}
 			if payload.Manifest.Validate() != nil || payload.Build.Kind != payload.Manifest.Kind {
@@ -295,4 +297,12 @@ func (s *Service) logs(w http.ResponseWriter, r *http.Request, j *Job) {
 		}
 	}
 	reply(w, 200, map[string]any{"items": out, "next_cursor": strconv.FormatInt(next, 10), "truncated": gap, "source": source})
+}
+
+// localSource accepts only a clean absolute path to a direct child of root, e.g. root/prj_x.git.
+func localSource(root, repository string) bool {
+	if root == "" || !filepath.IsAbs(repository) || filepath.Clean(repository) != repository {
+		return false
+	}
+	return filepath.Dir(repository) == root && strings.HasSuffix(repository, ".git") && !strings.HasPrefix(filepath.Base(repository), ".")
 }
