@@ -2,6 +2,29 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="light dark">
+<meta name="description" content="Deployer — your self-hosted deployment control panel.">
+<meta name="theme-color" content="#f1f2ef" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0c0d0c" media="(prefers-color-scheme: dark)">
+<meta name="application-name" content="Deployer">
+<meta name="apple-mobile-web-app-title" content="Deployer">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Deployer">
+<meta property="og:title" content="Deployer">
+<meta property="og:description" content="Your self-hosted deployment control panel.">
+<meta property="og:image" content="{{publicAssetURL "/static/brand/social-card.png"}}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Deployer logo: a D with a forward arrow.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Deployer">
+<meta name="twitter:description" content="Your self-hosted deployment control panel.">
+<meta name="twitter:image" content="{{publicAssetURL "/static/brand/social-card.png"}}">
+<link rel="icon" href="/static/brand/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/static/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png" sizes="180x180">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
 <title>{{.}} · Deployer</title>
 <script src="/static/theme.js"></script>
 <link rel="preload" href="/static/fonts/hanken-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
@@ -13,7 +36,7 @@
 <header class="topbar">
     <div class="topbar-inner">
         <a href="/" class="brand" aria-label="Deployer home">
-            <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <svg class="brand-mark" width="28" height="28" viewBox="0 0 64 64" aria-hidden="true"><path class="brand-shell" d="M4 4h28a28 28 0 0 1 0 56H4V41h20v6l22-15-22-15v6H4Z"/><path class="brand-arrow" d="m24 17 22 15-22 15Z"/></svg>
             <span class="brand-word">deployer</span>
         </a>
         <nav class="topnav" aria-label="Main navigation">
@@ -44,6 +67,6 @@
 
 {{define "track"}}{{if and . .Points}}<div class="track" role="img" aria-label="Last {{len .Points}} deploys: {{.Counts.Success}} succeeded, {{.Counts.Failed}} failed">{{range .Points}}<a class="tick tick-{{.Status}}" href="/builds/{{.BuildID}}" style="--h: {{.HeightPercent}}%" title="#{{.BuildID}} · {{.Status}} · {{formatDuration .DurationSeconds}}{{if .ProjectName}} · {{.ProjectName}}{{end}}" tabindex="-1"></a>{{end}}</div>{{else}}<div class="track track-empty"><span>No deploys yet</span></div>{{end}}{{end}}
 
-{{define "scripts"}}<script src="/static/app.js"></script>{{end}}
+{{define "scripts"}}<script src="/static/app.js"></script><script src="/static/pwa.js" defer></script>{{end}}
 
 {{define "opkind"}}{{if eq . "health_check"}}Health check{{else if eq . "compose_status"}}Service status{{else if eq . "compose_restart"}}Restart services{{else if eq . "compose_stop"}}Stop services{{else if eq . "compose_logs"}}Recent logs{{else}}{{.}}{{end}}{{end}}

@@ -230,30 +230,25 @@ kbd {
 .brand:hover { text-decoration: none; }
 
 .brand-mark {
-    display: flex;
-    align-items: flex-end;
-    gap: 2px;
-    height: 16px;
+    display: block;
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
 }
-.brand-mark i {
-    width: 3px;
-    border-radius: 1px;
-    background: var(--ink);
-    transition: height 0.4s var(--ease);
+.brand-shell { fill: var(--ink); }
+.brand-arrow { fill: var(--signal); }
+:root[data-theme="dark"] .brand-shell { fill: var(--signal); }
+:root[data-theme="dark"] .brand-arrow { fill: var(--paper); }
+@media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .brand-shell { fill: var(--signal); }
+    :root:not([data-theme="light"]) .brand-arrow { fill: var(--paper); }
 }
-.brand-mark i:nth-child(1) { height: 45%; }
-.brand-mark i:nth-child(2) { height: 75%; }
-.brand-mark i:nth-child(3) { height: 55%; }
-.brand-mark i:nth-child(4) { height: 100%; background: var(--signal); box-shadow: inset 0 0 0 1px var(--signal-edge); }
-.brand:hover .brand-mark i:nth-child(1) { height: 70%; }
-.brand:hover .brand-mark i:nth-child(3) { height: 85%; }
 
 .brand-word {
-    font-family: var(--font-mono);
-    font-stretch: 112.5%;
-    font-size: 14px;
-    font-weight: 600;
-    letter-spacing: -0.03em;
+    font-family: var(--font-ui);
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: -0.045em;
 }
 
 .topnav {

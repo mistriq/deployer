@@ -268,6 +268,9 @@ func initDB(path string) error {
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_running_per_project ON builds(project_id) WHERE status='running'`); err != nil {
 		return fmt.Errorf("create running build guard: %w", err)
 	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_builds_project_history ON builds(project_id, id DESC)`); err != nil {
+		return fmt.Errorf("create project build history index: %w", err)
+	}
 
 	return nil
 }
@@ -778,7 +781,7 @@ func listProjects() ([]Project, error) {
 		p.CreatedAt = parseSQLiteTime(createdAt)
 		projects = append(projects, p)
 	}
-	return projects, nil
+	return projects, rows.Err()
 }
 
 func listProjectsWithLastBuild() ([]Project, error) {
@@ -786,10 +789,13 @@ func listProjectsWithLastBuild() ([]Project, error) {
 	if err != nil {
 		return nil, err
 	}
+	builds, err := listRecentProjectBuilds(1)
+	if err != nil {
+		return nil, err
+	}
 	for i := range projects {
-		build, err := getLastBuild(projects[i].ID)
-		if err == nil && build != nil {
-			projects[i].LastBuild = build
+		if recent := builds[projects[i].ID]; len(recent) > 0 {
+			projects[i].LastBuild = &recent[0]
 		}
 	}
 	return projects, nil
