@@ -96,6 +96,12 @@ type Runtime interface {
 	Logs(context.Context, string, int) (string, error)
 	ReleaseLogs(context.Context, string, int) (string, error)
 }
+
+// ProjectRemover is implemented by Runtimes that can delete a project with its
+// releases and routes. Runtimes without it only lose the Deployer's own records.
+type ProjectRemover interface {
+	DeleteProject(context.Context, string) error
+}
 type Builder interface {
 	Resolve(context.Context, string, string) (string, error)
 	Build(context.Context, ocibuild.Request, func(string)) (ocibuild.Artifact, error)

@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -318,6 +319,20 @@ func (c *Runyer) Rollback(ctx context.Context, projectID, releaseID, key string)
 		e = &Error{Code: "INVALID_RESPONSE"}
 	}
 	return v, e
+}
+
+// DeleteProject removes the project, its releases and its route. A project the
+// node no longer knows counts as deleted, so the call can be retried safely.
+func (c *Runyer) DeleteProject(ctx context.Context, projectID string) error {
+	if !validID(projectID) {
+		return invalid()
+	}
+	_, e := c.call(ctx, "DELETE", "/projects/"+projectID, nil, "")
+	var remote *Error
+	if errors.As(e, &remote) && remote.HTTPStatus == 404 {
+		return nil
+	}
+	return e
 }
 
 func (c *Runyer) Logs(ctx context.Context, id string, tail int) (string, error) {

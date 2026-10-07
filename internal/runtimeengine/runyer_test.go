@@ -54,6 +54,8 @@ func (f *fakeRunyer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(202, map[string]any{"id": "dep_1", "project_id": "prj_1", "phase": "queued", "external_id": body["external_id"]})
 	case r.URL.Path == "/api/deployments/dep_1":
 		reply(200, map[string]any{"id": "dep_1", "project_id": "prj_1", "phase": f.phase, "release_id": "rel_1", "failure_code": map[bool]string{true: "HEALTH_CHECK_FAILED"}[f.phase == "failed"]})
+	case r.Method == "DELETE" && r.URL.Path == "/api/projects/prj_1":
+		reply(200, map[string]any{"deleted": true})
 	case r.URL.Path == "/api/projects/prj_1":
 		reply(200, map[string]any{"id": "prj_1", "hostname": "site.apps.example.com", "active_release_id": f.active, "route": f.route})
 	case r.URL.Path == "/api/projects/prj_1/rollback":
@@ -137,6 +139,12 @@ func TestRunyerDeploymentLifecycle(t *testing.T) {
 		t.Fatalf("failure code lost: %v", err)
 	}
 
+	if err := c.DeleteProject(ctx, "prj_1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := c.DeleteProject(ctx, "prj_gone"); err != nil {
+		t.Fatalf("deleting a missing project must succeed: %v", err)
+	}
 	if d, err := c.Rollback(ctx, "prj_1", "rel_1", "rb_1"); err != nil || d.ID != "dep_2" || f.bodies["POST /api/projects/prj_1/rollback"]["release_id"] != "rel_1" {
 		t.Fatalf("rollback: %v %+v", err, d)
 	}

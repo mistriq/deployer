@@ -79,6 +79,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 404, "NOT_FOUND")
 		return
 	}
+	if len(p) == 4 && r.Method == http.MethodDelete {
+		s.deleteProject(w, r, tenant, p[3])
+		return
+	}
 	if r.Method != "PUT" && r.Method != "POST" {
 		apiError(w, 405, "METHOD_NOT_ALLOWED")
 		return
@@ -312,4 +316,60 @@ func localSource(root, repository string) bool {
 		return false
 	}
 	return filepath.Dir(repository) == root && strings.HasSuffix(repository, ".git") && !strings.HasPrefix(filepath.Base(repository), ".")
+}
+
+// deleteProject removes a project from its Runtime and then forgets it. It refuses while a
+// deployment is still running, and a project that is already gone counts as deleted.
+func (s *Service) deleteProject(w http.ResponseWriter, r *http.Request, tenant, id string) {
+	s.workerMu.Lock()
+	defer s.workerMu.Unlock()
+	d := s.Store.snapshot()
+	project := d.Projects[id]
+	if project != nil && project.Tenant != tenant {
+		apiError(w, 404, "NOT_FOUND")
+		return
+	}
+	for _, j := range d.Jobs {
+		if j.Tenant == tenant && j.ProjectID == id && !terminal(j.State) {
+			apiError(w, 409, "PROJECT_BUSY")
+			return
+		}
+	}
+	if project != nil {
+		rt, err := s.runtimeFor(project.Spec.RuntimeTargetID)
+		if err != nil {
+			apiError(w, 503, "RUNTIME_TARGET_UNAVAILABLE")
+			return
+		}
+		if remover, ok := rt.(ProjectRemover); ok {
+			if err = remover.DeleteProject(r.Context(), runtimeProject(tenant, id)); err != nil {
+				code := "RUNTIME_UNAVAILABLE"
+				var remote *runtimeengine.Error
+				if errors.As(err, &remote) && identifier.MatchString(remote.Code) {
+					code = remote.Code
+				}
+				apiError(w, 502, code)
+				return
+			}
+		}
+	}
+	err := s.Store.update(func(d *database) error {
+		delete(d.Projects, id)
+		for jobID, j := range d.Jobs {
+			if j.Tenant == tenant && j.ProjectID == id {
+				delete(d.Jobs, jobID)
+				for key := range d.Logs {
+					if strings.HasPrefix(key, jobID+"|") {
+						delete(d.Logs, key)
+					}
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		apiError(w, 503, "STORE_UNAVAILABLE")
+		return
+	}
+	reply(w, 200, map[string]any{"project_id": id, "deleted": true})
 }
