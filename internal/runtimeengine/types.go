@@ -13,6 +13,13 @@ type Config struct {
 	Sandbox        bool
 	HTTPClient     *http.Client
 }
+
+// Protocols a Runtime target can speak. "internal-v1" is the original /api/internal/v1 API.
+const (
+	ProtocolInternalV1 = "internal-v1"
+	ProtocolRunyer     = "runyer"
+)
+
 type API interface {
 	Capabilities(context.Context) (Capabilities, error)
 	UpsertProject(context.Context, ProjectRequest) (Project, error)
@@ -75,6 +82,8 @@ type ProjectRequest struct {
 	ProjectID string   `json:"project_id"`
 	Slug      string   `json:"slug"`
 	Manifest  Manifest `json:"manifest"`
+	// Aliases are custom domains served next to the Runtime's own host name (runyer only).
+	Aliases []string `json:"aliases,omitempty"`
 }
 type Project struct {
 	ID              string `json:"id"`
@@ -122,14 +131,17 @@ type Release struct {
 	HealthStatus                        string `json:"health_status"`
 }
 type Route struct {
-	ID              string `json:"id"`
-	ProjectID       string `json:"project_id"`
-	ReleaseID       string `json:"release_id"`
-	ActiveReleaseID string `json:"active_release_id"`
-	Status          string `json:"status"`
-	DesiredRevision int64  `json:"desired_revision"`
-	AppliedRevision int64  `json:"applied_revision"`
-	Hostname        string `json:"hostname"`
+	ID              string   `json:"id"`
+	ProjectID       string   `json:"project_id"`
+	ReleaseID       string   `json:"release_id"`
+	ActiveReleaseID string   `json:"active_release_id"`
+	Status          string   `json:"status"`
+	DesiredRevision int64    `json:"desired_revision"`
+	AppliedRevision int64    `json:"applied_revision"`
+	Hostname        string   `json:"hostname"`
+	Aliases         []string `json:"aliases,omitempty"`
+	HTTPS           bool     `json:"https,omitempty"`
+	CertStatus      string   `json:"cert_status,omitempty"`
 }
 type Verification struct {
 	Active    bool

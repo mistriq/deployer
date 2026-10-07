@@ -16,6 +16,8 @@ import (
 type targetProfile struct {
 	BaseURL   string `json:"base_url"`
 	TokenFile string `json:"token_file"`
+	// API selects the Runtime protocol: "internal-v1" (default) or "runyer".
+	API string `json:"api,omitempty"`
 }
 type targetCatalogue struct {
 	DefaultTargetID string                   `json:"default_target_id"`
@@ -42,7 +44,7 @@ func privateContents(path string) ([]byte, error) {
 // Target IDs are durable routing identities. Never reassign an existing ID to
 // another node: historical jobs and rollback snapshots still reference it.
 func loadRuntimeTargets(sandbox bool, image string) (map[string]controlplane.Runtime, string, []string, error) {
-	catalogue := targetCatalogue{DefaultTargetID: "default", Targets: map[string]targetProfile{"default": {BaseURL: os.Getenv("RUNTIME_BASE_URL"), TokenFile: os.Getenv("RUNTIME_TOKEN_FILE")}}}
+	catalogue := targetCatalogue{DefaultTargetID: "default", Targets: map[string]targetProfile{"default": {BaseURL: os.Getenv("RUNTIME_BASE_URL"), TokenFile: os.Getenv("RUNTIME_TOKEN_FILE"), API: os.Getenv("RUNTIME_API")}}}
 	if path := os.Getenv("RUNTIME_TARGETS_FILE"); path != "" {
 		if !filepath.IsAbs(path) {
 			return nil, "", nil, errors.New("RUNTIME_TARGETS_FILE must be an absolute path")
@@ -79,9 +81,9 @@ func loadRuntimeTargets(sandbox bool, image string) (map[string]controlplane.Run
 			return nil, "", nil, err
 		}
 		token := strings.TrimSpace(string(b))
-		client, err := runtimeengine.New(runtimeengine.Config{BaseURL: p.BaseURL, Token: token, Sandbox: sandbox})
+		client, err := newRuntimeClient(p, runtimeengine.Config{BaseURL: p.BaseURL, Token: token, Sandbox: sandbox})
 		if err != nil {
-			return nil, "", nil, errors.New("invalid Runtime target endpoint or token")
+			return nil, "", nil, err
 		}
 		if err = checkRegistryLocation(image, p.BaseURL, sandbox); err != nil {
 			return nil, "", nil, err
@@ -90,4 +92,23 @@ func loadRuntimeTargets(sandbox bool, image string) (map[string]controlplane.Run
 		secrets = append(secrets, token)
 	}
 	return runtimes, catalogue.DefaultTargetID, secrets, nil
+}
+
+func newRuntimeClient(p targetProfile, cfg runtimeengine.Config) (controlplane.Runtime, error) {
+	switch p.API {
+	case "", runtimeengine.ProtocolInternalV1:
+		client, err := runtimeengine.New(cfg)
+		if err != nil {
+			return nil, errors.New("invalid Runtime target endpoint or token")
+		}
+		return client, nil
+	case runtimeengine.ProtocolRunyer:
+		client, err := runtimeengine.NewRunyer(cfg)
+		if err != nil {
+			return nil, errors.New("invalid runyer endpoint or token")
+		}
+		return client, nil
+	default:
+		return nil, errors.New("Runtime target api must be internal-v1 or runyer")
+	}
 }

@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mistriq/deployer/internal/runtimeengine"
 )
 
 var identifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
@@ -129,8 +131,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !(remote || localSource(s.Config.LocalSourceRoot, payload.Repository)) || payload.Ref == "" || strings.HasPrefix(payload.Ref, "-") {
 				return errInvalid
 			}
-			if payload.Manifest.Validate() != nil || payload.Build.Kind != payload.Manifest.Kind {
+			if payload.Manifest.Validate() != nil || payload.Build.Kind != payload.Manifest.Kind || len(payload.Aliases) > 20 {
 				return errInvalid
+			}
+			for _, alias := range payload.Aliases {
+				if !runtimeengine.ValidHostname(alias) {
+					return errInvalid
+				}
 			}
 			if payload.Build.Dockerfile == "" {
 				expectedPort := payload.Build.Port

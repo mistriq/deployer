@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/mistriq/deployer/internal/runtimeengine"
+
 	"context"
 	"encoding/json"
 	"net/http"
@@ -53,7 +55,7 @@ func TestRuntimeCatalogueClients(t *testing.T) {
 				t.Fatal(err)
 			}
 			cp := filepath.Join(dir, "targets.json")
-			data, _ := json.Marshal(targetCatalogue{DefaultTargetID: "node-b", Targets: map[string]targetProfile{"default": {a.URL, ap}, "node-b": {b.URL, bp}}})
+			data, _ := json.Marshal(targetCatalogue{DefaultTargetID: "node-b", Targets: map[string]targetProfile{"default": {BaseURL: a.URL, TokenFile: ap}, "node-b": {BaseURL: b.URL, TokenFile: bp}}})
 			if err := os.WriteFile(cp, data, 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -113,3 +115,20 @@ func TestRuntimeCatalogueRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
+
+func TestRuntimeTargetProtocols(t *testing.T) {
+	cfg := runtimeengine.Config{BaseURL: "https://runtime.example.com", Token: "tk_x"}
+	if c, err := newRuntimeClient(targetProfile{}, cfg); err != nil {
+		t.Fatal(err)
+	} else if _, ok := c.(*runtimeengine.Client); !ok {
+		t.Fatalf("default protocol must be internal-v1, got %T", c)
+	}
+	if c, err := newRuntimeClient(targetProfile{API: "runyer"}, cfg); err != nil {
+		t.Fatal(err)
+	} else if _, ok := c.(*runtimeengine.Runyer); !ok {
+		t.Fatalf("api runyer must select the runyer client, got %T", c)
+	}
+	if _, err := newRuntimeClient(targetProfile{API: "v3"}, cfg); err == nil {
+		t.Fatal("unknown protocol accepted")
+	}
+}

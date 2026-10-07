@@ -16,6 +16,16 @@ type ProjectSpec struct {
 	Ref             string                 `json:"ref"`
 	Build           ocibuild.BuildSpec     `json:"build"`
 	Manifest        runtimeengine.Manifest `json:"manifest"`
+	// Aliases are verified custom domains; the Runtime serves them from the next activation.
+	Aliases []string `json:"aliases,omitempty"`
+}
+
+// Domain is the edge state of one host name after a deployment became active.
+type Domain struct {
+	Hostname   string `json:"hostname"`
+	Primary    bool   `json:"primary,omitempty"`
+	HTTPS      bool   `json:"https"`
+	CertStatus string `json:"cert_status,omitempty"`
 }
 type Project struct {
 	ID          string            `json:"project_id"`
@@ -46,6 +56,7 @@ type Job struct {
 	RollbackOf          string             `json:"rollback_of,omitempty"`
 	VerificationStarted time.Time          `json:"verification_started,omitempty"`
 	RuntimeTail         []string           `json:"runtime_tail,omitempty"`
+	Domains             []Domain           `json:"domains,omitempty"`
 }
 
 func (j Job) public() any {
@@ -65,7 +76,8 @@ func (j Job) public() any {
 		RuntimeID       string    `json:"runtime_deployment_id,omitempty"`
 		ReleaseID       string    `json:"runtime_release_id,omitempty"`
 		SiteURL         string    `json:"site_url,omitempty"`
-	}{stableTarget(j.Snapshot.Spec.RuntimeTargetID), j.ID, j.ProjectID, j.RequestID, j.State, j.Stage, j.ErrorCode, j.Message, j.CreatedAt, j.UpdatedAt, j.Commit, j.BuildID, j.RuntimeID, j.ReleaseID, j.SiteURL}
+		Domains         []Domain  `json:"domains,omitempty"`
+	}{stableTarget(j.Snapshot.Spec.RuntimeTargetID), j.ID, j.ProjectID, j.RequestID, j.State, j.Stage, j.ErrorCode, j.Message, j.CreatedAt, j.UpdatedAt, j.Commit, j.BuildID, j.RuntimeID, j.ReleaseID, j.SiteURL, j.Domains}
 }
 
 type LogLine struct {

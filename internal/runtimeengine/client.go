@@ -153,6 +153,7 @@ func (c *Client) UpsertProject(ctx context.Context, r ProjectRequest) (Project, 
 	if e := r.Manifest.Validate(); e != nil {
 		return v, e
 	}
+	r.Aliases = nil // The internal v1 API has no custom domains.
 	b, e := c.call(ctx, "POST", "/projects", r, "")
 	if e == nil {
 		e = decode(b, "project", &v)

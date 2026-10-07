@@ -138,7 +138,7 @@ func (s *Service) Step(ctx context.Context) error {
 		if err = j.Snapshot.Spec.Manifest.ValidateCapabilities(caps); err != nil {
 			return s.fail(j.ID, "deployment_failed", "MANIFEST_INVALID")
 		}
-		_, err = rt.UpsertProject(ctx, runtimeengine.ProjectRequest{ProjectID: projectID, Slug: strings.TrimPrefix(projectID, "prj_"), Manifest: j.Snapshot.Spec.Manifest})
+		_, err = rt.UpsertProject(ctx, runtimeengine.ProjectRequest{ProjectID: projectID, Slug: strings.TrimPrefix(projectID, "prj_"), Manifest: j.Snapshot.Spec.Manifest, Aliases: j.Snapshot.Spec.Aliases})
 		if err != nil {
 			return s.runtimeError(j, err)
 		}
@@ -186,7 +186,9 @@ func (s *Service) Step(ctx context.Context) error {
 		if u, e := url.Parse("https://" + hostname); e == nil && u.Hostname() != "" && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == "" {
 			site = u.String()
 		}
+		domains := edgeDomains(v.Route, j.Snapshot.Spec.Aliases)
 		return s.change(j.ID, func(job *Job) {
+			job.Domains = domains
 			job.State = "online"
 			job.Stage = "active"
 			job.ReleaseID = v.ReleaseID
@@ -243,4 +245,22 @@ func (s *Service) runtimeError(j *Job, err error) error {
 		v.ErrorCode = "RUNTIME_UNAVAILABLE"
 		v.Message = "Runtime je dočasně nedostupný; požadavek bude zopakován."
 	})
+}
+
+// edgeDomains reports the Runtime host name and each requested alias with the route's HTTPS state.
+// An alias the route does not list yet is reported without HTTPS so the portal keeps it "connecting".
+func edgeDomains(route runtimeengine.Route, requested []string) []Domain {
+	served := map[string]bool{}
+	for _, alias := range route.Aliases {
+		served[strings.ToLower(alias)] = true
+	}
+	secure := route.HTTPS && (route.CertStatus == "" || route.CertStatus == "valid" || route.CertStatus == "active" || route.CertStatus == "issued" || route.CertStatus == "ok")
+	var out []Domain
+	if route.Hostname != "" {
+		out = append(out, Domain{Hostname: route.Hostname, Primary: true, HTTPS: secure, CertStatus: route.CertStatus})
+	}
+	for _, alias := range requested {
+		out = append(out, Domain{Hostname: alias, HTTPS: secure && served[alias], CertStatus: route.CertStatus})
+	}
+	return out
 }
