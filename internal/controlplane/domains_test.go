@@ -23,3 +23,12 @@ func TestEdgeDomains(t *testing.T) {
 		t.Fatal("pending certificate must not report HTTPS")
 	}
 }
+
+func TestEdgeDomainsOnlyValidIsSecure(t *testing.T) {
+	for _, status := range []string{"issuing", "failed", "expired", "ok", "active"} {
+		route := runtimeengine.Route{Hostname: "site.apps.example.com", HTTPS: true, CertStatus: status}
+		if edgeDomains(route, nil)[0].HTTPS {
+			t.Fatalf("%q must not count as HTTPS", status)
+		}
+	}
+}

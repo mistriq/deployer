@@ -138,6 +138,16 @@ Build výstup se průběžně čte z procesu a rediguje před zápisem. Runtime 
 
 Odpověď je stejný sledovatelný `deployment_id` jako při deploy. `release_id` je povinný a musí patřit dříve ověřené úspěšné operaci téhož projektu/organizace. Rollback obnoví její digest, manifest a env snapshot bez nového buildu; výsledkem je **nový Runtime release**. Toto je záměrné upřesnění společného kontraktu: katalog nepublikuje idempotenci nativního `/rollback`, proto portálový rollback používá idempotentní `/deployments`. Přímá metoda adaptéru `Rollback` existuje, ale worker ji nepoužívá. Ztracená odpověď tak nevytvoří druhý rollback. Aktuální požadovaná konfigurace projektu zůstane zachována pro příští běžný deploy.
 
+### GET /internal/v1/projects/{project_id}/edge
+
+Aktuální stav veřejného serveru: runyer route a za ní netyer site s certifikátem. Na rozdíl od nasazení se mění i po aktivaci — netyer vydává certifikát zhruba minutu po ní. Portál endpoint polluje, dokud všechny hosty nemají platný certifikát.
+
+```json
+{"project_id":"demo","runtime_target_id":"runyer","supported":true,"checked_at":"2026-10-10T10:00:00Z","edge":{"route_status":"active","tls_mode":"auto","hosts":[{"hostname":"site.yo.gomolo.eu","primary":true,"https":false,"cert_status":"issuing"},{"hostname":"www.client.cz","https":false,"cert_status":"pending"}]}}
+```
+
+`cert_status` používá hodnoty netyeru (`pending`, `issuing`, `valid`, `failed`, `expired`, `revoked`), dále `off` pro site bez TLS a `unknown`. `https:true` jen při `valid` a pokud netyer stránku skutečně obsluhuje přes HTTPS. Alias, který certifikát ještě nepokrývá, je `pending`. Volitelně `cert_error`, `cert_not_after`, `cert_renew_at`, `cert_next_attempt` (unix sekundy), `route_error`, `drift`. `route_status`: `active`, `suspended`, `maintenance`, `offline`, nebo `none` (projekt ještě nemá routu). Runtime bez této schopnosti (internal-v1) vrací `{"supported":false}`.
+
 ## Restart, zálohy a omezení
 
 Jeden proces má exkluzivní lock nad store. Jediný worker vykonává jednu fázi najednou, zachovává FIFO v rámci projektu a střídá projekty podle posledního postupu; při restartu navazuje z uložené fáze, případně bezpečně opakuje sync nebo odeslání se stejným klíčem. Přerušený build se může zopakovat pro stejné SHA, ale nezaloží nový Runtime deployment. Nedostupná nebo nejistá operace blokuje další operace stejného projektu, jiné projekty mohou postupovat. Po 15 minutách nepotvrzené aktivace se zobrazí `ACTIVATION_UNCONFIRMED`; ověřování původního ID pokračuje. Nejistý výsledek se nepovažuje za dokončené selhání, které by dovolilo konfliktní nové nasazení. Více workerů/HA není podporováno.

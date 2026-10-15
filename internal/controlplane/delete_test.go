@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/mistriq/deployer/internal/runtimeengine"
@@ -41,4 +42,14 @@ func TestDeleteProject(t *testing.T) {
 	}
 	requireStatus(t, request(t, s, "DELETE", "/internal/v1/projects/demo", "token-a", nil), 200)
 	requireStatus(t, request(t, s, "GET", "/internal/v1/deployments/"+job, "token-a", nil), 404)
+}
+
+func TestDeleteProjectOffboardPending(t *testing.T) {
+	s := testService(t)
+	s.Runtime = &removingRuntime{err: runtimeengine.ErrOffboardPending}
+	setupProject(t, s)
+	w := request(t, s, "DELETE", "/internal/v1/projects/demo", "token-a", nil)
+	if w.Code != 200 || s.Store.snapshot().Projects["demo"] != nil || !strings.Contains(w.Body.String(), `"offboard_pending":"`+runtimeProject("tenant-a", "demo")+`"`) {
+		t.Fatalf("a suspended project must be forgotten and reported: %d %s", w.Code, w.Body.String())
+	}
 }

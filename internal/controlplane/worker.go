@@ -254,7 +254,9 @@ func edgeDomains(route runtimeengine.Route, requested []string) []Domain {
 	for _, alias := range route.Aliases {
 		served[strings.ToLower(alias)] = true
 	}
-	secure := route.HTTPS && (route.CertStatus == "" || route.CertStatus == "valid" || route.CertStatus == "active" || route.CertStatus == "issued" || route.CertStatus == "ok")
+	// netyer's certificate states: only "valid" is secure. Runtimes that report no certificate state at
+	// all (the older protocol) are trusted on their HTTPS flag.
+	secure := route.HTTPS && (route.CertStatus == "" || route.CertStatus == "valid")
 	var out []Domain
 	if route.Hostname != "" {
 		out = append(out, Domain{Hostname: route.Hostname, Primary: true, HTTPS: secure, CertStatus: route.CertStatus})

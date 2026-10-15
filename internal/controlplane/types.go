@@ -102,6 +102,12 @@ type Runtime interface {
 type ProjectRemover interface {
 	DeleteProject(context.Context, string) error
 }
+
+// EdgeReader is implemented by Runtimes that report what the public is served right now (route,
+// HTTPS and certificate). Runtimes without it answer the edge endpoint with supported=false.
+type EdgeReader interface {
+	Edge(context.Context, string) (runtimeengine.Edge, error)
+}
 type Builder interface {
 	Resolve(context.Context, string, string) (string, error)
 	Build(context.Context, ocibuild.Request, func(string)) (ocibuild.Artifact, error)

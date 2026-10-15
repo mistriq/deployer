@@ -79,6 +79,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 404, "NOT_FOUND")
 		return
 	}
+	if len(p) == 5 && p[4] == "edge" && r.Method == http.MethodGet {
+		s.edge(w, r, tenant, p[3])
+		return
+	}
 	if len(p) == 4 && r.Method == http.MethodDelete {
 		s.deleteProject(w, r, tenant, p[3])
 		return
@@ -318,6 +322,41 @@ func localSource(root, repository string) bool {
 	return filepath.Dir(repository) == root && strings.HasSuffix(repository, ".git") && !strings.HasPrefix(filepath.Base(repository), ".")
 }
 
+// edge reports the live route, HTTPS and certificate state of a project's hosts. Unlike the deployment,
+// this keeps changing after go-live: netyer issues the certificate about a minute after activation.
+func (s *Service) edge(w http.ResponseWriter, r *http.Request, tenant, id string) {
+	project := s.Store.snapshot().Projects[id]
+	if project == nil || project.Tenant != tenant {
+		apiError(w, 404, "NOT_FOUND")
+		return
+	}
+	rt, err := s.runtimeFor(project.Spec.RuntimeTargetID)
+	if err != nil {
+		apiError(w, 503, "RUNTIME_TARGET_UNAVAILABLE")
+		return
+	}
+	reader, ok := rt.(EdgeReader)
+	if !ok {
+		reply(w, 200, map[string]any{"project_id": id, "runtime_target_id": stableTarget(project.Spec.RuntimeTargetID), "supported": false})
+		return
+	}
+	e, err := reader.Edge(r.Context(), runtimeProject(tenant, id))
+	if err != nil {
+		code := "RUNTIME_UNAVAILABLE"
+		var remote *runtimeengine.Error
+		if errors.As(err, &remote) && identifier.MatchString(remote.Code) {
+			code = remote.Code
+		}
+		apiError(w, 502, code)
+		return
+	}
+	e.RouteError = s.redact(e.RouteError)
+	for i := range e.Hosts {
+		e.Hosts[i].CertError = s.redact(e.Hosts[i].CertError)
+	}
+	reply(w, 200, map[string]any{"project_id": id, "runtime_target_id": stableTarget(project.Spec.RuntimeTargetID), "supported": true, "edge": e, "checked_at": time.Now().UTC()})
+}
+
 // deleteProject removes a project from its Runtime and then forgets it. It refuses while a
 // deployment is still running, and a project that is already gone counts as deleted.
 func (s *Service) deleteProject(w http.ResponseWriter, r *http.Request, tenant, id string) {
@@ -335,6 +374,9 @@ func (s *Service) deleteProject(w http.ResponseWriter, r *http.Request, tenant, 
 			return
 		}
 	}
+	// The Runtime may only suspend the project; it is forgotten here all the same and the reply
+	// names the Runtime project an admin still has to offboard.
+	offboard := ""
 	if project != nil {
 		rt, err := s.runtimeFor(project.Spec.RuntimeTargetID)
 		if err != nil {
@@ -342,7 +384,11 @@ func (s *Service) deleteProject(w http.ResponseWriter, r *http.Request, tenant, 
 			return
 		}
 		if remover, ok := rt.(ProjectRemover); ok {
-			if err = remover.DeleteProject(r.Context(), runtimeProject(tenant, id)); err != nil {
+			err = remover.DeleteProject(r.Context(), runtimeProject(tenant, id))
+			if errors.Is(err, runtimeengine.ErrOffboardPending) {
+				offboard, err = runtimeProject(tenant, id), nil
+			}
+			if err != nil {
 				code := "RUNTIME_UNAVAILABLE"
 				var remote *runtimeengine.Error
 				if errors.As(err, &remote) && identifier.MatchString(remote.Code) {
@@ -371,5 +417,9 @@ func (s *Service) deleteProject(w http.ResponseWriter, r *http.Request, tenant, 
 		apiError(w, 503, "STORE_UNAVAILABLE")
 		return
 	}
-	reply(w, 200, map[string]any{"project_id": id, "deleted": true})
+	result := map[string]any{"project_id": id, "deleted": true}
+	if offboard != "" {
+		result["offboard_pending"] = offboard
+	}
+	reply(w, 200, result)
 }

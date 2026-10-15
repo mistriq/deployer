@@ -321,6 +321,10 @@ func (c *Runyer) Rollback(ctx context.Context, projectID, releaseID, key string)
 	return v, e
 }
 
+// ErrOffboardPending reports a project that was suspended instead of removed: runyer lets only
+// admins offboard projects, so an operator token stops it serving and an admin removes it later.
+var ErrOffboardPending = errors.New("runyer: project suspended, offboarding needs an admin")
+
 // DeleteProject removes the project, its releases and its route. A project the
 // node no longer knows counts as deleted, so the call can be retried safely.
 func (c *Runyer) DeleteProject(ctx context.Context, projectID string) error {
@@ -331,6 +335,13 @@ func (c *Runyer) DeleteProject(ctx context.Context, projectID string) error {
 	var remote *Error
 	if errors.As(e, &remote) && remote.HTTPStatus == 404 {
 		return nil
+	}
+	if errors.As(e, &remote) && remote.HTTPStatus == 403 {
+		_, s := c.call(ctx, "POST", "/projects/"+projectID+"/suspend", map[string]string{"reason": "Deleted in Molo; waiting for an admin to offboard it."}, "")
+		if s == nil || errors.As(s, &remote) && remote.HTTPStatus == 409 {
+			return ErrOffboardPending
+		}
+		return s
 	}
 	return e
 }
