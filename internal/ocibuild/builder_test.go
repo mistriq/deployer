@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type runnerFunc func(context.Context, Command) ([]byte, error)
@@ -217,5 +219,91 @@ func TestBuildFailureStagesAndCode(t *testing.T) {
 				t.Fatalf("compilation failure labeled publishing: %v", phases)
 			}
 		})
+	}
+}
+
+func TestBusyBuilderStoreIsRetried(t *testing.T) {
+	repo, sha := repoFixture(t)
+	busy := "#12 ERROR: mount callback failed on /var/lib/docker/containerd/daemon/tmpmounts/x: failed to open writer: ref moby/1/abc locked for 276ms (since now): unavailable"
+	for _, tc := range []struct {
+		name      string
+		failures  int
+		code      string
+		restarted bool
+	}{{"recovers on retry", 1, "", false}, {"restart before last attempt", 2, "", true}, {"stays busy", 3, "BUILDER_BUSY", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			restart := filepath.Join(t.TempDir(), "builder-restart")
+			builds := 0
+			var sawRestart atomic.Bool
+			var logs []string
+			// Like the systemd path unit on the host: restart the builder, then remove the request.
+			stop := make(chan struct{})
+			defer close(stop)
+			go func() {
+				for {
+					select {
+					case <-stop:
+						return
+					case <-time.After(time.Millisecond):
+						if _, err := os.Stat(restart); err == nil {
+							sawRestart.Store(true)
+							os.Remove(restart)
+						}
+					}
+				}
+			}()
+			b := Builder{AllowLocalRepositories: true, TempDir: t.TempDir(), BuilderRestartFile: restart, busyDelay: time.Millisecond, restartWait: 50 * time.Millisecond}
+			b.Runner = runnerFunc(func(ctx context.Context, c Command) ([]byte, error) {
+				if c.Name != "docker" {
+					return (SystemRunner{}).Run(ctx, c)
+				}
+				if c.Args[0] == "version" {
+					return []byte("29.8.2"), nil
+				}
+				builds++
+				if builds <= tc.failures {
+					c.Log(busy)
+					return []byte(busy), fmt.Errorf("exit status 1")
+				}
+				for i, a := range c.Args {
+					if a == "--metadata-file" {
+						os.WriteFile(c.Args[i+1], []byte(`{"containerimage.digest":"sha256:`+strings.Repeat("b", 64)+`"}`), 0600)
+					}
+				}
+				return nil, nil
+			})
+			_, err := b.Build(context.Background(), Request{Repository: repo, Commit: sha, ImageRepository: "registry.example/app", Spec: BuildSpec{Kind: "dockerfile"}}, func(l string) { logs = append(logs, l) })
+			var pipeline *PipelineError
+			if tc.code == "" && err != nil {
+				t.Fatalf("expected success after retry: %v", err)
+			}
+			if tc.code != "" && (!errors.As(err, &pipeline) || pipeline.Code != tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, err)
+			}
+			if sawRestart.Load() != tc.restarted {
+				t.Fatalf("restart requested=%v, want %v", sawRestart.Load(), tc.restarted)
+			}
+			if !strings.Contains(strings.Join(logs, "\n"), "retrying (attempt 2 of 3)") {
+				t.Fatal("retry not visible in the build log")
+			}
+		})
+	}
+}
+
+func TestFailingDockerfileIsNotRetried(t *testing.T) {
+	repo, sha := repoFixture(t)
+	builds := 0
+	b := Builder{AllowLocalRepositories: true, TempDir: t.TempDir(), busyDelay: time.Millisecond}
+	b.Runner = runnerFunc(func(ctx context.Context, c Command) ([]byte, error) {
+		if c.Name != "docker" {
+			return (SystemRunner{}).Run(ctx, c)
+		}
+		builds++
+		return []byte("ERROR: process \"/bin/sh -c npm run build\" did not complete successfully: exit code: 1"), fmt.Errorf("exit status 1")
+	})
+	_, err := b.Build(context.Background(), Request{Repository: repo, Commit: sha, ImageRepository: "registry.example/app", Spec: BuildSpec{Kind: "dockerfile"}}, nil)
+	var pipeline *PipelineError
+	if !errors.As(err, &pipeline) || pipeline.Code != "BUILD_PUBLISH_FAILED" || builds != 1 {
+		t.Fatalf("a failing Dockerfile must fail at once: builds=%d err=%v", builds, err)
 	}
 }

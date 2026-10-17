@@ -106,6 +106,9 @@ func (SystemRunner) Run(ctx context.Context, c Command) ([]byte, error) {
 }
 
 type Builder struct {
+	// BuilderRestartFile, when set, is created to ask the host to restart the builder Docker (see Build).
+	BuilderRestartFile     string
+	busyDelay, restartWait time.Duration // tests shorten the retry pauses
 	AllowLocalRepositories bool
 	// LocalRepositoryRoot, when set, restricts local repositories to its direct children.
 	LocalRepositoryRoot string
@@ -195,7 +198,8 @@ func (b *Builder) Build(ctx context.Context, r Request, log func(string)) (Artif
 			log(line)
 		}})
 		if e != nil {
-			return "", fmt.Errorf("%s command failed: %w", name, e)
+			// The output is kept so callers can tell a passing builder hiccup from a real failure.
+			return strings.TrimSpace(string(output)), fmt.Errorf("%s command failed: %w", name, e)
 		}
 		return strings.TrimSpace(string(output)), nil
 	}
@@ -289,8 +293,32 @@ func (b *Builder) Build(ctx context.Context, r Request, log func(string)) (Artif
 	}
 	// Buildx combines build and publication; only metadata from a successful push
 	// constitutes an artifact. Streaming output redacts registry credentials.
-	if _, err = run(root, "docker", args...); err != nil {
-		return artifact, &PipelineError{Code: "BUILD_PUBLISH_FAILED", Err: err}
+	// The builder's image store occasionally keeps a write locked ("failed to open writer … locked … unavailable").
+	// That is never the customer's fault: retry, and before the last attempt ask the host to restart the builder
+	// (BuilderRestartFile, watched by a systemd unit outside the sandbox). If it still fails, report BUILDER_BUSY.
+	for attempt := 1; ; attempt++ {
+		var output string
+		if output, err = run(root, "docker", args...); err == nil {
+			break
+		}
+		if ctx.Err() != nil || !BuilderStorageBusy(output) {
+			return artifact, &PipelineError{Code: "BUILD_PUBLISH_FAILED", Err: err}
+		}
+		if attempt >= 3 {
+			return artifact, &PipelineError{Code: "BUILDER_BUSY", Err: err}
+		}
+		if log != nil {
+			log(fmt.Sprintf("molo: the builder's image store was busy; retrying (attempt %d of 3)", attempt+1))
+		}
+		if attempt == 2 && b.BuilderRestartFile != "" {
+			if log != nil {
+				log("molo: restarting the builder before the last attempt")
+			}
+			b.restartBuilder(ctx, run, root)
+		} else if !sleepContext(ctx, time.Duration(attempt)*b.delay(b.busyDelay, 5*time.Second)) {
+			return artifact, &PipelineError{Code: "BUILDER_BUSY", Err: err}
+		}
+		publishedPhase = false
 	}
 	if !publishedPhase {
 		phase("publishing")
@@ -447,4 +475,48 @@ func (b *Builder) validateRepository(repository string) error {
 		return nil
 	}
 	return fmt.Errorf("repository must be an HTTPS URL without embedded credentials")
+}
+
+var builderStorageBusy = regexp.MustCompile(`(?i)failed to open writer|locked for .*unavailable|failed commit on ref|mount callback failed`)
+
+// BuilderStorageBusy reports a transient image-store failure inside the builder, as opposed to a failing Dockerfile.
+func BuilderStorageBusy(output string) bool { return builderStorageBusy.MatchString(output) }
+
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// restartBuilder writes the request file and waits (up to two minutes) until the host removed it and the builder
+// answers again. Without a watcher it simply waits and the last attempt runs anyway.
+func (b *Builder) restartBuilder(ctx context.Context, run func(string, string, ...string) (string, error), root string) {
+	if err := os.WriteFile(b.BuilderRestartFile, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+		sleepContext(ctx, 15*time.Second)
+		return
+	}
+	deadline := time.Now().Add(b.delay(b.restartWait, 2*time.Minute))
+	for time.Now().Before(deadline) {
+		if !sleepContext(ctx, b.delay(b.busyDelay, 3*time.Second)) {
+			return
+		}
+		if _, err := os.Stat(b.BuilderRestartFile); os.IsNotExist(err) {
+			if _, err := run(root, "docker", "version", "--format", "{{.Server.Version}}"); err == nil {
+				return
+			}
+		}
+	}
+	os.Remove(b.BuilderRestartFile)
+}
+
+func (b *Builder) delay(set, fallback time.Duration) time.Duration {
+	if set > 0 {
+		return set
+	}
+	return fallback
 }

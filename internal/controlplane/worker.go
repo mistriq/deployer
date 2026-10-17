@@ -117,7 +117,7 @@ func (s *Service) Step(ctx context.Context) error {
 			}
 			var pipeline *ocibuild.PipelineError
 			if errors.As(err, &pipeline) {
-				code = "BUILD_PUBLISH_FAILED"
+				code = pipeline.Code
 			}
 			return s.fail(j.ID, "build_failed", code)
 		}
