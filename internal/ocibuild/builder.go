@@ -33,6 +33,8 @@ type BuildSpec struct {
 	Platform       string            `json:"platform"`
 	Port           int               `json:"port"`
 	BuildArgs      map[string]string `json:"build_args"`
+	// Badge adds the "Running on molo" badge to every HTML page of a generated static site (free plan).
+	Badge bool `json:"badge,omitempty"`
 }
 type RegistryCredentials struct{ Registry, Username, Password string }
 type Request struct {
@@ -393,6 +395,9 @@ func Dockerfile(s BuildSpec) (string, error) {
 		}
 		if filepath.IsAbs(dir) || dir == ".." || strings.HasPrefix(filepath.Clean(dir), "../") || !regexp.MustCompile(`^[A-Za-z0-9_./-]+$`).MatchString(dir) {
 			return "", fmt.Errorf("invalid static output directory")
+		}
+		if s.Badge {
+			out += badgeStep(dir)
 		}
 		out += "FROM nginxinc/nginx-unprivileged:stable-alpine\nUSER 10001:10001\nCOPY --from=build /app/" + dir + " /usr/share/nginx/html\nEXPOSE 8080\nENTRYPOINT [\"nginx\"]\nCMD [\"-g\", \"daemon off;\"]\n"
 	} else {

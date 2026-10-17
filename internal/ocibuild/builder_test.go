@@ -2,6 +2,7 @@ package ocibuild
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -305,5 +306,57 @@ func TestFailingDockerfileIsNotRetried(t *testing.T) {
 	var pipeline *PipelineError
 	if !errors.As(err, &pipeline) || pipeline.Code != "BUILD_PUBLISH_FAILED" || builds != 1 {
 		t.Fatalf("a failing Dockerfile must fail at once: builds=%d err=%v", builds, err)
+	}
+}
+
+func TestBadgeOnlyWhenAsked(t *testing.T) {
+	plain, err := Dockerfile(BuildSpec{Kind: "static", OutputDir: "dist"})
+	if err != nil || strings.Contains(plain, "molo-badge") {
+		t.Fatalf("no badge unless asked: %v", err)
+	}
+	badged, err := Dockerfile(BuildSpec{Kind: "static", OutputDir: "dist", Badge: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := strings.Index(badged, "node /tmp/molo-badge.js /app/dist ")
+	if step < 0 || step > strings.Index(badged, "FROM nginxinc") {
+		t.Fatalf("the badge step must run in the build stage, on the output dir:\n%s", badged)
+	}
+	node, _ := Dockerfile(BuildSpec{Kind: "node-http", Badge: true})
+	if strings.Contains(node, "molo-badge") {
+		t.Fatal("apps are not badged by the static recipe")
+	}
+}
+
+// Runs the injection script with Node on a sample output directory (skipped without node).
+func TestBadgeScriptInjectsOnce(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "sub"), 0o755)
+	os.WriteFile(filepath.Join(dir, "index.html"), []byte("<!doctype html><html lang=\"cs\"><body><h1>Ahoj</h1></BODY></html>"), 0o644)
+	os.WriteFile(filepath.Join(dir, "sub", "page.htm"), []byte("<p>no body tag</p>"), 0o644)
+	os.WriteFile(filepath.Join(dir, "app.js"), []byte("console.log('</body>')"), 0o644)
+	script := filepath.Join(t.TempDir(), "badge.js")
+	os.WriteFile(script, []byte(badgeScript), 0o644)
+	run := func() {
+		if out, err := exec.Command("node", script, dir, base64.StdEncoding.EncodeToString([]byte(badgeHTML))).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v", out, err)
+		}
+	}
+	run()
+	run() // a second build step must not add a second badge
+	index, _ := os.ReadFile(filepath.Join(dir, "index.html"))
+	page, _ := os.ReadFile(filepath.Join(dir, "sub", "page.htm"))
+	js, _ := os.ReadFile(filepath.Join(dir, "app.js"))
+	if strings.Count(string(index), "data-molo-badge") != 1 || !strings.Contains(string(index), "Běží na") || !strings.HasSuffix(string(index), "</BODY></html>") {
+		t.Fatalf("index not badged once before </body> in Czech: %s", index)
+	}
+	if !strings.Contains(string(page), "Running on") {
+		t.Fatal("pages without </body> get the badge appended")
+	}
+	if strings.Contains(string(js), "molo") {
+		t.Fatal("only HTML files are touched")
 	}
 }
