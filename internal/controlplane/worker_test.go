@@ -39,12 +39,14 @@ type fakeRuntime struct {
 	submitFailures int
 	verifyError    error
 	active         bool
+	upserts        []runtimeengine.ProjectRequest
 }
 
 func (r *fakeRuntime) Capabilities(context.Context) (runtimeengine.Capabilities, error) {
 	return runtimeengine.Capabilities{ManifestVersion: 1, SupportedManifestKinds: []string{"node-http"}}, nil
 }
 func (r *fakeRuntime) UpsertProject(_ context.Context, p runtimeengine.ProjectRequest) (runtimeengine.Project, error) {
+	r.upserts = append(r.upserts, p)
 	return runtimeengine.Project{ID: p.ProjectID}, nil
 }
 func (r *fakeRuntime) ReplaceEnvironment(_ context.Context, _ string, env map[string]string) error {
@@ -178,5 +180,32 @@ func TestRollbackUsesHistoricalArtifactAndEnvironment(t *testing.T) {
 	}
 	if len(r.requests) != 2 || r.requests[1].Artifact.Digest != old.Artifact.Digest || r.keys[1] != rollbackID {
 		t.Fatal("rollback lost immutable artifact or distinct request identity")
+	}
+}
+
+func TestRollbackNamingHostsServesTheSameReleaseUnderThem(t *testing.T) {
+	s, b, r, id := workerFixture(t)
+	step(t, s, 6)
+	old := s.Store.snapshot().Jobs[id]
+	if old.State != "online" {
+		t.Fatal("fixture did not deploy")
+	}
+	bad := request(t, s, "POST", "/internal/v1/projects/demo/rollback", "token-a", map[string]any{"request_id": "switch-bad", "release_id": old.ReleaseID, "hostname": "www.client.cz", "aliases": []string{"www.client.cz"}})
+	requireStatus(t, bad, 400)
+	w := request(t, s, "POST", "/internal/v1/projects/demo/rollback", "token-a", map[string]any{"request_id": "switch-hosts", "release_id": old.ReleaseID, "hostname": "www.client.cz", "aliases": []string{"shop.client.cz"}})
+	requireStatus(t, w, 202)
+	var response map[string]string
+	json.Unmarshal(w.Body.Bytes(), &response)
+	step(t, s, 4)
+	j := s.Store.snapshot().Jobs[response["deployment_id"]]
+	if j.State != "online" || b.calls != 1 || j.Artifact.Digest != old.Artifact.Digest {
+		t.Fatalf("host switch must reuse the running artifact without a build: %+v", j)
+	}
+	last := r.upserts[len(r.upserts)-1]
+	if last.Hostname != "www.client.cz" || len(last.Aliases) != 1 || last.Aliases[0] != "shop.client.cz" {
+		t.Fatalf("runtime did not receive the named hosts: %+v", last)
+	}
+	if spec := s.Store.snapshot().Projects["demo"].Spec; spec.Hostname != "www.client.cz" || len(spec.Aliases) != 1 {
+		t.Fatalf("project must keep the named hosts for later deployments: %+v", spec)
 	}
 }

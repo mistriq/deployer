@@ -230,6 +230,22 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return errMissing
 				}
 				j.Snapshot = target.Snapshot
+				// A rollback restores the target's host names too, unless the request names them: then the same
+				// release is served under the current domains (runyer applies host names at activation), and later
+				// deployments keep them.
+				if payload.Hostname != "" {
+					if !runtimeengine.ValidHostname(payload.Hostname) || len(payload.Aliases) > 20 {
+						return errInvalid
+					}
+					for _, alias := range payload.Aliases {
+						if !runtimeengine.ValidHostname(alias) || alias == payload.Hostname {
+							return errInvalid
+						}
+					}
+					aliases := append([]string(nil), payload.Aliases...)
+					j.Snapshot.Spec.Hostname, j.Snapshot.Spec.Aliases = payload.Hostname, aliases
+					project.Spec.Hostname, project.Spec.Aliases = payload.Hostname, append([]string(nil), aliases...)
+				}
 				j.Artifact = target.Artifact
 				j.Commit = target.Commit
 				j.RollbackOf = target.ID
