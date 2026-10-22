@@ -109,6 +109,18 @@ func TestRunyerDeploymentLifecycle(t *testing.T) {
 	if aliases := f.bodies["POST /api/projects"]["aliases"].([]any); len(aliases) != 1 || aliases[0] != "www.client.cz" {
 		t.Fatalf("aliases not sent: %v", f.bodies["POST /api/projects"])
 	}
+	if _, sent := f.bodies["POST /api/projects"]["hostname"]; sent {
+		t.Fatalf("no host name was asked for, runyer must keep its own: %v", f.bodies["POST /api/projects"])
+	}
+	if _, err := c.UpsertProject(ctx, ProjectRequest{ProjectID: "prj_1", Slug: "one", Manifest: runyerManifest(), Hostname: "client.cz", Aliases: []string{"www.client.cz"}}); err != nil {
+		t.Fatal(err)
+	}
+	if host := f.bodies["POST /api/projects"]["hostname"]; host != "client.cz" {
+		t.Fatalf("custom host name not sent: %v", f.bodies["POST /api/projects"])
+	}
+	if _, err := c.UpsertProject(ctx, ProjectRequest{ProjectID: "prj_1", Slug: "one", Manifest: runyerManifest(), Hostname: "Not A Host"}); err == nil {
+		t.Fatal("invalid host name accepted")
+	}
 	if _, err := c.UpsertProject(ctx, ProjectRequest{ProjectID: "prj_1", Slug: "one", Manifest: runyerManifest(), Aliases: []string{"Not A Host"}}); err == nil {
 		t.Fatal("invalid alias accepted")
 	}

@@ -167,7 +167,7 @@ func (c *Runyer) project(ctx context.Context, id string) (runyerProject, error) 
 
 func (c *Runyer) UpsertProject(ctx context.Context, r ProjectRequest) (Project, error) {
 	var v Project
-	if !validID(r.ProjectID) || !validID(r.Slug) || len(r.Aliases) > 20 {
+	if !validID(r.ProjectID) || !validID(r.Slug) || len(r.Aliases) > 20 || (r.Hostname != "" && !ValidHostname(r.Hostname)) {
 		return v, invalid()
 	}
 	for _, alias := range r.Aliases {
@@ -184,6 +184,9 @@ func (c *Runyer) UpsertProject(ctx context.Context, r ProjectRequest) (Project, 
 		aliases = []string{}
 	}
 	body := map[string]any{"id": r.ProjectID, "slug": r.Slug, "manifest": r.Manifest, "aliases": aliases}
+	if r.Hostname != "" {
+		body["hostname"] = r.Hostname
+	}
 	b, e := c.call(ctx, "POST", "/projects", body, "")
 	var p runyerProject
 	if e == nil {

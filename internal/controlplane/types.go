@@ -16,6 +16,9 @@ type ProjectSpec struct {
 	Ref             string                 `json:"ref"`
 	Build           ocibuild.BuildSpec     `json:"build"`
 	Manifest        runtimeengine.Manifest `json:"manifest"`
+	// Hostname replaces the Runtime's own host name (a verified custom domain, or the Runtime's default
+	// named explicitly); empty leaves it to the Runtime. Like aliases it applies at the next activation.
+	Hostname string `json:"hostname,omitempty"`
 	// Aliases are verified custom domains; the Runtime serves them from the next activation.
 	Aliases []string `json:"aliases,omitempty"`
 }

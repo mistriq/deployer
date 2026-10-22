@@ -82,7 +82,10 @@ type ProjectRequest struct {
 	ProjectID string   `json:"project_id"`
 	Slug      string   `json:"slug"`
 	Manifest  Manifest `json:"manifest"`
-	// Aliases are custom domains served next to the Runtime's own host name (runyer only).
+	// Hostname replaces the Runtime's own host name, e.g. with the customer's domain, so the Runtime's
+	// address is neither served nor given a certificate (runyer only). Empty keeps the Runtime's choice.
+	Hostname string `json:"hostname,omitempty"`
+	// Aliases are custom domains served next to the host name (runyer only).
 	Aliases []string `json:"aliases,omitempty"`
 }
 type Project struct {

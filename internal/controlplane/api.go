@@ -142,8 +142,11 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if payload.Manifest.Validate() != nil || payload.Build.Kind != payload.Manifest.Kind || len(payload.Aliases) > 20 {
 				return errInvalid
 			}
+			if payload.Hostname != "" && !runtimeengine.ValidHostname(payload.Hostname) {
+				return errInvalid
+			}
 			for _, alias := range payload.Aliases {
-				if !runtimeengine.ValidHostname(alias) {
+				if !runtimeengine.ValidHostname(alias) || alias == payload.Hostname {
 					return errInvalid
 				}
 			}

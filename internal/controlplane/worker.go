@@ -138,7 +138,7 @@ func (s *Service) Step(ctx context.Context) error {
 		if err = j.Snapshot.Spec.Manifest.ValidateCapabilities(caps); err != nil {
 			return s.fail(j.ID, "deployment_failed", "MANIFEST_INVALID")
 		}
-		_, err = rt.UpsertProject(ctx, runtimeengine.ProjectRequest{ProjectID: projectID, Slug: strings.TrimPrefix(projectID, "prj_"), Manifest: j.Snapshot.Spec.Manifest, Aliases: j.Snapshot.Spec.Aliases})
+		_, err = rt.UpsertProject(ctx, runtimeengine.ProjectRequest{ProjectID: projectID, Slug: strings.TrimPrefix(projectID, "prj_"), Manifest: j.Snapshot.Spec.Manifest, Hostname: j.Snapshot.Spec.Hostname, Aliases: j.Snapshot.Spec.Aliases})
 		if err != nil {
 			return s.runtimeError(j, err)
 		}

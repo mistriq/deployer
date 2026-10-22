@@ -81,6 +81,8 @@ Upsert lokální požadované konfigurace. `revision` roste při nové změně. 
 
 Odpověď `200 {"project_id":"…","revision":1,"request_id":"…"}`. `policy_version` musí odpovídat nasazené Runtime politice. Pro statický projekt nastavte oba `kind` na `static`, port na `8080`, health path na existující asset a `build.output_dir` na `dist`. Pokud nepotřebujete npm, použijte explicitní install/build command z ukázkových projektů. Volitelné `build.dockerfile` volí vlastní Dockerfile relativně ke context dir. Bez něj se generuje recipe pro statický nebo Node HTTP server. `platform` nastavte podle VPS; výchozí hodnota je `linux/amd64`, lze zvolit `linux/arm64`. `build_args` nejsou secret mechanismus; build argumenty se mohou dostat do image/history. Runtime env se do buildu nepředává.
 
+Volitelné `hostname` a `aliases` (jen runyer) určují adresy webu od další aktivace. `hostname` nahrazuje vlastní adresu Runtime, typicky ověřenou doménou zákazníka; Runtime pak svou adresu (`<id>.yo.gomolo.eu`) neobsluhuje ani pro ni nevydává certifikát. Prázdné `hostname` nechává volbu na Runtime. `aliases` jsou další domény (nejvýše 20) a nesmí opakovat `hostname`.
+
 ### PUT /internal/v1/projects/{project_id}/env
 
 ```json
