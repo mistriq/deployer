@@ -260,7 +260,7 @@ func (b *Builder) Build(ctx context.Context, r Request, log func(string)) (Artif
 		}
 	}
 	metadata := filepath.Join(root, "metadata.json")
-	args := []string{"buildx", "build", "--push", "--progress=plain", "--metadata-file", metadata, "--tag", r.ImageRepository + ":" + sha, "--file", dockerfile}
+	args := []string{"buildx", "build", "--pull", "--push", "--progress=plain", "--metadata-file", metadata, "--tag", r.ImageRepository + ":" + sha, "--file", dockerfile}
 	platform := r.Spec.Platform
 	if platform == "" {
 		platform = "linux/amd64"
@@ -396,6 +396,7 @@ func Dockerfile(s BuildSpec) (string, error) {
 		if filepath.IsAbs(dir) || dir == ".." || strings.HasPrefix(filepath.Clean(dir), "../") || !regexp.MustCompile(`^[A-Za-z0-9_./-]+$`).MatchString(dir) {
 			return "", fmt.Errorf("invalid static output directory")
 		}
+		out += guardStep("public", "/app/"+dir)
 		if s.Badge {
 			out += badgeStep(dir)
 		}
@@ -413,6 +414,7 @@ func Dockerfile(s BuildSpec) (string, error) {
 			start = "npm start"
 		}
 		cmd, _ := json.Marshal([]string{"sh", "-c", start})
+		out += guardStep("app", appBrowserDirs...)
 		out += fmt.Sprintf("FROM node:22-alpine\nWORKDIR /app\nENV NODE_ENV=production\nENV HOME=/tmp\nENV NPM_CONFIG_CACHE=/tmp/.npm\nENV PORT=%d\nCOPY --from=build --chown=10001:10001 /app /app\nUSER 10001:10001\nEXPOSE %d\nCMD %s\n", port, port, cmd)
 	}
 	return out, nil
