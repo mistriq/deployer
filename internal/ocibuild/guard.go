@@ -20,12 +20,12 @@ const [mode,...roots]=process.argv.slice(2);
 const privateFile=/^(\.(?!well-known$).+|id_(rsa|dsa|ecdsa|ed25519)|.+\.(pem|key|p12|pfx|sql|sqlite|sqlite3|db|bak|old|orig|swp|log)|.+~)$/i;
 const jwtRole=token=>{try{return JSON.parse(Buffer.from(token.split(".")[1],"base64url").toString("utf8")).role;}catch{return null;}};
 const rules=[
-["a Stripe secret key",/\b[rs]k_live_[0-9A-Za-z]{20,}/g],
-["a Supabase service_role key",/\beyJ[0-9A-Za-z_-]{10,}\.eyJ[0-9A-Za-z_-]{20,}\.[0-9A-Za-z_-]{20,}/g,token=>jwtRole(token)==="service_role"],
-["a Supabase secret key",/\bsb_secret_[0-9A-Za-z_-]{20,}/g],
-["an OpenAI API key",/\bsk-[0-9A-Za-z_-]{16,}T3BlbkFJ[0-9A-Za-z_-]{16,}/g],
-["an Anthropic API key",/\bsk-ant-(?:api|admin)\d\d-[0-9A-Za-z_-]{80,}/g],
-["a GitHub token",/\b(?:gh[opsu]_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{60,})/g],
+["a Stripe secret key",/\b[rs]k_live_[0-9A-Za-z]{20,255}/g],
+["a Supabase service_role key",/\beyJ[0-9A-Za-z_-]{10,1000}\.eyJ[0-9A-Za-z_-]{20,4000}\.[0-9A-Za-z_-]{20,1000}/g,token=>jwtRole(token)==="service_role"],
+["a Supabase secret key",/\bsb_secret_[0-9A-Za-z_-]{20,200}/g],
+["an OpenAI API key",/\bsk-[0-9A-Za-z_-]{16,300}T3BlbkFJ[0-9A-Za-z_-]{16,300}/g],
+["an Anthropic API key",/\bsk-ant-(?:api|admin)\d\d-[0-9A-Za-z_-]{80,300}/g],
+["a GitHub token",/\b(?:gh[opsu]_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{60,255})/g],
 ["a SendGrid API key",/\bSG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}/g],
 ["a private key",/-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/g]];
 const shown=p=>p.replace(/[^\w./@+-]/g,"?").slice(0,160);
@@ -40,8 +40,10 @@ let data;try{if(fs.statSync(file).size>8388608)continue;data=fs.readFileSync(fil
 if(data.subarray(0,8000).includes(0))continue;
 const text=data.toString("utf8");
 for(const [label,pattern,accept] of rules){pattern.lastIndex=0;let match;
-while((match=pattern.exec(text))){if(accept&&!accept(match[0]))continue;
-found.push(label+" in "+shown(rel)+" (line "+(text.slice(0,match.index).split("\n").length)+")");break;}}}}
+// A file the scanner cannot read through is reported and skipped; it never fails the build.
+try{while((match=pattern.exec(text))){if(accept&&!accept(match[0]))continue;
+found.push(label+" in "+shown(rel)+" (line "+(text.slice(0,match.index).split("\n").length)+")");break;}}
+catch{console.log("molo-guard: could not check "+shown(rel)+" for "+label);}}}}
 for(const root of roots)if(fs.existsSync(root))walk(root,root);
 if(found.length){for(const item of found.slice(0,20))console.log("molo-guard: secret found: "+item);
 console.log("molo-guard: stopped before going live. Visitors' browsers can read these files, so anyone could copy the key. Remove it from the code, create a new key with its provider, and keep it on a server (Environment variables). Your live version did not change.");

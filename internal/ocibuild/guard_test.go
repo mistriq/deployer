@@ -99,3 +99,19 @@ func TestGuardLetsPublicKeysThrough(t *testing.T) {
 		t.Fatalf("publishable, anon, test keys and binary files pass:\n%s", out)
 	}
 }
+
+// Huge runs of key-like characters (inlined base64 images, minified bundles) must neither crash the scanner nor hide
+// a real key further on.
+func TestGuardSurvivesHugeFiles(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.js"), []byte(strings.Repeat("eyJ", 2700000)), 0o644)
+	os.WriteFile(filepath.Join(dir, "b.js"), []byte(strings.Repeat("sk-"+strings.Repeat("A", 5000)+" ", 1600)), 0o644)
+	os.WriteFile(filepath.Join(dir, "c.js"), []byte("data:image/png;base64,"+strings.Repeat("iVBORw0KGgoAAAANSUhEUgeyJ", 300000)), 0o644)
+	if out, err := runGuard(t, "app", dir); err != nil {
+		t.Fatalf("huge files without keys pass:\n%s", out)
+	}
+	os.WriteFile(filepath.Join(dir, "d.js"), []byte(strings.Repeat("A", 4000000)+`;Stripe("sk_`+`live_`+strings.Repeat("Q7", 14)+`")`), 0o644)
+	if out, err := runGuard(t, "app", dir); err == nil || !strings.Contains(out, "a Stripe secret key in d.js") {
+		t.Fatalf("a key after a huge run is still found:\n%s", out)
+	}
+}
