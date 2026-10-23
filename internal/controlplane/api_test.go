@@ -137,3 +137,15 @@ func TestAPIStrictPayloadAndRollbackTarget(t *testing.T) {
 		t.Fatal("invalid request created job")
 	}
 }
+
+// The portal's "Deploy anyway" sends build.allow_secrets; the strict decoder must accept it (and still reject typos).
+func TestAPIAcceptsAllowSecrets(t *testing.T) {
+	s := testService(t)
+	build := map[string]any{"kind": "node-http", "start_command": "node server.js", "port": 3000, "allow_secrets": true}
+	requireStatus(t, request(t, s, "PUT", "/internal/v1/projects/demo", "token-a", map[string]any{"request_id": "p-allow", "repository": "https://github.com/example/app.git", "ref": "main", "build": build, "manifest": testManifest()}), 200)
+	build["allow_secret"] = true
+	delete(build, "allow_secrets")
+	if w := request(t, s, "PUT", "/internal/v1/projects/demo", "token-a", map[string]any{"request_id": "p-typo", "repository": "https://github.com/example/app.git", "ref": "main", "build": build, "manifest": testManifest()}); w.Code == 200 {
+		t.Fatal("unknown build fields are still rejected")
+	}
+}

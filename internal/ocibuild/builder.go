@@ -35,6 +35,9 @@ type BuildSpec struct {
 	BuildArgs      map[string]string `json:"build_args"`
 	// Badge adds the "Running on molo" badge to every HTML page of a generated static site (free plan).
 	Badge bool `json:"badge,omitempty"`
+	// AllowSecrets lets a build through the leak guard's key check (the owner chose "Deploy anyway"); the keys found
+	// are still named in the log, and private files are still kept off static sites.
+	AllowSecrets bool `json:"allow_secrets,omitempty"`
 }
 type RegistryCredentials struct{ Registry, Username, Password string }
 type Request struct {
@@ -396,7 +399,7 @@ func Dockerfile(s BuildSpec) (string, error) {
 		if filepath.IsAbs(dir) || dir == ".." || strings.HasPrefix(filepath.Clean(dir), "../") || !regexp.MustCompile(`^[A-Za-z0-9_./-]+$`).MatchString(dir) {
 			return "", fmt.Errorf("invalid static output directory")
 		}
-		out += guardStep("public", "/app/"+dir)
+		out += guardStep(guardMode("public", s.AllowSecrets), "/app/"+dir)
 		if s.Badge {
 			out += badgeStep(dir)
 		}
@@ -414,7 +417,7 @@ func Dockerfile(s BuildSpec) (string, error) {
 			start = "npm start"
 		}
 		cmd, _ := json.Marshal([]string{"sh", "-c", start})
-		out += guardStep("app", appBrowserDirs...)
+		out += guardStep(guardMode("app", s.AllowSecrets), appBrowserDirs...)
 		out += fmt.Sprintf("FROM node:22-alpine\nWORKDIR /app\nENV NODE_ENV=production\nENV HOME=/tmp\nENV NPM_CONFIG_CACHE=/tmp/.npm\nENV PORT=%d\nCOPY --from=build --chown=10001:10001 /app /app\nUSER 10001:10001\nEXPOSE %d\nCMD %s\n", port, port, cmd)
 	}
 	return out, nil

@@ -115,3 +115,24 @@ func TestGuardSurvivesHugeFiles(t *testing.T) {
 		t.Fatalf("a key after a huge run is still found:\n%s", out)
 	}
 }
+
+// "Deploy anyway": the key is still reported, but the build goes on; private files are still removed.
+func TestGuardDeployAnyway(t *testing.T) {
+	spec, _ := Dockerfile(BuildSpec{Kind: "static", OutputDir: "dist", AllowSecrets: true})
+	if !strings.Contains(spec, "molo-guard.js public+allow /app/dist") {
+		t.Fatalf("the static recipe passes the owner's choice to the guard:\n%s", spec)
+	}
+	if plain, _ := Dockerfile(BuildSpec{Kind: "node-http"}); strings.Contains(plain, "+allow") {
+		t.Fatal("the key check is on unless asked")
+	}
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, ".env"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(dir, "docs.js"), []byte(`// example: "sk_`+`live_`+strings.Repeat("a1", 12)+`"`), 0o644)
+	out, err := runGuard(t, "public+allow", dir)
+	if err != nil || !strings.Contains(out, "molo-guard: published anyway: a Stripe secret key in docs.js (line 1)") || strings.Contains(out, "secret found") {
+		t.Fatalf("an allowed key passes and is reported: %v\n%s", err, out)
+	}
+	if _, e := os.Stat(filepath.Join(dir, ".env")); e == nil {
+		t.Fatal(".env is still kept off the site")
+	}
+}

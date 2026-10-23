@@ -16,7 +16,7 @@ import (
 // A stopped build never replaces the live version. Public keys (Stripe publishable, Supabase anon or
 // publishable) are meant for browsers and pass.
 const guardScript = `const fs=require("fs"),path=require("path");
-const [mode,...roots]=process.argv.slice(2);
+const [given,...roots]=process.argv.slice(2),mode=given.replace(/\+allow$/,""),allow=given.endsWith("+allow");
 const privateFile=/^(\.(?!well-known$).+|id_(rsa|dsa|ecdsa|ed25519)|.+\.(pem|key|p12|pfx|sql|sqlite|sqlite3|db|bak|old|orig|swp|log)|.+~)$/i;
 const jwtRole=token=>{try{return JSON.parse(Buffer.from(token.split(".")[1],"base64url").toString("utf8")).role;}catch{return null;}};
 const rules=[
@@ -45,10 +45,20 @@ try{while((match=pattern.exec(text))){if(accept&&!accept(match[0]))continue;
 found.push(label+" in "+shown(rel)+" (line "+(text.slice(0,match.index).split("\n").length)+")");break;}}
 catch{console.log("molo-guard: could not check "+shown(rel)+" for "+label);}}}}
 for(const root of roots)if(fs.existsSync(root))walk(root,root);
-if(found.length){for(const item of found.slice(0,20))console.log("molo-guard: secret found: "+item);
+if(found.length&&allow){for(const item of found.slice(0,20))console.log("molo-guard: published anyway: "+item);
+console.log("molo-guard: the owner chose to deploy anyway. Anyone can copy these keys: treat them as leaked.");}
+else if(found.length){for(const item of found.slice(0,20))console.log("molo-guard: secret found: "+item);
 console.log("molo-guard: stopped before going live. Visitors' browsers can read these files, so anyone could copy the key. Remove it from the code, create a new key with its provider, and keep it on a server (Environment variables). Your live version did not change.");
 process.exit(1);}
 `
+
+// guardMode adds "+allow" when the owner chose "Deploy anyway" (BuildSpec.AllowSecrets).
+func guardMode(mode string, allow bool) string {
+	if allow {
+		return mode + "+allow"
+	}
+	return mode
+}
 
 // guardStep is the RUN line for the build stage (node is available there). mode is "public" for a published
 // folder, "app" for the browser files of a server app; paths are absolute folders, missing ones are skipped.
