@@ -72,6 +72,7 @@ func TestGuardStopsSecretKeysInBrowserFiles(t *testing.T) {
 		"a Stripe secret key":         `const stripe = Stripe("` + stripe + `")`,
 		"a Supabase service_role key": "createClient(url, '" + fakeJWT("service_role") + "')",
 		"a private key":               "-----BEGIN " + "PRIVATE KEY-----\nMIIE",
+		"a Molo API token":            `fetch("/api", { headers: { Authorization: "Bearer molo_` + `pat_` + strings.Repeat("Ab3", 10) + `xy" } })`,
 	}
 	for label, content := range cases {
 		dir := t.TempDir()

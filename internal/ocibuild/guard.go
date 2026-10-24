@@ -11,7 +11,7 @@ import (
 //     .git (except .well-known), private keys, database dumps and backups. Each one is named in the build log.
 //   - Both modes then read the files a browser can download and stop the build when one holds a secret key
 //     (a live Stripe key, a Supabase service_role or secret key, an OpenAI, Anthropic, GitHub or SendGrid key,
-//     a private key). The log names the kind of key, the file and the line, never the key itself.
+//     a Molo API token, a private key). The log names the kind of key, the file and the line, never the key itself.
 //
 // A stopped build never replaces the live version. Public keys (Stripe publishable, Supabase anon or
 // publishable) are meant for browsers and pass.
@@ -27,6 +27,7 @@ const rules=[
 ["an Anthropic API key",/\bsk-ant-(?:api|admin)\d\d-[0-9A-Za-z_-]{80,300}/g],
 ["a GitHub token",/\b(?:gh[opsu]_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{60,255})/g],
 ["a SendGrid API key",/\bSG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}/g],
+["a Molo API token",/\bmolo_pat_[0-9A-Za-z]{32}\b/g],
 ["a private key",/-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/g]];
 const shown=p=>p.replace(/[^\w./@+-]/g,"?").slice(0,160);
 const found=[];let files=0;
