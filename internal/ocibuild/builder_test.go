@@ -360,3 +360,45 @@ func TestBadgeScriptInjectsOnce(t *testing.T) {
 		t.Fatal("only HTML files are touched")
 	}
 }
+
+// Static images serve single-page apps (every path that is not a file gets index.html) unless the site has its
+// own 404.html; the configuration is written in the build stage and copied over nginx's stock one.
+func TestStaticImageServesSinglePageApps(t *testing.T) {
+	out, err := Dockerfile(BuildSpec{Kind: "static", OutputDir: "dist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, from, copied := strings.Index(out, "/tmp/molo-nginx.conf"), strings.Index(out, "FROM nginxinc"), strings.Index(out, staticServerCopy)
+	if step < 0 || step > from || copied < from {
+		t.Fatalf("the nginx configuration must be written before the nginx stage and copied in it:\n%s", out)
+	}
+	for _, want := range []string{`fallback="/index.html"`, `error_page 404 /404.html;`, "absolute_redirect off;", `try_files \$uri =404;`} {
+		if !strings.Contains(staticServerScript, want) {
+			t.Fatalf("static server script lacks %q", want)
+		}
+	}
+	app, _ := Dockerfile(BuildSpec{Kind: "node-http"})
+	if strings.Contains(app, "molo-nginx") {
+		t.Fatal("apps that run their own server get no nginx configuration")
+	}
+}
+
+// Build arguments reach the build commands as ARGs in the build stage, and only there.
+func TestGeneratedImagesDeclareBuildArguments(t *testing.T) {
+	for _, kind := range []string{"static", "node-http"} {
+		out, err := Dockerfile(BuildSpec{Kind: kind, BuildArgs: map[string]string{"VITE_SUPABASE_URL": "https://x.supabase.co", "NEXT_PUBLIC_A": "1"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, build := strings.Index(out, "ARG NEXT_PUBLIC_A\nARG VITE_SUPABASE_URL\n"), strings.Index(out, "RUN npm run build")
+		if first < 0 || first > build || strings.Count(out, "ARG ") != 2 {
+			t.Fatalf("%s: build arguments must be declared once, sorted, before the build:\n%s", kind, out)
+		}
+		if strings.Contains(out, "x.supabase.co") {
+			t.Fatalf("%s: values must not be written into the Dockerfile", kind)
+		}
+	}
+	if _, err := Dockerfile(BuildSpec{Kind: "static", BuildArgs: map[string]string{"BAD NAME": "x"}}); err == nil {
+		t.Fatal("an invalid build argument name must be refused")
+	}
+}

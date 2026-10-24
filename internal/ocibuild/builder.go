@@ -22,6 +22,8 @@ import (
 	"time"
 )
 
+var buildArgName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 type BuildSpec struct {
 	Kind           string            `json:"kind"`
 	ContextDir     string            `json:"context_dir"`
@@ -280,7 +282,7 @@ func (b *Builder) Build(ctx context.Context, r Request, log func(string)) (Artif
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(k) {
+		if !buildArgName.MatchString(k) {
 			return artifact, fmt.Errorf("invalid build argument")
 		}
 		args = append(args, "--build-arg", k+"="+r.Spec.BuildArgs[k])
@@ -387,7 +389,22 @@ func Dockerfile(s BuildSpec) (string, error) {
 	if build == "" {
 		build = "npm run build"
 	}
-	out := "FROM node:22-alpine AS build\nWORKDIR /app\nCOPY . .\nRUN " + install + "\nRUN " + build + "\n"
+	// Build arguments (the project's public variables, e.g. VITE_SUPABASE_URL) are declared in the build stage so
+	// the install and build commands see them as environment variables; frameworks bake them into the files they
+	// build. They never reach the runtime stage.
+	args := ""
+	names := make([]string, 0, len(s.BuildArgs))
+	for k := range s.BuildArgs {
+		if !buildArgName.MatchString(k) {
+			return "", fmt.Errorf("invalid build argument")
+		}
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		args += "ARG " + k + "\n"
+	}
+	out := "FROM node:22-alpine AS build\nWORKDIR /app\n" + args + "COPY . .\nRUN " + install + "\nRUN " + build + "\n"
 	if s.Kind == "static" {
 		if s.Port != 0 && s.Port != 8080 {
 			return "", fmt.Errorf("generated static images listen on port 8080")
@@ -403,7 +420,8 @@ func Dockerfile(s BuildSpec) (string, error) {
 		if s.Badge {
 			out += badgeStep(dir)
 		}
-		out += "FROM nginxinc/nginx-unprivileged:stable-alpine\nUSER 10001:10001\nCOPY --from=build /app/" + dir + " /usr/share/nginx/html\nEXPOSE 8080\nENTRYPOINT [\"nginx\"]\nCMD [\"-g\", \"daemon off;\"]\n"
+		out += staticServerStep(dir)
+		out += "FROM nginxinc/nginx-unprivileged:stable-alpine\nUSER 10001:10001\nCOPY --from=build /app/" + dir + " /usr/share/nginx/html\n" + staticServerCopy + "EXPOSE 8080\nENTRYPOINT [\"nginx\"]\nCMD [\"-g\", \"daemon off;\"]\n"
 	} else {
 		port := s.Port
 		if port == 0 {
