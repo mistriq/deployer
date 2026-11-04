@@ -106,6 +106,14 @@ type ProjectRemover interface {
 	DeleteProject(context.Context, string) error
 }
 
+// ReleasePruner is implemented by Runtimes that keep earlier releases running after an activation (runyer
+// keeps them for its own rollback and reserves node capacity for each). The Deployer never returns to a kept
+// release: a rollback deploys the earlier artifact again by digest. So after every activation the earlier
+// releases are deleted and only the live one holds capacity.
+type ReleasePruner interface {
+	PruneReleases(context.Context, string) (int, error)
+}
+
 // EdgeReader is implemented by Runtimes that report what the public is served right now (route,
 // HTTPS and certificate). Runtimes without it answer the edge endpoint with supported=false.
 type EdgeReader interface {

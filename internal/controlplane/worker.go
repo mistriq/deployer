@@ -187,7 +187,7 @@ func (s *Service) Step(ctx context.Context) error {
 			site = u.String()
 		}
 		domains := edgeDomains(v.Route, j.Snapshot.Spec.Aliases)
-		return s.change(j.ID, func(job *Job) {
+		if err := s.change(j.ID, func(job *Job) {
 			job.Domains = domains
 			job.State = "online"
 			job.Stage = "active"
@@ -195,7 +195,16 @@ func (s *Service) Step(ctx context.Context) error {
 			job.SiteURL = site
 			job.Message = "Online"
 			job.ErrorCode = ""
-		})
+		}); err != nil {
+			return err
+		}
+		// Best effort: a release that cannot be deleted now goes with the next activation.
+		if pruner, ok := rt.(ReleasePruner); ok {
+			pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			_, _ = pruner.PruneReleases(pctx, projectID)
+			cancel()
+		}
+		return nil
 	}
 }
 func (s *Service) change(id string, fn func(*Job)) error {

@@ -189,3 +189,37 @@ func TestRunyerLogsAndErrors(t *testing.T) {
 		t.Fatalf("auth error: %v", err)
 	}
 }
+
+func TestRunyerPruneReleases(t *testing.T) {
+	var deleted []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tk_test" {
+			w.WriteHeader(401)
+			return
+		}
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/api/projects/prj_demo/releases":
+			_, _ = io.WriteString(w, `[{"id":"rel_live","status":"active"},{"id":"rel_old","status":"superseded"},{"id":"rel_busy","status":"superseded"},{"id":"rel_gone","status":"retired"},{"id":"rel_failed","status":"failed"}]`)
+		case r.Method == "DELETE" && r.URL.Path == "/api/releases/rel_busy":
+			w.WriteHeader(409)
+			_, _ = io.WriteString(w, `{"error":"RELEASE_BUSY","http":409}`)
+		case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/api/releases/"):
+			deleted = append(deleted, strings.TrimPrefix(r.URL.Path, "/api/releases/"))
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer server.Close()
+	client, err := NewRunyer(Config{BaseURL: server.URL, Token: "tk_test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := client.PruneReleases(context.Background(), "prj_demo")
+	if err != nil || n != 1 || len(deleted) != 1 || deleted[0] != "rel_old" {
+		t.Fatalf("only the superseded release is deleted, a busy one is skipped: n=%d err=%v deleted=%v", n, err, deleted)
+	}
+	if _, err := client.PruneReleases(context.Background(), "../x"); err == nil {
+		t.Fatal("an invalid project id is refused")
+	}
+}

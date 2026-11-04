@@ -324,6 +324,41 @@ func (c *Runyer) Rollback(ctx context.Context, projectID, releaseID, key string)
 	return v, e
 }
 
+// PruneReleases deletes the project's superseded releases (their containers and records). The active
+// release and a candidate are never superseded, and runyer refuses to delete them anyway. Returns how many
+// were deleted; one that is already gone or busy (404, 409) is skipped.
+func (c *Runyer) PruneReleases(ctx context.Context, projectID string) (int, error) {
+	if !validID(projectID) {
+		return 0, invalid()
+	}
+	b, err := c.call(ctx, "GET", "/projects/"+projectID+"/releases", nil, "")
+	if err != nil {
+		return 0, err
+	}
+	var releases []struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if json.Unmarshal(b, &releases) != nil {
+		return 0, &Error{Code: "INVALID_RESPONSE"}
+	}
+	deleted := 0
+	for _, r := range releases {
+		if r.Status != "superseded" || !validID(r.ID) {
+			continue
+		}
+		if _, err := c.call(ctx, "DELETE", "/releases/"+r.ID, nil, ""); err != nil {
+			var remote *Error
+			if errors.As(err, &remote) && (remote.HTTPStatus == 404 || remote.HTTPStatus == 409) {
+				continue
+			}
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
 // ErrOffboardPending reports a project that was suspended instead of removed: runyer lets only
 // admins offboard projects, so an operator token stops it serving and an admin removes it later.
 var ErrOffboardPending = errors.New("runyer: project suspended, offboarding needs an admin")
