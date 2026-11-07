@@ -53,6 +53,10 @@ func (m Manifest) Validate() error {
 	if s.CPUMillis < 1 || s.CPUMillis > 2000 || s.MemoryMB < 1 || s.MemoryMB > 2048 || s.PidsLimit < 1 || s.PidsLimit > 512 || s.DiskMB < 1 || s.DiskMB > 4096 || m.Network.MaxBodyBytes < 1 || m.Network.MaxBodyBytes > 1073741824 || m.Network.RateLimitRPS < 1 || m.Network.RateLimitRPS > 100000 {
 		return invalid()
 	}
+	// runyer refuses SMTP submission without egress: such a project has no route out at all.
+	if m.Network.SMTPSubmission && !m.Network.EgressAllowed {
+		return invalid()
+	}
 	return nil
 }
 

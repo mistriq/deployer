@@ -28,7 +28,7 @@ func TestManifestPolicy(t *testing.T) {
 	if e := manifest().Validate(); e != nil {
 		t.Fatal(e)
 	}
-	for name, edit := range map[string]func(*Manifest){"root": func(m *Manifest) { m.Runtime.User = "0:0" }, "writable": func(m *Manifest) { m.Runtime.ReadOnlyRoot = false }, "cpu": func(m *Manifest) { m.Resources.CPUMillis = 2001 }, "env-duplicate": func(m *Manifest) { m.Runtime.EnvNames = []string{"A", "A"} }, "mount-escape": func(m *Manifest) { m.Runtime.Tmpfs = []Tmpfs{{Path: "/tmp/../etc", SizeMB: 1}} }, "health-host": func(m *Manifest) { m.Health.Path = "https://evil.test" }} {
+	for name, edit := range map[string]func(*Manifest){"root": func(m *Manifest) { m.Runtime.User = "0:0" }, "writable": func(m *Manifest) { m.Runtime.ReadOnlyRoot = false }, "cpu": func(m *Manifest) { m.Resources.CPUMillis = 2001 }, "env-duplicate": func(m *Manifest) { m.Runtime.EnvNames = []string{"A", "A"} }, "mount-escape": func(m *Manifest) { m.Runtime.Tmpfs = []Tmpfs{{Path: "/tmp/../etc", SizeMB: 1}} }, "health-host": func(m *Manifest) { m.Health.Path = "https://evil.test" }, "smtp-without-egress": func(m *Manifest) { m.Network.SMTPSubmission = true; m.Network.EgressAllowed = false }} {
 		t.Run(name, func(t *testing.T) {
 			m := manifest()
 			edit(&m)
@@ -36,6 +36,20 @@ func TestManifestPolicy(t *testing.T) {
 				t.Fatal("accepted unsafe manifest")
 			}
 		})
+	}
+}
+func TestManifestSMTPSubmission(t *testing.T) {
+	m := manifest()
+	m.Network.EgressAllowed = true
+	if b, _ := json.Marshal(m.Network); strings.Contains(string(b), "smtp_submission") {
+		t.Fatal("a manifest without SMTP submission must not carry the field (older runtimes)")
+	}
+	m.Network.SMTPSubmission = true
+	if e := m.Validate(); e != nil {
+		t.Fatal(e)
+	}
+	if b, _ := json.Marshal(m.Network); !strings.Contains(string(b), `"smtp_submission":true`) {
+		t.Fatal("SMTP submission not sent:", string(b))
 	}
 }
 func TestConfigRejectsUnsafeOrigin(t *testing.T) {

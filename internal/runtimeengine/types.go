@@ -77,6 +77,10 @@ type Network struct {
 	EgressAllowed bool  `json:"egress_allowed"`
 	MaxBodyBytes  int64 `json:"max_body_bytes"`
 	RateLimitRPS  int   `json:"rate_limit_rps"`
+	// SMTPSubmission opens outgoing ports 465 and 587 (sending through a mailbox provider) on runyer 0.6.1+.
+	// Port 25 and internal ranges stay closed. Needs EgressAllowed. Omitted when false, so older runtimes
+	// get the same manifest as before.
+	SMTPSubmission bool `json:"smtp_submission,omitempty"`
 }
 type ProjectRequest struct {
 	ProjectID string   `json:"project_id"`
