@@ -240,6 +240,10 @@ func (s *Service) runtimeError(j *Job, err error) error {
 			})
 		}
 		if !remote.Retryable {
+			// runyer's own explanation goes into the runtime log, so it is there even when the container left none.
+			for _, line := range remote.Detail {
+				_ = s.appendLog(j.ID, "runtime", "system", line)
+			}
 			if remote.Code == "DEPLOY_CANCELLED" {
 				return s.fail(j.ID, "cancelled", remote.Code)
 			}

@@ -70,6 +70,18 @@ func (s *Service) appendLog(id, source, stream, text string) error {
 	}
 	return s.Store.update(func(d *database) error { appendLine(d, id, source, stream, text); return nil })
 }
+
+// appendLogOnce adds a line unless it is already the last one (a repeated poll must not repeat it).
+func (s *Service) appendLogOnce(id, source, stream, text string) error {
+	text = s.redact(text)
+	return s.Store.update(func(d *database) error {
+		if lines := d.Logs[id+"|"+source]; len(lines) > 0 && lines[len(lines)-1].Text == text {
+			return nil
+		}
+		appendLine(d, id, source, stream, text)
+		return nil
+	})
+}
 func appendLine(d *database, id, source, stream, text string) {
 	appendLineAt(d, id, source, stream, text, time.Now().UTC())
 }

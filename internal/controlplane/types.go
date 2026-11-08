@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"net/url"
 	"sync"
 	"time"
 
@@ -125,6 +126,11 @@ type EdgeCapsController interface {
 	EdgeModules(context.Context) (json.RawMessage, error)
 	EdgeCaps(context.Context, string) (json.RawMessage, error)
 	SetEdgeCaps(context.Context, string, json.RawMessage) error
+}
+
+// AccessLogReader reads netyer's access log of a project's site.
+type AccessLogReader interface {
+	AccessLog(context.Context, string, url.Values) ([]map[string]any, error)
 }
 type Builder interface {
 	Resolve(context.Context, string, string) (string, error)

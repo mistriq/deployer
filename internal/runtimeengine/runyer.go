@@ -288,7 +288,7 @@ func (c *Runyer) VerifyActive(ctx context.Context, projectID, deploymentID strin
 		if code == "" {
 			code = "DEPLOY_FAILED"
 		}
-		return v, &Error{Code: code}
+		return v, &Error{Code: code, Detail: failureDetail(d)}
 	case "active":
 	default:
 		return v, nil
@@ -319,6 +319,31 @@ func (c *Runyer) VerifyActive(ctx context.Context, projectID, deploymentID strin
 		}
 	}
 	return Verification{Active: true, ReleaseID: d.ReleaseID, Route: route}, nil
+}
+
+// failureDetail is what runyer says about a failed deployment: its failure message and the timeline's notes.
+func failureDetail(d Deployment) []string {
+	out := []string{}
+	if d.FailureMessage != "" {
+		out = append(out, "runyer: "+d.FailureMessage)
+	}
+	for _, e := range d.Events {
+		if e.Message == "" && e.Code == "" {
+			continue
+		}
+		line := "runyer " + e.Phase
+		if e.Code != "" {
+			line += " [" + e.Code + "]"
+		}
+		if e.Message != "" {
+			line += ": " + e.Message
+		}
+		out = append(out, line)
+		if len(out) >= 20 {
+			break
+		}
+	}
+	return out
 }
 
 func (c *Runyer) Rollback(ctx context.Context, projectID, releaseID, key string) (Deployment, error) {

@@ -77,6 +77,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if p[2] == "projects" && len(p) == 6 && p[4] == "edge" && p[5] == "logs" && r.Method == http.MethodGet {
+		s.accessLog(w, r, tenant, p[3])
+		return
+	}
 	if p[2] == "projects" && len(p) == 6 && p[4] == "edge" && p[5] == "caps" {
 		s.edgeCaps(w, r, tenant, p[3])
 		return
@@ -330,8 +334,8 @@ func (s *Service) logs(w http.ResponseWriter, r *http.Request, j *Job) {
 				cause = "TIMEOUT"
 			}
 			log.Printf("runtime logs of %s unavailable: %s", j.ID, cause)
-			reply(w, 502, map[string]string{"error_code": "RUNTIME_LOGS_UNAVAILABLE", "cause": cause, "message": "Požadavek nelze dokončit."})
-			return
+			// The lines already kept (runyer's failure notes among them) are still shown, with the reason last.
+			_ = s.appendLogOnce(j.ID, "runtime", "system", "Server logy kontejneru nevrátil ("+cause+").")
 		}
 	}
 	lines := s.Store.snapshot().Logs[j.ID+"|"+source]
@@ -392,6 +396,66 @@ func (s *Service) edge(w http.ResponseWriter, r *http.Request, tenant, id string
 		e.Hosts[i].CertError = s.redact(e.Hosts[i].CertError)
 	}
 	reply(w, 200, map[string]any{"project_id": id, "runtime_target_id": stableTarget(project.Spec.RuntimeTargetID), "supported": true, "edge": e, "checked_at": time.Now().UTC()})
+}
+
+var accessFilter = map[string]*regexp.Regexp{
+	"status": regexp.MustCompile(`^([1-5][0-9x]{2}|[1-5]xx|error|blocked)$`),
+	"ip":     regexp.MustCompile(`^[0-9a-fA-F:.]{1,45}$`),
+	"method": regexp.MustCompile(`^[A-Z]{3,7}$`),
+	"q":      regexp.MustCompile(`^[^\x00-\x1f]{1,200}$`),
+	"since":  regexp.MustCompile(`^[0-9]{1,15}$`),
+	"before": regexp.MustCompile(`^[0-9]{1,15}$`),
+	"limit":  regexp.MustCompile(`^([1-9][0-9]{0,2})$`),
+}
+
+// accessLog passes netyer's access log of a project's site through (filters checked, sensitive values redacted).
+func (s *Service) accessLog(w http.ResponseWriter, r *http.Request, tenant, id string) {
+	project := s.Store.snapshot().Projects[id]
+	if project == nil || project.Tenant != tenant {
+		apiError(w, 404, "NOT_FOUND")
+		return
+	}
+	query := url.Values{}
+	for key, pattern := range accessFilter {
+		if v := r.URL.Query().Get(key); v != "" {
+			if !pattern.MatchString(v) {
+				apiError(w, 400, "INVALID_REQUEST")
+				return
+			}
+			query.Set(key, v)
+		}
+	}
+	rt, err := s.runtimeFor(project.Spec.RuntimeTargetID)
+	if err != nil {
+		apiError(w, 503, "RUNTIME_TARGET_UNAVAILABLE")
+		return
+	}
+	reader, ok := rt.(AccessLogReader)
+	if !ok {
+		reply(w, 200, map[string]any{"project_id": id, "supported": false, "items": []any{}})
+		return
+	}
+	items, err := reader.AccessLog(r.Context(), runtimeProject(tenant, id), query)
+	if err != nil {
+		code := "RUNTIME_UNAVAILABLE"
+		var remote *runtimeengine.Error
+		if errors.As(err, &remote) && identifier.MatchString(remote.Code) {
+			code = remote.Code
+		}
+		apiError(w, 502, code)
+		return
+	}
+	if len(items) > 500 {
+		items = items[:500]
+	}
+	for _, item := range items {
+		for key, value := range item {
+			if text, ok := value.(string); ok {
+				item[key] = s.redact(text)
+			}
+		}
+	}
+	reply(w, 200, map[string]any{"project_id": id, "supported": true, "items": items})
 }
 
 var moduleID = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)

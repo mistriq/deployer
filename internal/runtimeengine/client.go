@@ -23,6 +23,8 @@ type Error struct {
 	Code       string
 	HTTPStatus int
 	Retryable  bool
+	// Detail carries the Runtime's own words about a failed deployment (not part of Error()).
+	Detail []string
 }
 
 func (e *Error) Error() string {

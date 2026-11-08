@@ -3,6 +3,7 @@ package runtimeengine
 import (
 	"context"
 	"encoding/json"
+	"net/url"
 	"strings"
 )
 
@@ -184,6 +185,9 @@ func (c *Runyer) EdgeCaps(ctx context.Context, projectID string) (json.RawMessag
 		return nil, e
 	}
 	var body struct {
+		Route *struct {
+			Caps json.RawMessage `json:"caps"`
+		} `json:"route"`
 		Site *struct {
 			Caps json.RawMessage `json:"caps"`
 		} `json:"site"`
@@ -191,10 +195,15 @@ func (c *Runyer) EdgeCaps(ctx context.Context, projectID string) (json.RawMessag
 	if json.Unmarshal(b, &body) != nil {
 		return nil, &Error{Code: "INVALID_RESPONSE"}
 	}
-	if body.Site == nil || len(body.Site.Caps) == 0 || string(body.Site.Caps) == "null" {
-		return json.RawMessage("{}"), nil
+	present := func(raw json.RawMessage) bool { return len(raw) > 0 && string(raw) != "null" }
+	// netyer's site is the truth; runyer ≥ 0.7 also keeps the caps on the route.
+	if body.Site != nil && present(body.Site.Caps) {
+		return body.Site.Caps, nil
 	}
-	return body.Site.Caps, nil
+	if body.Route != nil && present(body.Route.Caps) {
+		return body.Route.Caps, nil
+	}
+	return json.RawMessage("{}"), nil
 }
 
 // SetEdgeCaps sends PUT /api/projects/{id}/edge/caps {caps: {<module id>: {on, config}}}. netyer validates the
@@ -205,4 +214,38 @@ func (c *Runyer) SetEdgeCaps(ctx context.Context, projectID string, caps json.Ra
 	}
 	_, e := c.call(ctx, "PUT", "/projects/"+projectID+"/edge/caps", map[string]json.RawMessage{"caps": caps}, "")
 	return e
+}
+
+// AccessLog is netyer's access log of a project's site (GET /api/projects/{id}/edge/logs), newest first.
+// query holds only the filters netyer documents: status (404, 4xx, error, blocked), ip (prefix), method, q (text),
+// since (unix ms), before (seq) and limit.
+func (c *Runyer) AccessLog(ctx context.Context, projectID string, query url.Values) ([]map[string]any, error) {
+	if !validID(projectID) {
+		return nil, invalid()
+	}
+	p := "/projects/" + projectID + "/edge/logs"
+	if encoded := query.Encode(); encoded != "" {
+		p += "?" + encoded
+	}
+	b, e := c.call(ctx, "GET", p, nil, "")
+	if e != nil {
+		return nil, e
+	}
+	var list []map[string]any
+	if json.Unmarshal(b, &list) == nil {
+		return list, nil
+	}
+	var wrapped map[string]json.RawMessage
+	if json.Unmarshal(b, &wrapped) != nil {
+		return nil, &Error{Code: "INVALID_RESPONSE"}
+	}
+	for _, key := range []string{"items", "entries", "logs", "lines"} {
+		if raw, ok := wrapped[key]; ok {
+			if json.Unmarshal(raw, &list) != nil {
+				return nil, &Error{Code: "INVALID_RESPONSE"}
+			}
+			return list, nil
+		}
+	}
+	return []map[string]any{}, nil
 }

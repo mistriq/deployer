@@ -108,17 +108,21 @@ type DeploymentRequest struct {
 	Artifact             Artifact `json:"artifact"`
 }
 type Deployment struct {
-	ID          string       `json:"id"`
-	ProjectID   string       `json:"project_id"`
-	ReleaseID   string       `json:"release_id"`
-	Status      string       `json:"status"`
-	Phase       string       `json:"phase"`
-	FailureCode string       `json:"failure_code,omitempty"`
-	Events      []PhaseEvent `json:"events,omitempty"`
+	ID          string `json:"id"`
+	ProjectID   string `json:"project_id"`
+	ReleaseID   string `json:"release_id"`
+	Status      string `json:"status"`
+	Phase       string `json:"phase"`
+	FailureCode string `json:"failure_code,omitempty"`
+	// FailureMessage is runyer's own explanation of a failure (health check, start, pull…).
+	FailureMessage string       `json:"failure_message,omitempty"`
+	Events         []PhaseEvent `json:"events,omitempty"`
 }
 type PhaseEvent struct {
-	Phase string    `json:"phase"`
-	At    time.Time `json:"at"`
+	Phase   string    `json:"phase"`
+	At      time.Time `json:"at"`
+	Code    string    `json:"code,omitempty"`
+	Message string    `json:"message,omitempty"`
 }
 type LogEntry struct {
 	ID     string    `json:"id,omitempty"`
