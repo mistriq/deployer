@@ -159,3 +159,50 @@ func certCovers(names []string, host string) bool {
 	}
 	return false
 }
+
+// EdgeModules reads netyer's per-site modules through runyer (GET /api/edge/modules): ids, names and the site
+// fields of each, enough for the portal to draw a form.
+func (c *Runyer) EdgeModules(ctx context.Context) (json.RawMessage, error) {
+	b, e := c.call(ctx, "GET", "/edge/modules", nil, "")
+	if e != nil {
+		return nil, e
+	}
+	if !json.Valid(b) {
+		return nil, &Error{Code: "INVALID_RESPONSE"}
+	}
+	return json.RawMessage(b), nil
+}
+
+// EdgeCaps reads the switches and settings of a project's netyer site (site.caps of GET /api/projects/{id}/edge).
+// A project without a site yet has none.
+func (c *Runyer) EdgeCaps(ctx context.Context, projectID string) (json.RawMessage, error) {
+	if !validID(projectID) {
+		return nil, invalid()
+	}
+	b, e := c.call(ctx, "GET", "/projects/"+projectID+"/edge", nil, "")
+	if e != nil {
+		return nil, e
+	}
+	var body struct {
+		Site *struct {
+			Caps json.RawMessage `json:"caps"`
+		} `json:"site"`
+	}
+	if json.Unmarshal(b, &body) != nil {
+		return nil, &Error{Code: "INVALID_RESPONSE"}
+	}
+	if body.Site == nil || len(body.Site.Caps) == 0 || string(body.Site.Caps) == "null" {
+		return json.RawMessage("{}"), nil
+	}
+	return body.Site.Caps, nil
+}
+
+// SetEdgeCaps sends PUT /api/projects/{id}/edge/caps {caps: {<module id>: {on, config}}}. netyer validates the
+// settings; a refusal (422) changes nothing. Needs a runyer token with operator access.
+func (c *Runyer) SetEdgeCaps(ctx context.Context, projectID string, caps json.RawMessage) error {
+	if !validID(projectID) || !json.Valid(caps) {
+		return invalid()
+	}
+	_, e := c.call(ctx, "PUT", "/projects/"+projectID+"/edge/caps", map[string]json.RawMessage{"caps": caps}, "")
+	return e
+}

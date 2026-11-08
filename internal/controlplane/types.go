@@ -119,6 +119,13 @@ type ReleasePruner interface {
 type EdgeReader interface {
 	Edge(context.Context, string) (runtimeengine.Edge, error)
 }
+
+// EdgeCapsController switches netyer modules (password, forward auth, IP filter…) for a project's site.
+type EdgeCapsController interface {
+	EdgeModules(context.Context) (json.RawMessage, error)
+	EdgeCaps(context.Context, string) (json.RawMessage, error)
+	SetEdgeCaps(context.Context, string, json.RawMessage) error
+}
 type Builder interface {
 	Resolve(context.Context, string, string) (string, error)
 	Build(context.Context, ocibuild.Request, func(string)) (ocibuild.Artifact, error)

@@ -75,6 +75,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if p[2] == "projects" && len(p) == 6 && p[4] == "edge" && p[5] == "caps" {
+		s.edgeCaps(w, r, tenant, p[3])
+		return
+	}
 	if p[2] != "projects" || len(p) > 5 {
 		apiError(w, 404, "NOT_FOUND")
 		return
@@ -374,6 +378,88 @@ func (s *Service) edge(w http.ResponseWriter, r *http.Request, tenant, id string
 		e.Hosts[i].CertError = s.redact(e.Hosts[i].CertError)
 	}
 	reply(w, 200, map[string]any{"project_id": id, "runtime_target_id": stableTarget(project.Spec.RuntimeTargetID), "supported": true, "edge": e, "checked_at": time.Now().UTC()})
+}
+
+var moduleID = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
+
+// edgeCaps reads (GET: the modules netyer offers and the site's current caps) or changes (PUT {caps: {<module>:
+// {on, config}}}, only the modules sent) the netyer modules of a project's site.
+func (s *Service) edgeCaps(w http.ResponseWriter, r *http.Request, tenant, id string) {
+	project := s.Store.snapshot().Projects[id]
+	if project == nil || project.Tenant != tenant {
+		apiError(w, 404, "NOT_FOUND")
+		return
+	}
+	rt, err := s.runtimeFor(project.Spec.RuntimeTargetID)
+	if err != nil {
+		apiError(w, 503, "RUNTIME_TARGET_UNAVAILABLE")
+		return
+	}
+	edge, ok := rt.(EdgeCapsController)
+	if !ok {
+		reply(w, 200, map[string]any{"project_id": id, "supported": false})
+		return
+	}
+	remoteFailure := func(err error) {
+		code, status := "RUNTIME_UNAVAILABLE", 502
+		var remote *runtimeengine.Error
+		if errors.As(err, &remote) {
+			if identifier.MatchString(remote.Code) {
+				code = remote.Code
+			}
+			if remote.HTTPStatus == 400 || remote.HTTPStatus == 422 {
+				code, status = "EDGE_CAPS_REFUSED", 400
+			} else if remote.HTTPStatus == 401 || remote.HTTPStatus == 403 {
+				code = "EDGE_CAPS_FORBIDDEN"
+			}
+		}
+		apiError(w, status, code)
+	}
+	switch r.Method {
+	case http.MethodGet:
+		modules, err := edge.EdgeModules(r.Context())
+		if err != nil {
+			remoteFailure(err)
+			return
+		}
+		caps, err := edge.EdgeCaps(r.Context(), runtimeProject(tenant, id))
+		if err != nil {
+			remoteFailure(err)
+			return
+		}
+		reply(w, 200, map[string]any{"project_id": id, "supported": true, "modules": modules, "caps": caps})
+	case http.MethodPut:
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+		if err != nil {
+			apiError(w, 413, "REQUEST_TOO_LARGE")
+			return
+		}
+		var payload struct {
+			Caps map[string]json.RawMessage `json:"caps"`
+		}
+		if json.Unmarshal(body, &payload) != nil || len(payload.Caps) == 0 || len(payload.Caps) > 32 {
+			apiError(w, 400, "INVALID_REQUEST")
+			return
+		}
+		for name, cap := range payload.Caps {
+			var c struct {
+				On     *bool           `json:"on"`
+				Config json.RawMessage `json:"config"`
+			}
+			if !moduleID.MatchString(name) || json.Unmarshal(cap, &c) != nil || c.On == nil || (len(c.Config) > 0 && string(c.Config) != "null" && c.Config[0] != '{') {
+				apiError(w, 400, "INVALID_REQUEST")
+				return
+			}
+		}
+		caps, _ := json.Marshal(payload.Caps)
+		if err := edge.SetEdgeCaps(r.Context(), runtimeProject(tenant, id), caps); err != nil {
+			remoteFailure(err)
+			return
+		}
+		reply(w, 200, map[string]any{"project_id": id, "ok": true})
+	default:
+		apiError(w, 405, "METHOD_NOT_ALLOWED")
+	}
 }
 
 // deleteProject removes a project from its Runtime and then forgets it. It refuses while a
