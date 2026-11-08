@@ -300,12 +300,19 @@ func (b *Builder) Build(ctx context.Context, r Request, log func(string)) (Artif
 	}
 	// Buildx combines build and publication; only metadata from a successful push
 	// constitutes an artifact. Streaming output redacts registry credentials.
-	// The builder's image store occasionally keeps a write locked ("failed to open writer … locked … unavailable").
-	// That is never the customer's fault: retry, and before the last attempt ask the host to restart the builder
-	// (BuilderRestartFile, watched by a systemd unit outside the sandbox). If it still fails, report BUILDER_BUSY.
+	// Exporting into the builder's image store sometimes collides with itself ("failed to open writer … locked …
+	// unavailable"): BuildKit opens the same layer writer twice within milliseconds. The lock is not left over, so a
+	// restart alone does not help, and a retry that reuses the cached layer hits the same ref again. That is never
+	// the customer's fault: retry, then ask the host to restart the builder (BuilderRestartFile, watched by a systemd
+	// unit outside the sandbox) and make the last attempt with --no-cache so every layer gets a new ref.
+	// If it still fails, report BUILDER_BUSY.
 	for attempt := 1; ; attempt++ {
 		var output string
-		if output, err = run(root, "docker", args...); err == nil {
+		attemptArgs := args
+		if attempt == 3 {
+			attemptArgs = append([]string{args[0], args[1], "--no-cache"}, args[2:]...)
+		}
+		if output, err = run(root, "docker", attemptArgs...); err == nil {
 			break
 		}
 		if ctx.Err() != nil || !BuilderStorageBusy(output) {
@@ -319,7 +326,7 @@ func (b *Builder) Build(ctx context.Context, r Request, log func(string)) (Artif
 		}
 		if attempt == 2 && b.BuilderRestartFile != "" {
 			if log != nil {
-				log("molo: restarting the builder before the last attempt")
+				log("molo: restarting the builder; the last attempt builds without cache")
 			}
 			b.restartBuilder(ctx, run, root)
 		} else if !sleepContext(ctx, time.Duration(attempt)*b.delay(b.busyDelay, 5*time.Second)) {

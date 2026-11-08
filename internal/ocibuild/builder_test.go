@@ -262,6 +262,9 @@ func TestBusyBuilderStoreIsRetried(t *testing.T) {
 					return []byte("29.8.2"), nil
 				}
 				builds++
+				if noCache := strings.Contains(strings.Join(c.Args, " "), " --no-cache "); noCache != (builds == 3) {
+					t.Fatalf("build %d: --no-cache=%v, want it only on the last attempt", builds, noCache)
+				}
 				if builds <= tc.failures {
 					c.Log(busy)
 					return []byte(busy), fmt.Errorf("exit status 1")
