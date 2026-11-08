@@ -114,7 +114,11 @@ func (SystemRunner) Run(ctx context.Context, c Command) ([]byte, error) {
 
 type Builder struct {
 	// BuilderRestartFile, when set, is created to ask the host to restart the builder Docker (see Build).
-	BuilderRestartFile     string
+	BuilderRestartFile string
+	// BuildxBuilder, when set, builds with a separate BuildKit container of that name inside the builder Docker
+	// (buildx driver docker-container) instead of the Docker daemon's own BuildKit. That BuildKit pushes straight to
+	// the registry and never writes into the daemon's image store, where exports sometimes lock themselves.
+	BuildxBuilder          string
 	busyDelay, restartWait time.Duration // tests shorten the retry pauses
 	AllowLocalRepositories bool
 	// LocalRepositoryRoot, when set, restricts local repositories to its direct children.
@@ -288,6 +292,12 @@ func (b *Builder) Build(ctx context.Context, r Request, log func(string)) (Artif
 		args = append(args, "--build-arg", k+"="+r.Spec.BuildArgs[k])
 	}
 	args = append(args, contextDir)
+	if b.BuildxBuilder != "" {
+		if err = b.ensureBuildxBuilder(ctx, run, root); err != nil {
+			return artifact, &PipelineError{Code: "BUILDER_BUSY", Err: err}
+		}
+		args = append([]string{args[0], args[1], "--builder", b.BuildxBuilder}, args[2:]...)
+	}
 	phase("building")
 	publishedPhase := false
 	commandProgress = func(line string) {
@@ -526,6 +536,38 @@ func sleepContext(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 		return true
 	}
+}
+
+var buildxBuilderName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,39}$`)
+
+// buildkitdConfig keeps the separate BuildKit's cache under 20 GB, like builder/daemon.json does for the daemon.
+const buildkitdConfig = "[worker.oci]\n  gc = true\n  gckeepstorage = \"20GB\"\n"
+
+// ensureBuildxBuilder registers BuildxBuilder in this build's own DOCKER_CONFIG and starts it. The BuildKit container
+// (buildx_buildkit_<name>0) lives in the builder Docker and is reused when it already exists, so only the first build
+// after the builder Docker lost its data creates it. Several workspaces may build at once and race to create it, so
+// starting is tried a few times.
+func (b *Builder) ensureBuildxBuilder(ctx context.Context, run func(string, string, ...string) (string, error), root string) error {
+	if !buildxBuilderName.MatchString(b.BuildxBuilder) {
+		return fmt.Errorf("invalid buildx builder name")
+	}
+	config := filepath.Join(root, "buildkitd.toml")
+	if err := os.WriteFile(config, []byte(buildkitdConfig), 0o600); err != nil {
+		return err
+	}
+	if _, err := run(root, "docker", "buildx", "create", "--name", b.BuildxBuilder, "--driver", "docker-container", "--driver-opt", "network=host", "--buildkitd-config", config); err != nil {
+		return err
+	}
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if _, err = run(root, "docker", "buildx", "inspect", "--bootstrap", b.BuildxBuilder); err == nil {
+			return nil
+		}
+		if !sleepContext(ctx, time.Duration(attempt)*b.delay(b.busyDelay, 3*time.Second)) {
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 // restartBuilder writes the request file and waits (up to two minutes) until the host removed it and the builder

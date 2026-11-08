@@ -151,7 +151,7 @@ func run() error {
 			return errors.New("DEPLOYER_LOCAL_SOURCE_ROOT must be an existing directory")
 		}
 	}
-	svc := &controlplane.Service{Store: store, Runtimes: runtimes, Builder: &ocibuild.Builder{AllowLocalRepositories: localSources != "", LocalRepositoryRoot: localSources, BuilderRestartFile: os.Getenv("DEPLOYER_BUILDER_RESTART_FILE")}, Config: controlplane.Config{DefaultRuntimeTarget: defaultTarget, Tokens: tokens, ImagePrefix: image, Credentials: creds, ServiceSecrets: append(runtimeSecrets, keyHex), LocalSourceRoot: localSources}}
+	svc := &controlplane.Service{Store: store, Runtimes: runtimes, Builder: &ocibuild.Builder{AllowLocalRepositories: localSources != "", LocalRepositoryRoot: localSources, BuilderRestartFile: os.Getenv("DEPLOYER_BUILDER_RESTART_FILE"), BuildxBuilder: os.Getenv("DEPLOYER_BUILDX_BUILDER")}, Config: controlplane.Config{DefaultRuntimeTarget: defaultTarget, Tokens: tokens, ImagePrefix: image, Credentials: creds, ServiceSecrets: append(runtimeSecrets, keyHex), LocalSourceRoot: localSources}}
 	if len(os.Args) > 1 {
 		if len(os.Args) == 2 && os.Args[1] == "--check-config" {
 			fmt.Println("Configuration valid; no network calls made.")

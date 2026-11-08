@@ -405,3 +405,53 @@ func TestGeneratedImagesDeclareBuildArguments(t *testing.T) {
 		t.Fatal("an invalid build argument name must be refused")
 	}
 }
+
+func TestBuildxBuilderIsUsedWhenConfigured(t *testing.T) {
+	repo, sha := repoFixture(t)
+	var commands []string
+	inspects := 0
+	b := Builder{AllowLocalRepositories: true, TempDir: t.TempDir(), BuildxBuilder: "molo-bk", busyDelay: time.Millisecond}
+	b.Runner = runnerFunc(func(ctx context.Context, c Command) ([]byte, error) {
+		if c.Name != "docker" {
+			return (SystemRunner{}).Run(ctx, c)
+		}
+		commands = append(commands, strings.Join(c.Args, " "))
+		switch {
+		case c.Args[0] == "buildx" && c.Args[1] == "create":
+			for i, a := range c.Args {
+				if a == "--buildkitd-config" {
+					if data, err := os.ReadFile(c.Args[i+1]); err != nil || !strings.Contains(string(data), "gckeepstorage") {
+						t.Fatalf("buildkitd config missing: %v", err)
+					}
+				}
+			}
+		case c.Args[0] == "buildx" && c.Args[1] == "inspect":
+			if inspects++; inspects == 1 { // another workspace is creating the same container
+				return []byte("Conflict. The container name is already in use"), fmt.Errorf("exit status 1")
+			}
+		case c.Args[0] == "buildx" && c.Args[1] == "build":
+			for i, a := range c.Args {
+				if a == "--metadata-file" {
+					os.WriteFile(c.Args[i+1], []byte(`{"containerimage.digest":"sha256:`+strings.Repeat("c", 64)+`"}`), 0600)
+				}
+			}
+		}
+		return nil, nil
+	})
+	if _, err := b.Build(context.Background(), Request{Repository: repo, Commit: sha, ImageRepository: "registry.example/app", Spec: BuildSpec{Kind: "dockerfile"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(commands, "\n")
+	for _, want := range []string{"buildx create --name molo-bk --driver docker-container --driver-opt network=host", "buildx inspect --bootstrap molo-bk", "buildx build --builder molo-bk "} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in:\n%s", want, joined)
+		}
+	}
+
+	b.BuildxBuilder = "Bad Name;"
+	_, err := b.Build(context.Background(), Request{Repository: repo, Commit: sha, ImageRepository: "registry.example/app", Spec: BuildSpec{Kind: "dockerfile"}}, nil)
+	var pipeline *PipelineError
+	if !errors.As(err, &pipeline) || pipeline.Code != "BUILDER_BUSY" {
+		t.Fatalf("invalid builder name accepted: %v", err)
+	}
+}
