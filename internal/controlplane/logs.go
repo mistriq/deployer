@@ -123,7 +123,10 @@ func (s *Service) collectLogs(ctx context.Context, j *Job) error {
 	if ok {
 		if j.ReleaseID != "" {
 			entries, err = structured.ReleaseLogEntries(ctx, j.ReleaseID, 1000)
-		} else {
+		}
+		// A release that never went live (failed health check) may have no release logs of its own; the
+		// deployment's logs are the output of that same container.
+		if j.ReleaseID == "" || (err != nil && j.RuntimeID != "") {
 			entries, err = structured.LogEntries(ctx, j.RuntimeID, 1000)
 		}
 	} else {

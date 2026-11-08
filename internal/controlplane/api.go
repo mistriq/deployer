@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -316,7 +318,19 @@ func (s *Service) logs(w http.ResponseWriter, r *http.Request, j *Job) {
 	}
 	if source == "runtime" && j.RuntimeID != "" {
 		if err := s.collectLogs(r.Context(), j); err != nil {
-			apiError(w, 502, "RUNTIME_LOGS_UNAVAILABLE")
+			// Say why: runyer's own error code (or the transport failure), so nobody has to guess.
+			cause := "RUNTIME_UNAVAILABLE"
+			var remote *runtimeengine.Error
+			if errors.As(err, &remote) && identifier.MatchString(remote.Code) {
+				cause = remote.Code
+				if remote.HTTPStatus > 0 {
+					cause += "_" + strconv.Itoa(remote.HTTPStatus)
+				}
+			} else if errors.Is(err, context.DeadlineExceeded) {
+				cause = "TIMEOUT"
+			}
+			log.Printf("runtime logs of %s unavailable: %s", j.ID, cause)
+			reply(w, 502, map[string]string{"error_code": "RUNTIME_LOGS_UNAVAILABLE", "cause": cause, "message": "Požadavek nelze dokončit."})
 			return
 		}
 	}

@@ -31,6 +31,20 @@ type Runyer struct {
 }
 
 var remoteCode = regexp.MustCompile(`^[A-Z][A-Z0-9_]{1,63}$`)
+var lowerCode = regexp.MustCompile(`^[a-z][a-z0-9_]{1,63}$`)
+
+// runyerCode keeps runyer's own codes (its catalogue is lowercase: health_check_failed, not_found…) in the
+// uppercase form the portal knows, instead of folding them into REMOTE_ERROR, which reads as trouble on our side.
+func runyerCode(code string) string {
+	if lowerCode.MatchString(code) {
+		code = strings.ToUpper(code)
+	}
+	if !remoteCode.MatchString(code) {
+		return "REMOTE_ERROR"
+	}
+	return code
+}
+
 var hostnamePattern = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$`)
 
 // ValidHostname reports whether s is a lowercase DNS host name suitable as a project alias.
@@ -112,9 +126,7 @@ func (c *Runyer) call(ctx context.Context, method, p string, body any, key strin
 			_ = json.Unmarshal(v.Error, &nested)
 			code, v.Retryable = nested.Code, nested.Retryable
 		}
-		if !remoteCode.MatchString(code) {
-			code = "REMOTE_ERROR"
-		}
+		code = runyerCode(code)
 		retryable := resp.StatusCode == 429 || resp.StatusCode >= 500
 		if v.Retryable != nil {
 			retryable = *v.Retryable
@@ -250,8 +262,8 @@ func (c *Runyer) Deployment(ctx context.Context, id string) (Deployment, error) 
 	if e == nil && v.ID != id {
 		e = &Error{Code: "INVALID_RESPONSE"}
 	}
-	if v.FailureCode != "" && !remoteCode.MatchString(v.FailureCode) {
-		v.FailureCode = "REMOTE_ERROR"
+	if v.FailureCode != "" {
+		v.FailureCode = runyerCode(v.FailureCode)
 	}
 	return v, e
 }
